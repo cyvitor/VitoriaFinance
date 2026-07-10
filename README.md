@@ -56,6 +56,18 @@ python -m alembic upgrade head
 python main.py
 ```
 
+Para iniciar o worker de automacao e o bot Telegram em outro terminal, configure
+primeiro o token em **Configuracoes globais** e execute:
+
+```bash
+python -m app.automation.runner
+```
+
+Cada usuario associa o proprio Telegram em **Meu perfil**. O sistema gera um
+codigo de oito digitos, de uso unico e valido por dez minutos, que deve ser
+enviado ao bot no formato `/start CODIGO`. A vinculacao usa o Telegram User ID,
+nao o username.
+
 Acesse [http://localhost:8000](http://localhost:8000).
 
 O seed inicial cria o acesso abaixo somente para o ambiente recém-instalado:

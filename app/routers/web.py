@@ -16,10 +16,11 @@ from app.database import get_db
 from app.dependencies import allowed_person_ids, current_user, current_workspace_id
 from app.models import (
     Account, AccountRole, AccountType, Card, Category, Person, PersonType, SystemAccount, SystemSetting,
-    Transaction, TransactionStatus, TransactionType, User, UserPersonAccess, WorkspaceMember,
+    Transaction, TransactionStatus, TransactionType, User, UserPersonAccess, WorkspaceMember, TelegramLink,
     RecurrenceRule, RecurrenceOccurrence, AccountingPeriod, MemberRole, Workspace,
 )
 from app.security import hash_password, verify_password
+from app.services.telegram_auth import PAIRING_TTL_MINUTES, create_pairing_code, unlink_telegram
 from scripts.seed import seed_categories
 
 router = APIRouter()
@@ -918,8 +919,30 @@ def category_create(request: Request, name: str = Form(), parent_name: str | Non
 
 
 @router.get("/profile", response_class=HTMLResponse)
-def profile(request: Request, user: User = Depends(current_user)):
-    return render(request, "profile/index.html", user=user)
+def profile(request: Request, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    telegram_link = db.scalar(select(TelegramLink).where(TelegramLink.user_id == user.id))
+    return render(request, "profile/index.html", user=user, telegram_link=telegram_link,
+                  pairing_ttl_minutes=PAIRING_TTL_MINUTES)
+
+
+@router.post("/profile/telegram/code")
+def telegram_pairing_code(request: Request, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    if db.scalar(select(TelegramLink.id).where(TelegramLink.user_id == user.id)):
+        flash(request, "Seu Telegram ja esta associado. Desvincule-o antes de gerar outro codigo.", "warning")
+        return redirect("/profile")
+    code = create_pairing_code(db, user)
+    request.session["telegram_pairing_code"] = code
+    return redirect("/profile")
+
+
+@router.post("/profile/telegram/unlink")
+def telegram_unlink(request: Request, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    request.session.pop("telegram_pairing_code", None)
+    if unlink_telegram(db, user):
+        flash(request, "Telegram desvinculado com sucesso.")
+    else:
+        flash(request, "Nenhum Telegram estava associado.", "warning")
+    return redirect("/profile")
 
 
 @router.post("/profile/password")

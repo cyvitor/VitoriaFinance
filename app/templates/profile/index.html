@@ -1,1 +1,27 @@
-{% extends "base.html" %}{% block title %}Meu perfil · VitoriaFinance{% endblock %}{% block content %}<div class="page-head"><div><p class="eyebrow">CONTA</p><h1>Meu perfil</h1><p>Dados pessoais e segurança</p></div></div><div class="row g-4"><div class="col-lg-5"><section class="panel profile-card"><span class="big-avatar">{{ user.full_name[0]|upper }}</span><h2>{{ user.full_name }}</h2><p>@{{ user.username }}</p><span class="badge text-bg-success">Conta ativa</span></section></div><div class="col-lg-7"><form class="panel form-panel" method="post" action="/profile/password"><h2>Alterar senha</h2><p class="text-secondary">Use pelo menos 8 caracteres.</p><label class="form-label">Senha atual</label><input class="form-control mb-3" type="password" name="current_password" required><label class="form-label">Nova senha</label><input class="form-control mb-3" type="password" name="new_password" minlength="8" required><label class="form-label">Confirmar nova senha</label><input class="form-control mb-3" type="password" name="confirm_password" minlength="8" required><button class="btn btn-primary">Alterar senha</button></form></div></div>{% endblock %}
+{% extends "base.html" %}
+{% block title %}Meu perfil · VitoriaFinance{% endblock %}
+{% block content %}
+<div class="page-head"><div><p class="eyebrow">CONTA</p><h1>Meu perfil</h1><p>Dados pessoais, segurança e integrações</p></div></div>
+<div class="row g-4">
+  <div class="col-lg-5">
+    <section class="panel profile-card"><span class="big-avatar">{{ user.full_name[0]|upper }}</span><h2>{{ user.full_name }}</h2><p>@{{ user.username }}</p><span class="badge text-bg-success">Conta ativa</span></section>
+  </div>
+  <div class="col-lg-7">
+    <form class="panel form-panel" method="post" action="/profile/password"><h2>Alterar senha</h2><p class="text-secondary">Use pelo menos 8 caracteres.</p><label class="form-label">Senha atual</label><input class="form-control mb-3" type="password" name="current_password" required><label class="form-label">Nova senha</label><input class="form-control mb-3" type="password" name="new_password" minlength="8" required><label class="form-label">Confirmar nova senha</label><input class="form-control mb-3" type="password" name="confirm_password" minlength="8" required><button class="btn btn-primary">Alterar senha</button></form>
+  </div>
+  <div class="col-12">
+    <section class="panel form-panel">
+      <div class="d-flex justify-content-between align-items-start gap-3 flex-wrap"><div><h2><i class="bi bi-telegram"></i> Telegram</h2><p class="text-secondary mb-0">Associe seu Telegram para usar a automação com sua própria conta financeira.</p></div>
+      {% if telegram_link %}<span class="badge text-bg-success">Associado</span>{% else %}<span class="badge text-bg-secondary">Não associado</span>{% endif %}</div>
+      {% if telegram_link %}
+        <hr><p class="mb-1"><strong>ID:</strong> {{ telegram_link.telegram_user_id }}</p><p class="text-secondary">{% if telegram_link.telegram_username %}@{{ telegram_link.telegram_username }} · {% endif %}associado em {{ telegram_link.linked_at.strftime('%d/%m/%Y %H:%M') }}</p>
+        <form method="post" action="/profile/telegram/unlink"><button class="btn btn-outline-danger" onclick="return confirm('Desvincular este Telegram?')">Desvincular Telegram</button></form>
+      {% else %}
+        <hr><ol><li>Gere um código temporário abaixo.</li><li>Abra o VitoriaBot no Telegram.</li><li>Envie <code>/start CODIGO</code> ao bot.</li></ol>
+        {% if request.session.get('telegram_pairing_code') %}<div class="alert alert-info"><div class="small">Código válido por {{ pairing_ttl_minutes }} minutos</div><div class="display-6 fw-bold font-monospace">{{ request.session.get('telegram_pairing_code') }}</div><div>Envie: <code>/start {{ request.session.get('telegram_pairing_code') }}</code></div></div>{% endif %}
+        <form method="post" action="/profile/telegram/code"><button class="btn btn-primary">Gerar código de associação</button></form>
+      {% endif %}
+    </section>
+  </div>
+</div>
+{% endblock %}

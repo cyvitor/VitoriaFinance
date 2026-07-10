@@ -71,6 +71,29 @@ class User(Base):
     memberships: Mapped[list["WorkspaceMember"]] = relationship(back_populates="user")
     default_person: Mapped["Person | None"] = relationship(foreign_keys=[default_person_id])
     system_account: Mapped[SystemAccount | None] = relationship()
+    telegram_link: Mapped["TelegramLink | None"] = relationship(back_populates="user", uselist=False)
+
+
+class TelegramLink(Base):
+    __tablename__ = "telegram_links"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), unique=True, index=True)
+    telegram_user_id: Mapped[str] = mapped_column(String(32), unique=True, index=True)
+    telegram_chat_id: Mapped[str] = mapped_column(String(32))
+    telegram_username: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    linked_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    user: Mapped[User] = relationship(back_populates="telegram_link")
+
+
+class TelegramPairingCode(Base):
+    __tablename__ = "telegram_pairing_codes"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    code_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
 class Workspace(Base):
