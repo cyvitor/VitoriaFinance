@@ -68,10 +68,11 @@ codigo de oito digitos, de uso unico e valido por dez minutos, que deve ser
 enviado ao bot no formato `/start CODIGO`. A vinculacao usa o Telegram User ID,
 nao o username.
 
-Depois da vinculacao, uma despesa simples pode ser registrada com
-`/gasto VALOR DESCRICAO` (por exemplo, `/gasto 85,90 mercado`). O bot cria um
-rascunho valido por 30 minutos e somente grava a transacao depois de receber
-`/confirmar`. O comando `/cancelar` descarta o rascunho.
+Depois da vinculacao, o usuario conversa naturalmente com a Vitoria, por exemplo:
+`gastei 85,90 no mercado`. O modelo ativo da DeepInfra interpreta a intencao e o
+bot cria um rascunho valido por 30 minutos. Respostas naturais como `sim, pode
+registrar` ou `nao, cancela` confirmam ou descartam o rascunho. Se a IA estiver
+indisponivel, nenhum lancamento e criado e o bot orienta o uso da interface web.
 
 Acesse [http://localhost:8000](http://localhost:8000).
 

@@ -1,7 +1,6 @@
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from decimal import Decimal, InvalidOperation
-import re
+from decimal import Decimal
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -15,27 +14,9 @@ DRAFT_TTL_MINUTES = 30
 
 
 @dataclass(frozen=True)
-class ExpenseCommand:
+class ExpenseInput:
     amount: Decimal
     description: str
-
-
-def parse_expense_command(text: str) -> ExpenseCommand | None:
-    text = text.strip()
-    match = re.fullmatch(r"/gasto(?:@\w+)?\s+(?:R\$\s*)?([\d.,]+)\s+(.+)", text, re.IGNORECASE)
-    if not match:
-        return None
-    raw_amount = match.group(1)
-    if "," in raw_amount:
-        raw_amount = raw_amount.replace(".", "").replace(",", ".")
-    try:
-        amount = Decimal(raw_amount).quantize(Decimal("0.01"))
-    except InvalidOperation:
-        return None
-    description = " ".join(match.group(2).split()).strip()
-    if amount <= 0 or not description or len(description) > 180:
-        return None
-    return ExpenseCommand(amount, description)
 
 
 def _telegram_context(db: Session, user: User) -> tuple[int, Person] | None:
@@ -70,7 +51,7 @@ def _infer_category(db: Session, workspace_id: int, description: str) -> Categor
     return max(exact, key=lambda category: len(category.name)) if exact else None
 
 
-def create_expense_draft(db: Session, user: User, command: ExpenseCommand, now: datetime | None = None) -> TelegramExpenseDraft | None:
+def create_expense_draft(db: Session, user: User, expense: ExpenseInput, now: datetime | None = None) -> TelegramExpenseDraft | None:
     now = now or datetime.utcnow()
     context = _telegram_context(db, user)
     if not context:
@@ -83,10 +64,10 @@ def create_expense_draft(db: Session, user: User, command: ExpenseCommand, now: 
     if active:
         active.status = "cancelled"
         active.resolved_at = now
-    category = _infer_category(db, workspace_id, command.description)
+    category = _infer_category(db, workspace_id, expense.description)
     draft = TelegramExpenseDraft(
         user_id=user.id, workspace_id=workspace_id, person_id=person.id,
-        description=command.description, amount=command.amount, transaction_date=date.today(),
+        description=expense.description, amount=expense.amount, transaction_date=date.today(),
         category_id=category.id if category else None,
         expires_at=now + timedelta(minutes=DRAFT_TTL_MINUTES),
     )
@@ -150,5 +131,5 @@ def format_draft(draft: TelegramExpenseDraft) -> str:
         "Confirme este gasto:\n\n"
         f"Descricao: {draft.description}\nValor: R$ {amount}\n"
         f"Data: {draft.transaction_date.strftime('%d/%m/%Y')}\nArea: {draft.person.name}\n"
-        f"Categoria: {category}\n\nEnvie /confirmar ou /cancelar."
+        f"Categoria: {category}\n\nPosso registrar?"
     )
