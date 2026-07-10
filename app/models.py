@@ -96,6 +96,32 @@ class TelegramPairingCode(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
+class TelegramExpenseDraft(Base):
+    __tablename__ = "telegram_expense_drafts"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    workspace_id: Mapped[int] = mapped_column(ForeignKey("workspaces.id", ondelete="CASCADE"), index=True)
+    person_id: Mapped[int] = mapped_column(ForeignKey("people.id", ondelete="CASCADE"))
+    description: Mapped[str] = mapped_column(String(180))
+    amount: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+    transaction_date: Mapped[date] = mapped_column(Date)
+    category_id: Mapped[int | None] = mapped_column(ForeignKey("categories.id", ondelete="SET NULL"), nullable=True)
+    status: Mapped[str] = mapped_column(String(30), default="awaiting_confirmation", index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    transaction_id: Mapped[int | None] = mapped_column(ForeignKey("transactions.id", ondelete="SET NULL"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    person: Mapped["Person"] = relationship()
+    category: Mapped["Category | None"] = relationship()
+
+
+class TelegramProcessedUpdate(Base):
+    __tablename__ = "telegram_processed_updates"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    update_id: Mapped[str] = mapped_column(String(32), unique=True, index=True)
+    processed_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 class Workspace(Base):
     __tablename__ = "workspaces"
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -250,6 +276,7 @@ class Transaction(Base):
     payment_method: Mapped[str | None] = mapped_column(String(40), nullable=True)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_by_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    source: Mapped[str] = mapped_column(String(30), default="web", index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     account: Mapped[Account | None] = relationship(foreign_keys=[account_id])
     destination_account: Mapped[Account | None] = relationship(foreign_keys=[destination_account_id])

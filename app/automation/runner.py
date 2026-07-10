@@ -6,7 +6,7 @@ from sqlalchemy import select
 from app.automation.telegram_bot import handle_message
 from app.database import SessionLocal
 from app.integrations.telegram import TelegramClient
-from app.models import SystemSetting
+from app.models import SystemSetting, TelegramProcessedUpdate
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -32,7 +32,12 @@ def run() -> None:
                 if not message:
                     continue
                 with SessionLocal() as db:
+                    update_key = str(update["update_id"])
+                    if db.scalar(select(TelegramProcessedUpdate.id).where(TelegramProcessedUpdate.update_id == update_key)):
+                        continue
                     response = handle_message(db, message)
+                    db.add(TelegramProcessedUpdate(update_id=update_key))
+                    db.commit()
                 client.send_message(message["chat"]["id"], response)
         except KeyboardInterrupt:
             logger.info("Worker encerrado.")

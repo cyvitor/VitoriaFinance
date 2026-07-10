@@ -68,6 +68,11 @@ codigo de oito digitos, de uso unico e valido por dez minutos, que deve ser
 enviado ao bot no formato `/start CODIGO`. A vinculacao usa o Telegram User ID,
 nao o username.
 
+Depois da vinculacao, uma despesa simples pode ser registrada com
+`/gasto VALOR DESCRICAO` (por exemplo, `/gasto 85,90 mercado`). O bot cria um
+rascunho valido por 30 minutos e somente grava a transacao depois de receber
+`/confirmar`. O comando `/cancelar` descarta o rascunho.
+
 Acesse [http://localhost:8000](http://localhost:8000).
 
 O seed inicial cria o acesso abaixo somente para o ambiente recém-instalado:
