@@ -1,0 +1,15 @@
+{% extends "base.html" %}{% block title %}Novo lançamento · VitoriaFinance{% endblock %}{% block content %}
+<div class="page-head"><div><p class="eyebrow">NOVO</p><h1>{% if kind=='income' %}Receita{% elif kind=='transfer' %}Transferência{% else %}Despesa{% endif %}</h1></div></div>
+<form class="panel form-panel" method="post"><input type="hidden" name="transaction_type" value="{{ kind }}"><div class="row g-3">
+<div class="col-md-8"><label class="form-label">Descrição</label><input class="form-control" name="description" required></div>
+<div class="col-md-4"><label class="form-label">Valor</label><input class="form-control" type="number" min="0.01" step="0.01" name="amount" required></div>
+<div class="col-md-4"><label class="form-label">Data</label><input class="form-control" type="date" name="transaction_date" value="{{ today }}" required></div>
+<div class="col-md-4"><label class="form-label">Status</label><select class="form-select" name="status"><option value="paid">Pago</option><option value="pending">Pendente</option><option value="cancelled">Cancelado</option></select></div>
+<div class="col-md-4"><label class="form-label">Pessoa</label><select class="form-select" name="person_id"><option value="">Compartilhado</option>{% for x in people %}<option value="{{ x.id }}">{{ x.name }}</option>{% endfor %}</select></div>
+<div class="col-md-6"><label class="form-label">{% if kind=='transfer' %}Conta de origem{% else %}Conta{% endif %}</label><select class="form-select" name="account_id"><option value="">Selecione</option>{% for x in accounts %}<option value="{{ x.id }}">{{ x.name }}</option>{% endfor %}</select></div>
+{% if kind=='transfer' %}<div class="col-md-6"><label class="form-label">Conta de destino</label><select class="form-select" name="destination_account_id" required><option value="">Selecione</option>{% for x in accounts %}<option value="{{ x.id }}">{{ x.name }}</option>{% endfor %}</select></div>
+{% else %}<div class="col-md-6"><label class="form-label">Categoria</label><select class="form-select" name="category_id"><option value="">Sem categoria</option>{% for x in categories if x.kind.value==kind %}<option value="{{ x.id }}">{{ x.parent_name + ' · ' if x.parent_name else '' }}{{ x.name }}</option>{% endfor %}</select></div>
+<div class="col-md-6"><label class="form-label">Cartão</label><select class="form-select" name="card_id"><option value="">Não utilizado</option>{% for x in cards %}<option value="{{ x.id }}">{{ x.name }}</option>{% endfor %}</select></div>
+<div class="col-md-6"><label class="form-label">Forma de pagamento</label><select class="form-select" name="payment_method"><option value="">Selecione</option><option>PIX</option><option>Débito</option><option>Crédito</option><option>Dinheiro</option><option>Transferência</option></select></div>{% endif %}
+<div class="col-12"><label class="form-label">Observação</label><textarea class="form-control" name="notes" rows="3"></textarea></div>
+</div><div class="form-actions"><a class="btn btn-light" href="/transactions">Cancelar</a><button class="btn btn-primary">Salvar lançamento</button></div></form>{% endblock %}

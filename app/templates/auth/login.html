@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block title %}Entrar · VitoriaFinance{% endblock %}
+{% block auth_content %}
+<div class="login-page">
+  <div class="login-panel">
+    <div class="brand login-brand"><img src="/static/icon.png"><span>Vitoria<span>Finance</span></span></div>
+    <p class="text-secondary mb-4">Seu dinheiro, claro e sob controle.</p>
+    <form method="post" action="/login">
+      <label class="form-label">Usuário</label>
+      <div class="input-group mb-3"><span class="input-group-text"><i class="bi bi-person"></i></span><input class="form-control" name="username" autofocus required></div>
+      <label class="form-label">Senha</label>
+      <div class="input-group mb-4"><span class="input-group-text"><i class="bi bi-lock"></i></span><input class="form-control" type="password" name="password" required></div>
+      <button class="btn btn-primary w-100 py-2">Entrar</button>
+    </form>
+  </div>
+  <div class="login-art"><div><h1>Decisões melhores começam com uma visão clara.</h1><p>Acompanhe saldos, compromissos e o seu futuro financeiro em um só lugar.</p></div></div>
+</div>
+{% endblock %}
