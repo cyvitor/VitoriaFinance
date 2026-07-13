@@ -69,6 +69,10 @@ def test_recurring_income_monthly_confirmation_skip_and_delete(client):
 def test_fixed_expense_inline_confirm_and_skip(client):
     area_id = seed_test()
     client.post("/login", data={"username": "vh", "password": "123456"})
+    with SessionLocal() as db:
+        workspace_id = db.scalar(select(Workspace.id))
+        account = Account(workspace_id=workspace_id, person_id=area_id, name="Conta", account_type=AccountType.checking)
+        db.add(account); db.commit(); account_id = account.id
     response = client.post("/fixed-expenses", data={
         "description": "Aluguel", "amount": "750.00", "account_id": "",
         "person_id": str(area_id), "category_id": "",
@@ -81,12 +85,42 @@ def test_fixed_expense_inline_confirm_and_skip(client):
     assert "Aluguel" in month.text
     assert "Confirmar pagamento" in month.text
     assert "Não pagar neste mês" in month.text
-    response = client.post(f"/recurrences/{rule_id}/confirm", data={"year": "2026", "month": "7", "confirmed_amount": "732.45"}, follow_redirects=False)
+    response = client.post(f"/recurrences/{rule_id}/confirm", data={"year": "2026", "month": "7", "confirmed_amount": "732.45", "payment_source": f"account:{account_id}"}, follow_redirects=False)
     assert response.status_code == 303
     with SessionLocal() as db:
         tx = db.scalar(select(Transaction).where(Transaction.recurrence_rule_id == rule_id))
         assert tx.transaction_type == TransactionType.expense
         assert tx.amount == Decimal("732.45")
+
+
+def test_fixed_expense_partial_payment_keeps_remaining_and_uses_card(client):
+    area_id = seed_test()
+    client.post("/login", data={"username": "vh", "password": "123456"})
+    with SessionLocal() as db:
+        workspace_id = db.scalar(select(Workspace.id))
+        account = Account(workspace_id=workspace_id, person_id=area_id, name="C6 Conta", account_type=AccountType.checking)
+        db.add(account); db.flush()
+        card = Card(workspace_id=workspace_id, account_id=account.id, name="C6")
+        db.add(card); db.commit(); card_id = card.id
+    client.post("/fixed-expenses", data={"description":"Mercado", "amount":"400.00",
+        "account_id":"", "person_id":str(area_id), "category_id":""})
+    with SessionLocal() as db:
+        rule_id = db.scalar(select(RecurrenceRule.id))
+    response = client.post(f"/recurrences/{rule_id}/confirm", data={"year":"2026", "month":"7",
+        "confirmed_amount":"150.00", "payment_source":f"card:{card_id}", "settlement_mode":"partial",
+        "confirmed_description":"Compra rápida", "paid_on":"2026-07-15", "confirmed_notes":"Itens que faltavam"},
+        follow_redirects=False)
+    assert response.status_code == 303
+    with SessionLocal() as db:
+        tx = db.scalar(select(Transaction))
+        occurrence = db.scalar(select(RecurrenceOccurrence))
+        assert tx.card_id == card_id and tx.status == TransactionStatus.pending
+        assert tx.payment_method == "Crédito"
+        assert tx.description == "Compra rápida" and tx.transaction_date.isoformat() == "2026-07-15"
+        assert tx.notes == "Itens que faltavam"
+        assert occurrence.status == "partial" and occurrence.remaining_amount == Decimal("250.00")
+    month = client.get("/month?year=2026&month=7")
+    assert "R$ 250,00" in month.text
 
 
 def test_account_admin_grants_only_selected_areas(client):
@@ -123,6 +157,9 @@ def test_credit_and_debit_card_expenses_are_grouped_and_detailed(client):
     client.post("/login", data={"username": "vh", "password": "123456"})
     with SessionLocal() as db:
         workspace_id = db.scalar(select(Workspace.id))
+        category = Category(workspace_id=workspace_id, kind=TransactionType.expense,
+                            parent_name="Alimentação", name="Mercado", color="#00b894")
+        db.add(category); db.flush(); category_id = category.id
         account = Account(workspace_id=workspace_id, person_id=area_id, name="C6 Conta", account_type=AccountType.checking)
         db.add(account); db.flush()
         card = Card(workspace_id=workspace_id, account_id=account.id, name="C6", closing_day=5, due_day=12)
@@ -147,9 +184,15 @@ def test_credit_and_debit_card_expenses_are_grouped_and_detailed(client):
     assert "Gastos no crédito" in analysis.text
     assert "Projeção de saldo" in analysis.text
     assert "Gasto no cartão" in client.get("/").text
+    monthly_analysis = client.get("/monthly-analysis?year=2026&month=7")
+    assert monthly_analysis.status_code == 200
+    assert "Análise mensal" in monthly_analysis.text
+    assert "Comprometimento da renda" in monthly_analysis.text
+    assert "Sem categoria" in monthly_analysis.text
     response = client.post("/card-expenses/new", data={
         "card_id": str(card_id), "description": "Notebook", "amount": "100.00",
         "payment_method": "Crédito", "purchase_type": "installments", "installments": "3",
+        "category_id": str(category_id),
     }, follow_redirects=False)
     assert response.status_code == 303
     with SessionLocal() as db:
@@ -157,6 +200,16 @@ def test_credit_and_debit_card_expenses_are_grouped_and_detailed(client):
         assert len(parcels) == 3
         assert sum((item.amount for item in parcels), Decimal(0)) == Decimal("100.00")
         assert all(item.status == TransactionStatus.pending for item in parcels)
+        assert all(item.category_id == category_id for item in parcels)
+        first_parcel_id = parcels[0].id
+    response = client.post(f"/cards/{card_id}/expenses/{first_parcel_id}/edit", data={
+        "description": "Notebook ajustado", "amount": "34.00", "category_id": str(category_id),
+    }, follow_redirects=False)
+    assert response.status_code == 303
+    with SessionLocal() as db:
+        edited = db.get(Transaction, first_parcel_id)
+        assert edited.description == "Notebook ajustado"
+        assert edited.amount == Decimal("34.00")
 
 
 def test_superadmin_creates_account_and_refreshes_deepinfra_models(client, monkeypatch):

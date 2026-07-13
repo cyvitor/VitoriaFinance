@@ -239,6 +239,7 @@ class RecurrenceOccurrence(Base):
     year: Mapped[int] = mapped_column()
     month: Mapped[int] = mapped_column()
     status: Mapped[str] = mapped_column(String(20))
+    remaining_amount: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
     transaction_id: Mapped[int | None] = mapped_column(ForeignKey("transactions.id", ondelete="SET NULL"), nullable=True)
     resolved_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     rule: Mapped[RecurrenceRule] = relationship()

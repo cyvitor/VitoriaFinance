@@ -1,4 +1,5 @@
 from calendar import monthrange
+from copy import copy
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 import json
@@ -296,6 +297,87 @@ def financial_analysis(request: Request, history: int = 12, horizon: int = 12, a
         projection_labels=projection_labels, projection_balances=projection_balances, top_categories=top_categories)
 
 
+@router.get("/monthly-analysis", response_class=HTMLResponse)
+def monthly_analysis(request: Request, year: int | None = None, month: int | None = None,
+                     area_id: int | None = None, db: Session = Depends(get_db),
+                     user: User = Depends(current_user)):
+    today = date.today()
+    if year is None or month is None or not 1 <= month <= 12 or not 2000 <= year <= 2100:
+        year, month = today.year, today.month
+    selected = date(year, month, 1)
+    wid = current_workspace_id(request, user, db)
+    areas = visible_people(user, wid, db)
+    allowed_ids = {area.id for area in areas}
+    if area_id not in allowed_ids:
+        area_id = None
+    allowed = allowed_person_ids(user, db)
+    tx_query = select(Transaction).where(Transaction.workspace_id == wid,
+        Transaction.status != TransactionStatus.cancelled,
+        Transaction.transaction_type.in_([TransactionType.income, TransactionType.expense]))
+    rule_query = select(RecurrenceRule).where(RecurrenceRule.workspace_id == wid,
+        RecurrenceRule.is_active.is_(True),
+        RecurrenceRule.transaction_type.in_([TransactionType.income, TransactionType.expense]))
+    if area_id:
+        tx_query = tx_query.where(Transaction.person_id == area_id)
+        rule_query = rule_query.where(RecurrenceRule.person_id == area_id)
+    elif allowed is not None:
+        tx_query = tx_query.where(Transaction.person_id.in_(allowed_ids))
+        rule_query = rule_query.where(RecurrenceRule.person_id.in_(allowed_ids))
+    transactions, rules = db.scalars(tx_query).all(), db.scalars(rule_query).all()
+    rule_ids = [rule.id for rule in rules]
+    occurrences = db.scalars(select(RecurrenceOccurrence).where(
+        RecurrenceOccurrence.recurrence_rule_id.in_(rule_ids))).all() if rule_ids else []
+    occurrence_map = {(item.recurrence_rule_id, item.year, item.month): item for item in occurrences}
+
+    def period_totals(period: date, with_categories: bool = False):
+        totals = {"income": Decimal(0), "expense": Decimal(0), "pending": Decimal(0)}
+        categories: dict[str, Decimal] = {}
+        for item in transactions:
+            item_period = (item.competence_year or item.transaction_date.year,
+                           item.competence_month or item.transaction_date.month)
+            if item_period != (period.year, period.month):
+                continue
+            amount = Decimal(item.amount)
+            totals[item.transaction_type.value] += amount
+            if item.status == TransactionStatus.pending:
+                totals["pending"] += amount
+            if with_categories and item.transaction_type == TransactionType.expense:
+                name = item.category.name if item.category else "Sem categoria"
+                categories[name] = categories.get(name, Decimal(0)) + amount
+        for rule in rules:
+            last_day = date(period.year, period.month, monthrange(period.year, period.month)[1])
+            occurrence = occurrence_map.get((rule.id, period.year, period.month))
+            if (rule.start_date and rule.start_date > last_day) or (occurrence and occurrence.status != "partial"):
+                continue
+            amount = Decimal(occurrence.remaining_amount if occurrence and occurrence.status == "partial" else rule.amount or 0)
+            totals[rule.transaction_type.value] += amount
+            totals["pending"] += amount
+            if with_categories and rule.transaction_type == TransactionType.expense:
+                name = rule.category.name if rule.category else "Sem categoria"
+                categories[name] = categories.get(name, Decimal(0)) + amount
+        return totals, categories
+
+    selected_totals, category_totals = period_totals(selected, True)
+    previous = shift_month(selected, -1)
+    previous_totals, _ = period_totals(previous)
+    trend_months = [shift_month(selected, offset) for offset in range(-11, 1)]
+    trend = [period_totals(period)[0] for period in trend_months]
+    month_names = ["Jan", "Fev", "Mar", "Abr", "Mai", "Jun", "Jul", "Ago", "Set", "Out", "Nov", "Dez"]
+    income, expense = selected_totals["income"], selected_totals["expense"]
+    commitment_rate = expense / income * 100 if income else None
+    expense_change = ((expense - previous_totals["expense"]) / previous_totals["expense"] * 100
+                      if previous_totals["expense"] else None)
+    categories = sorted(category_totals.items(), key=lambda pair: pair[1], reverse=True)
+    return render(request, "analysis/monthly.html", user=user, areas=areas, selected_area=area_id,
+        selected=selected, previous=previous, next_month=shift_month(selected, 1), income=income,
+        expense=expense, balance=income - expense, pending=selected_totals["pending"],
+        commitment_rate=commitment_rate, expense_change=expense_change,
+        category_rows=[(name, value, value / expense * 100 if expense else Decimal(0)) for name, value in categories],
+        category_labels=[name for name, _ in categories], category_values=[float(value) for _, value in categories],
+        trend_labels=[f"{month_names[p.month - 1]}/{str(p.year)[2:]}" for p in trend_months],
+        trend_incomes=[float(item["income"]) for item in trend], trend_expenses=[float(item["expense"]) for item in trend])
+
+
 @router.get("/transactions", response_class=HTMLResponse)
 def transactions(request: Request, db: Session = Depends(get_db), user: User = Depends(current_user)):
     wid = current_workspace_id(request, user, db)
@@ -314,17 +396,28 @@ def card_expense_form(request: Request, db: Session = Depends(get_db), user: Use
     query = select(Card).where(Card.workspace_id == wid, Card.is_active)
     if allowed_person_ids(user, db) is not None: query = query.where(Card.account_id.in_(account_ids))
     cards = db.scalars(query.order_by(Card.name)).all()
-    return render(request, "cards/expense_form.html", user=user, cards=cards)
+    categories = db.scalars(select(Category).where(
+        Category.workspace_id == wid, Category.kind == TransactionType.expense
+    ).order_by(Category.parent_name, Category.name)).all()
+    return render(request, "cards/expense_form.html", user=user, cards=cards, categories=categories)
 
 
 @router.post("/card-expenses/new")
 def card_expense_create(request: Request, card_id: int = Form(), description: str = Form(),
         amount: Decimal = Form(), payment_method: str = Form(), purchase_type: str = Form("cash"),
-        installments: int = Form(1), db: Session = Depends(get_db), user: User = Depends(current_user)):
+        installments: int = Form(1), category_id: int = Form(),
+        db: Session = Depends(get_db), user: User = Depends(current_user)):
     wid = current_workspace_id(request, user, db)
     card = db.scalar(select(Card).where(Card.id == card_id, Card.workspace_id == wid, Card.is_active))
     if not card: raise HTTPException(404)
     ensure_account_access(card.account_id, user, wid, db)
+    category = db.scalar(select(Category).where(
+        Category.id == category_id, Category.workspace_id == wid,
+        Category.kind == TransactionType.expense,
+    ))
+    if not category:
+        flash(request, "Selecione uma categoria de despesa válida.", "danger")
+        return redirect("/card-expenses/new")
     if not card.account_id or not card.account or not card.account.person_id:
         flash(request, "O cartão precisa estar vinculado a uma conta com área financeira.", "danger")
         return redirect("/card-expenses/new")
@@ -349,6 +442,7 @@ def card_expense_create(request: Request, card_id: int = Form(), description: st
             amount=Decimal(cents) / 100, transaction_date=tx_date,
             status=TransactionStatus.pending if is_credit else TransactionStatus.paid,
             account_id=card.account_id, card_id=card.id, person_id=card.account.person_id,
+            category_id=category.id,
             payment_method="Crédito" if is_credit else "Débito", created_by_id=user.id,
             competence_year=year, competence_month=month,
         ))
@@ -483,7 +577,10 @@ def fixed_expense_delete(rule_id: int, request: Request, db: Session = Depends(g
 
 @router.post("/recurrences/{rule_id}/confirm")
 def recurring_income_confirm(rule_id: int, request: Request, year: int = Form(), month: int = Form(),
-        confirmed_amount: Decimal = Form(),
+        confirmed_amount: Decimal = Form(), payment_source: str | None = Form(None),
+        settlement_mode: str = Form("full"), confirmed_description: str | None = Form(None),
+        confirmed_category_id: str | None = Form(None), paid_on: date | None = Form(None),
+        confirmed_notes: str | None = Form(None),
         db: Session = Depends(get_db), user: User = Depends(current_user)):
     wid = current_workspace_id(request, user, db)
     rule = db.scalar(select(RecurrenceRule).where(
@@ -493,7 +590,7 @@ def recurring_income_confirm(rule_id: int, request: Request, year: int = Form(),
         RecurrenceOccurrence.recurrence_rule_id == rule_id,
         RecurrenceOccurrence.year == year, RecurrenceOccurrence.month == month,
     ))
-    if not rule or existing:
+    if not rule or (existing and existing.status != "partial"):
         raise HTTPException(404)
     if confirmed_amount <= 0:
         flash(request, "O valor confirmado deve ser maior que zero.", "danger")
@@ -506,16 +603,59 @@ def recurring_income_confirm(rule_id: int, request: Request, year: int = Form(),
         target_month += 1
         if target_month == 13:
             target_month, target_year = 1, target_year + 1
+    remaining_before = Decimal(existing.remaining_amount) if existing and existing.remaining_amount is not None else Decimal(rule.amount)
+    is_partial = rule.transaction_type == TransactionType.expense and settlement_mode == "partial"
+    if is_partial and confirmed_amount >= remaining_before:
+        flash(request, "Para manter saldo programado, informe um valor menor que o saldo restante.", "danger")
+        return redirect(f"/month?year={year}&month={month}")
+    account_id, card_id, payment_method = rule.account_id, None, rule.payment_method
+    transaction_status = TransactionStatus.paid
+    if rule.transaction_type == TransactionType.expense:
+        if not payment_source or ":" not in payment_source:
+            flash(request, "Selecione a conta ou o cartão usado no pagamento.", "danger")
+            return redirect(f"/month?year={year}&month={month}")
+        source_type, raw_id = payment_source.split(":", 1)
+        source_id = optional_int(raw_id)
+        if source_type == "card":
+            card = db.scalar(select(Card).where(Card.id == source_id, Card.workspace_id == wid, Card.is_active))
+            if not card or not card.account_id:
+                raise HTTPException(403)
+            ensure_account_access(card.account_id, user, wid, db)
+            account_id, card_id, payment_method = card.account_id, card.id, "Crédito"
+            transaction_status = TransactionStatus.pending
+        elif source_type == "account":
+            account = db.scalar(select(Account).where(Account.id == source_id, Account.workspace_id == wid, Account.is_active))
+            if not account:
+                raise HTTPException(403)
+            ensure_account_access(account.id, user, wid, db)
+            account_id, payment_method = account.id, "Conta bancária"
+        else:
+            raise HTTPException(400)
+    description = (confirmed_description or rule.description).strip()
+    category_id = rule.category_id
+    requested_category_id = optional_int(confirmed_category_id)
+    if is_partial and requested_category_id:
+        category = db.scalar(select(Category).where(Category.id == requested_category_id,
+            Category.workspace_id == wid, Category.kind == TransactionType.expense))
+        if not category:
+            raise HTTPException(400)
+        category_id = category.id
     transaction = Transaction(
-        workspace_id=wid, transaction_type=rule.transaction_type, description=rule.description,
-        amount=confirmed_amount, transaction_date=date.today(), status=TransactionStatus.paid,
-        account_id=rule.account_id, person_id=rule.person_id, category_id=rule.category_id,
-        payment_method=rule.payment_method, notes=rule.notes, created_by_id=user.id,
+        workspace_id=wid, transaction_type=rule.transaction_type, description=description,
+        amount=confirmed_amount, transaction_date=paid_on if is_partial and paid_on else date.today(), status=transaction_status,
+        account_id=account_id, card_id=card_id, person_id=rule.person_id, category_id=category_id,
+        payment_method=payment_method, notes=confirmed_notes if is_partial and confirmed_notes is not None else rule.notes, created_by_id=user.id,
         recurrence_rule_id=rule.id, competence_year=target_year, competence_month=target_month,
     )
     db.add(transaction); db.flush()
-    db.add(RecurrenceOccurrence(recurrence_rule_id=rule.id, year=year, month=month,
-                                status="confirmed", transaction_id=transaction.id))
+    if existing:
+        existing.status = "partial" if is_partial else "confirmed"
+        existing.remaining_amount = remaining_before - confirmed_amount if is_partial else Decimal(0)
+        existing.transaction_id = transaction.id
+    else:
+        db.add(RecurrenceOccurrence(recurrence_rule_id=rule.id, year=year, month=month,
+            status="partial" if is_partial else "confirmed", transaction_id=transaction.id,
+            remaining_amount=remaining_before - confirmed_amount if is_partial else Decimal(0)))
     db.commit()
     label = "Receita" if rule.transaction_type == TransactionType.income else "Despesa"
     flash(request, f"{label} confirmada na competência {target_month:02d}/{target_year}.")
@@ -574,7 +714,8 @@ def family_view(request: Request, year: int | None = None, month: int | None = N
     occurrences = db.scalars(select(RecurrenceOccurrence).join(RecurrenceRule).where(
         RecurrenceRule.workspace_id == wid, RecurrenceOccurrence.year == selected_year,
     )).all()
-    resolved = {(occurrence.recurrence_rule_id, occurrence.month) for occurrence in occurrences}
+    occurrence_by_key = {(occurrence.recurrence_rule_id, occurrence.month): occurrence for occurrence in occurrences}
+    resolved = {key for key, occurrence in occurrence_by_key.items() if occurrence.status != "partial"}
     virtual_by_month = {number: [] for number in range(1, 13)}
     for rule in recurring_rules:
         created = rule.created_at.date()
@@ -583,9 +724,14 @@ def family_view(request: Request, year: int | None = None, month: int | None = N
                 continue
             if (rule.id, number) in resolved:
                 continue
-            virtual_by_month[number].append(rule)
+            display_rule = rule
+            partial = occurrence_by_key.get((rule.id, number))
+            if partial and partial.status == "partial":
+                display_rule = copy(rule)
+                display_rule.amount = Decimal(partial.remaining_amount or 0)
+            virtual_by_month[number].append(display_rule)
             key = "income_pending" if rule.transaction_type == TransactionType.income else "expense_pending"
-            months[number - 1][key] += Decimal(rule.amount)
+            months[number - 1][key] += Decimal(display_rule.amount)
     running_balance = Decimal(0)
     for summary in months:
         summary["realized"] = summary["income_paid"] - summary["expense_paid"]
@@ -645,12 +791,19 @@ def family_view(request: Request, year: int | None = None, month: int | None = N
         AccountingPeriod.month == selected_month,
     ))
     people = visible_people(user, wid, db)
+    accounts = visible_accounts(user, wid, db)
+    account_ids = [account.id for account in accounts]
+    cards = db.scalars(select(Card).where(Card.workspace_id == wid, Card.is_active.is_(True),
+        Card.account_id.in_(account_ids)).order_by(Card.name)).all() if account_ids else []
+    expense_categories = db.scalars(select(Category).where(Category.workspace_id == wid,
+        Category.kind == TransactionType.expense).order_by(Category.parent_name, Category.name)).all()
     return render(request, "family/index.html", user=user, months=months, selected_year=selected_year,
                   selected_month=selected_month, confirmed=confirmed, forecasts=forecasts, people=people,
                   selected_summary=selected_summary, income_items=income_items, expense_items=expense_items,
                   period_closed=bool(period and period.is_closed), visible_months=visible_months,
                   recurring_pending=recurring_pending, fixed_expense_pending=fixed_expense_pending,
-                  card_groups=card_groups)
+                  card_groups=card_groups, accounts=accounts, cards=cards,
+                  expense_categories=expense_categories, today=today)
 
 
 @router.get("/family", include_in_schema=False)
@@ -841,10 +994,43 @@ def card_detail(card_id: int, request: Request, year: int | None = None, month: 
     ).order_by(Transaction.transaction_date, Transaction.id)).all()
     credit = [item for item in items if (item.payment_method or "").lower() in ("crédito", "credito")]
     debit = [item for item in items if item not in credit]
+    categories = db.scalars(select(Category).where(
+        Category.workspace_id == wid, Category.kind == TransactionType.expense
+    ).order_by(Category.parent_name, Category.name)).all()
     return render(request, "cards/detail.html", user=user, card=card, credit=credit, debit=debit,
+                  categories=categories,
                   selected_year=selected_year, selected_month=selected_month,
                   credit_total=sum((Decimal(x.amount) for x in credit), Decimal(0)),
                   debit_total=sum((Decimal(x.amount) for x in debit), Decimal(0)))
+
+
+@router.post("/cards/{card_id}/expenses/{transaction_id}/edit")
+def card_expense_edit(card_id: int, transaction_id: int, request: Request,
+                      description: str = Form(), amount: Decimal = Form(), category_id: int = Form(),
+                      db: Session = Depends(get_db), user: User = Depends(current_user)):
+    wid = current_workspace_id(request, user, db)
+    card = db.scalar(select(Card).where(Card.id == card_id, Card.workspace_id == wid))
+    if not card: raise HTTPException(404)
+    ensure_account_access(card.account_id, user, wid, db)
+    item = db.scalar(select(Transaction).where(
+        Transaction.id == transaction_id, Transaction.card_id == card.id,
+        Transaction.workspace_id == wid,
+    ))
+    if not item: raise HTTPException(404)
+    category = db.scalar(select(Category).where(
+        Category.id == category_id, Category.workspace_id == wid,
+        Category.kind == TransactionType.expense,
+    ))
+    year, month = item.competence_year, item.competence_month
+    if not description.strip() or amount <= 0 or not category:
+        flash(request, "Informe descrição, valor e categoria válidos.", "danger")
+        return redirect(f"/cards/{card.id}?year={year}&month={month}")
+    item.description = description.strip()
+    item.amount = amount
+    item.category_id = category.id
+    db.commit()
+    flash(request, "Gasto do cartão atualizado.")
+    return redirect(f"/cards/{card.id}?year={year}&month={month}")
 
 
 @router.post("/cards/{card_id}/confirm")
