@@ -11,6 +11,7 @@ from app.services.access_context import build_user_access_context
 from app.services.financial_tools import ToolError, execute_tool
 from app.services.telegram_ai import AIUnavailableError
 from app.services.telegram_expenses import get_active_draft
+from app.services.user_memory import format_memory_context, relevant_memories, store_candidates
 
 
 TOOL_GUIDE = """
@@ -101,17 +102,39 @@ def _fallback_tool_reply(tool_name: str, result: dict) -> str:
     return "A consulta foi executada, mas nao consegui formatar a resposta agora. Tente novamente em instantes."
 
 
+def _extract_memories(db: Session, user: User, token: str, model: str) -> None:
+    history = _conversation_history(db, user.id)[-6:]
+    extractor_prompt = """Analise a conversa e extraia apenas informacoes pessoais duraveis e uteis em conversas futuras.
+O processo e automatico; o usuario nao precisa pedir para memorizar.
+Nao memorize saldos, faturas, totais mensais, senhas, tokens, codigos, resultados momentaneos ou suposicoes da assistente.
+Memorize associacoes declaradas de estabelecimento, conta, cartao, categoria, area, financiamento, preferencia ou meta.
+Retorne SOMENTE JSON valido: {"candidates":[{"type":"merchant_alias|preferred_account|preferred_card|category_preference|financial_area_alias|financing_alias|user_preference|financial_goal","subject":"chave curta","value":{},"summary":"frase objetiva em pt-BR","confidence":0.4}]}
+Use confianca acima de 0.85 apenas quando o usuario declarou ou confirmou explicitamente. Se nao houver fato duravel, retorne {"candidates":[]}."""
+    try:
+        content = _complete(token, model, [{"role": "system", "content": extractor_prompt}, *history], 450)
+        payload = _json_from_model(content)
+        candidates = payload.get("candidates")
+        if isinstance(candidates, list):
+            store_candidates(db, user.id, candidates)
+    except (AIUnavailableError, json.JSONDecodeError, TypeError, ValueError):
+        # A memoria e complementar; sua falha nunca invalida uma resposta ou operacao concluida.
+        return
+
+
 def run_financial_agent(db: Session, user: User, text: str) -> str:
     token, model = _settings(db)
     context = build_user_access_context(db, user)
     areas = db.scalars(select(Person.name).where(Person.id.in_(context.allowed_person_ids))).all() if context.allowed_person_ids else []
     pending = _pending_context(db, user)
+    memory_context = format_memory_context(relevant_memories(db, user.id, text))
     system = f"""Voce e Vitoria, gestora financeira conversacional do VitoriaFinance.
 Hoje e {date.today().isoformat()}, fuso America/Sao_Paulo. Usuario: {user.full_name}.
 Areas que o backend autorizou: {', '.join(areas) or 'nenhuma'}.
+{memory_context}
 {pending}
 Escolha no maximo uma ferramenta para atender a mensagem. Nunca invente valores ou resultados financeiros.
 Nunca tente acessar usuario, workspace ou area fora das opcoes autorizadas. IDs internos nao sao argumentos aceitos.
+Memorias sao pistas pessoais, nunca dados financeiros atuais. Quando marcadas como provaveis, confirme a associacao com o usuario.
 Quando houver acao aguardando confirmacao, interprete confirmacao ou cancelamento natural e escolha a ferramenta correta.
 Uma confirmacao de despesa usa confirmar_despesa; amortizacao usa confirmar_acao_pendente.
 Para amortizacao incompleta, chame preparar_amortizacao_financiamento novamente com os novos dados fornecidos.
@@ -150,5 +173,7 @@ Valores monetarios devem usar R$ e formato brasileiro. Nao diga que alterou algo
     else:
         raise AIUnavailableError("O modelo nao selecionou uma acao valida")
     db.add(TelegramConversationMessage(user_id=user.id, role="assistant", content=reply))
+    db.flush()
+    _extract_memories(db, user, token, model)
     db.commit()
     return reply

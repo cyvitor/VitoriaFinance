@@ -201,7 +201,9 @@ def test_credit_and_debit_card_expenses_are_grouped_and_detailed(client):
     month = client.get("/month?year=2026&month=7")
     assert "Cartão Crédito C6" in month.text
     assert "Cartão Débito C6" in month.text
-    detail = client.get(f"/cards/{card_id}?year=2026&month=7")
+    analytic = client.get(f"/cards/{card_id}?year=2026&month=7")
+    assert "Gastos agrupados" in analytic.text and "Analítica" in analytic.text and "Detalhada" in analytic.text
+    detail = client.get(f"/cards/{card_id}?year=2026&month=7&view=detailed")
     assert "Compra" in detail.text and "Mercado" in detail.text
     assert "Valor: maior para menor" in detail.text
     assert "Data/hora: recentes" in detail.text

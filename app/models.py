@@ -131,6 +131,25 @@ class TelegramConversationMessage(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
 
 
+class UserMemory(Base):
+    __tablename__ = "user_memories"
+    __table_args__ = (UniqueConstraint("user_id", "memory_type", "subject"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    memory_type: Mapped[str] = mapped_column(String(50), index=True)
+    subject: Mapped[str] = mapped_column(String(160))
+    value_json: Mapped[str] = mapped_column(Text)
+    summary: Mapped[str] = mapped_column(String(500))
+    confidence: Mapped[Decimal] = mapped_column(Numeric(4, 3), default=Decimal("0.500"))
+    observation_count: Mapped[int] = mapped_column(default=1)
+    confirmation_count: Mapped[int] = mapped_column(default=0)
+    source: Mapped[str] = mapped_column(String(40), default="conversation")
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class TelegramPendingAction(Base):
     __tablename__ = "telegram_pending_actions"
     id: Mapped[int] = mapped_column(primary_key=True)

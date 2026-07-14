@@ -7,13 +7,14 @@ from sqlalchemy import select
 from app.database import SessionLocal
 from app.models import (
     AccountRole, Financing, FinancingAmortization, MemberRole, Person, PersonType,
-    RecurrenceRule, SystemAccount, SystemSetting, Transaction, TransactionType, User, UserPersonAccess, Workspace, WorkspaceMember,
+    RecurrenceRule, SystemAccount, SystemSetting, Transaction, TransactionType, User, UserMemory, UserPersonAccess, Workspace, WorkspaceMember,
 )
 from app.security import hash_password
 from app.services.access_context import build_user_access_context
 from app.services.financial_tools import ToolError, execute_tool
 from app.services.telegram_agent import run_financial_agent
 from app.services.telegram_ai import AIUnavailableError
+from app.services.user_memory import relevant_memories
 
 
 def setup_financings(db, member_role=MemberRole.editor, account_role=AccountRole.admin):
@@ -106,6 +107,7 @@ def test_agent_uses_natural_conversation_and_keeps_confirmed_write_on_synthesis_
         return value
 
     monkeypatch.setattr("app.services.telegram_agent._complete", complete)
+    monkeypatch.setattr("app.services.telegram_agent._extract_memories", lambda *args: None)
     with SessionLocal() as db:
         user, financing, hidden, rule = setup_financings(db)
         db.add_all([SystemSetting(key="deepinfra_api_key", value="secret", is_secret=True),
@@ -118,3 +120,24 @@ def test_agent_uses_natural_conversation_and_keeps_confirmed_write_on_synthesis_
         assert "registrada com sucesso" in second
         transaction = db.scalar(select(Transaction))
         assert transaction.amount == Decimal("42.50") and transaction.source == "telegram"
+
+
+def test_agent_automatically_extracts_permanent_memory(monkeypatch):
+    responses = iter([
+        json.dumps({"action": "respond", "reply": "Entendi."}),
+        json.dumps({"candidates": [{
+            "type": "merchant_alias", "subject": "padaria",
+            "value": {"merchant": "Doce Pao"},
+            "summary": "Padaria normalmente significa Doce Pao.", "confidence": 0.82,
+        }]}),
+    ])
+    monkeypatch.setattr("app.services.telegram_agent._complete", lambda *args, **kwargs: next(responses))
+    with SessionLocal() as db:
+        user, financing, hidden, rule = setup_financings(db)
+        db.add_all([SystemSetting(key="deepinfra_api_key", value="secret", is_secret=True),
+                    SystemSetting(key="deepinfra_model", value="deepseek")])
+        db.commit()
+        assert run_financial_agent(db, user, "Quando eu disser padaria, geralmente e a Doce Pao.") == "Entendi."
+        memory = db.scalar(select(UserMemory).where(UserMemory.user_id == user.id))
+        assert memory.memory_type == "merchant_alias" and memory.subject == "padaria"
+        assert relevant_memories(db, user.id, "gastei quinze na padaria") == [memory]

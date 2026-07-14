@@ -4,6 +4,7 @@ from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 import json
 from pathlib import Path
+import re
 from urllib.parse import parse_qs, urlparse
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Request
@@ -18,7 +19,7 @@ from app.dependencies import allowed_person_ids, current_user, current_workspace
 from app.models import (
     Account, AccountRole, AccountType, Card, Category, Person, PersonType, SystemAccount, SystemSetting,
     Transaction, TransactionStatus, TransactionType, User, UserPersonAccess, WorkspaceMember, TelegramLink,
-    RecurrenceRule, RecurrenceOccurrence, AccountingPeriod, Financing, MemberRole, Workspace,
+    RecurrenceRule, RecurrenceOccurrence, AccountingPeriod, Financing, MemberRole, UserMemory, Workspace,
 )
 from app.security import hash_password, verify_password
 from app.services.telegram_auth import PAIRING_TTL_MINUTES, create_pairing_code, unlink_telegram
@@ -1060,7 +1061,7 @@ def cards(request: Request, db: Session = Depends(get_db), user: User = Depends(
 
 @router.get("/cards/{card_id}", response_class=HTMLResponse)
 def card_detail(card_id: int, request: Request, year: int | None = None, month: int | None = None,
-                db: Session = Depends(get_db), user: User = Depends(current_user)):
+                view: str = "analytic", db: Session = Depends(get_db), user: User = Depends(current_user)):
     wid = current_workspace_id(request, user, db); today = date.today()
     selected_year, selected_month = year or today.year, month or today.month
     card = db.scalar(select(Card).where(Card.id == card_id, Card.workspace_id == wid))
@@ -1073,11 +1074,32 @@ def card_detail(card_id: int, request: Request, year: int | None = None, month: 
     ).order_by(Transaction.transaction_date, Transaction.id)).all()
     credit = [item for item in items if (item.payment_method or "").lower() in ("crédito", "credito")]
     debit = [item for item in items if item not in credit]
+    view = view if view in ("analytic", "detailed") else "analytic"
+    grouped = {}
+    for item in items:
+        display_name = re.sub(r"\s*\(\d+/\d+\)\s*$", "", item.description).strip()
+        method = "Crédito" if item in credit else "Débito"
+        key = (" ".join(display_name.casefold().split()), method.casefold())
+        row = grouped.setdefault(key, {
+            "description": display_name, "payment_method": method, "count": 0,
+            "total": Decimal(0), "categories": set(), "first_date": item.transaction_date,
+            "last_date": item.transaction_date,
+        })
+        row["count"] += 1
+        row["total"] += Decimal(item.amount)
+        row["first_date"] = min(row["first_date"], item.transaction_date)
+        row["last_date"] = max(row["last_date"], item.transaction_date)
+        if item.category:
+            row["categories"].add(f"{item.category.parent_name} > {item.category.name}" if item.category.parent_name else item.category.name)
+    analytic_rows = sorted(grouped.values(), key=lambda row: (-row["total"], row["description"].casefold()))
+    for row in analytic_rows:
+        row["average"] = row["total"] / row["count"]
+        row["category_label"] = ", ".join(sorted(row["categories"])) or "Sem categoria"
     categories = db.scalars(select(Category).where(
         Category.workspace_id == wid, Category.kind == TransactionType.expense
     ).order_by(Category.parent_name, Category.name)).all()
     return render(request, "cards/detail.html", user=user, card=card, credit=credit, debit=debit,
-                  categories=categories,
+                  categories=categories, view=view, analytic_rows=analytic_rows,
                   selected_year=selected_year, selected_month=selected_month,
                   credit_total=sum((Decimal(x.amount) for x in credit), Decimal(0)),
                   debit_total=sum((Decimal(x.amount) for x in debit), Decimal(0)))
@@ -1186,8 +1208,22 @@ def category_create(request: Request, name: str = Form(), parent_name: str | Non
 @router.get("/profile", response_class=HTMLResponse)
 def profile(request: Request, db: Session = Depends(get_db), user: User = Depends(current_user)):
     telegram_link = db.scalar(select(TelegramLink).where(TelegramLink.user_id == user.id))
+    memories = db.scalars(select(UserMemory).where(
+        UserMemory.user_id == user.id, UserMemory.is_active.is_(True)
+    ).order_by(UserMemory.updated_at.desc())).all()
     return render(request, "profile/index.html", user=user, telegram_link=telegram_link,
-                  pairing_ttl_minutes=PAIRING_TTL_MINUTES)
+                  pairing_ttl_minutes=PAIRING_TTL_MINUTES, memories=memories)
+
+
+@router.post("/profile/memories/{memory_id}/delete")
+def memory_delete(memory_id: int, request: Request, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    memory = db.scalar(select(UserMemory).where(UserMemory.id == memory_id, UserMemory.user_id == user.id))
+    if not memory:
+        raise HTTPException(404)
+    memory.is_active = False
+    db.commit()
+    flash(request, "Memória removida da Vitoria.")
+    return redirect("/profile")
 
 
 @router.post("/profile/telegram/code")

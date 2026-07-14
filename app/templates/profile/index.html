@@ -23,5 +23,14 @@
       {% endif %}
     </section>
   </div>
+  <div class="col-12">
+    <section class="panel form-panel">
+      <div><h2><i class="bi bi-brain"></i> Memórias da Vitoria</h2><p class="text-secondary">Informações permanentes aprendidas nas suas conversas. Saldos e valores temporários nunca são guardados aqui.</p></div>
+      <div class="table-responsive"><table class="table align-middle"><thead><tr><th>Memória</th><th>Tipo</th><th>Confiança</th><th></th></tr></thead><tbody>
+      {% for memory in memories %}<tr><td><strong>{{ memory.summary }}</strong><small class="d-block text-secondary">Observada {{ memory.observation_count }} vez(es)</small></td><td>{{ memory.memory_type }}</td><td>{{ (memory.confidence * 100)|round(0) }}%</td><td class="text-end"><form method="post" action="/profile/memories/{{ memory.id }}/delete" onsubmit="return confirm('Fazer a Vitoria esquecer esta informação?')"><button class="btn btn-sm btn-outline-danger">Esquecer</button></form></td></tr>
+      {% else %}<tr><td colspan="4" class="empty">A Vitoria ainda não aprendeu nenhuma preferência permanente.</td></tr>{% endfor %}
+      </tbody></table></div>
+    </section>
+  </div>
 </div>
 {% endblock %}
