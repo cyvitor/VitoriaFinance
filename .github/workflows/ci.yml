@@ -30,15 +30,18 @@ jobs:
       - name: Baixar o codigo do commit
         uses: actions/checkout@v6
 
-      - name: Configurar Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-          cache: pip
-          cache-dependency-path: requirements.txt
+      - name: Exibir versao do Python do runner
+        run: python3 --version
+
+      - name: Criar ambiente virtual
+        run: |
+          python3 -m venv .venv-ci
+          echo "$GITHUB_WORKSPACE/.venv-ci/bin" >> "$GITHUB_PATH"
 
       - name: Instalar dependencias
-        run: python -m pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
 
       - name: Executar testes
         run: python -m pytest -q
