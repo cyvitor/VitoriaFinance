@@ -18,7 +18,7 @@ from app.dependencies import allowed_person_ids, current_user, current_workspace
 from app.models import (
     Account, AccountRole, AccountType, Card, Category, Person, PersonType, SystemAccount, SystemSetting,
     Transaction, TransactionStatus, TransactionType, User, UserPersonAccess, WorkspaceMember, TelegramLink,
-    RecurrenceRule, RecurrenceOccurrence, AccountingPeriod, MemberRole, Workspace,
+    RecurrenceRule, RecurrenceOccurrence, AccountingPeriod, Financing, MemberRole, Workspace,
 )
 from app.security import hash_password, verify_password
 from app.services.telegram_auth import PAIRING_TTL_MINUTES, create_pairing_code, unlink_telegram
@@ -128,6 +128,15 @@ def optional_int(value: str | None) -> int | None:
     try:
         return int(value)
     except ValueError:
+        return None
+
+
+def optional_decimal(value: str | None) -> Decimal | None:
+    if value is None or not value.strip():
+        return None
+    try:
+        return Decimal(value.replace(".", "").replace(",", ".") if "," in value else value)
+    except InvalidOperation:
         return None
 
 
@@ -524,6 +533,7 @@ def fixed_expenses(request: Request, db: Session = Depends(get_db), user: User =
     rule_query = select(RecurrenceRule).where(
         RecurrenceRule.workspace_id == wid, RecurrenceRule.description.is_not(None),
         RecurrenceRule.transaction_type == TransactionType.expense,
+        ~RecurrenceRule.id.in_(select(Financing.recurrence_rule_id).where(Financing.recurrence_rule_id.is_not(None))),
     )
     if allowed is not None: rule_query = rule_query.where(RecurrenceRule.person_id.in_(allowed))
     rules = db.scalars(rule_query.order_by(RecurrenceRule.is_active.desc(), RecurrenceRule.description)).all()
@@ -558,6 +568,67 @@ def fixed_expense_create(request: Request, description: str = Form(), amount: De
     db.commit()
     flash(request, "Despesa fixa adicionada. Ela aparecerá para confirmação a cada mês.")
     return redirect("/fixed-expenses")
+
+
+@router.post("/fixed-expenses/{rule_id}/edit")
+def fixed_expense_edit(rule_id: int, request: Request, description: str = Form(), amount: Decimal = Form(),
+                       db: Session = Depends(get_db), user: User = Depends(current_user)):
+    wid = current_workspace_id(request, user, db)
+    rule = db.scalar(select(RecurrenceRule).where(RecurrenceRule.id == rule_id,
+        RecurrenceRule.workspace_id == wid, RecurrenceRule.transaction_type == TransactionType.expense,
+        RecurrenceRule.is_active.is_(True)))
+    if not rule or amount <= 0:
+        raise HTTPException(404)
+    rule.description, rule.amount = description.strip(), amount
+    db.commit()
+    flash(request, "Despesa fixa atualizada.")
+    return redirect("/fixed-expenses")
+
+
+@router.get("/financings", response_class=HTMLResponse)
+def financings(request: Request, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    wid = current_workspace_id(request, user, db)
+    allowed = allowed_person_ids(user, db)
+    query = select(Financing).where(Financing.workspace_id == wid)
+    if allowed is not None:
+        query = query.where(Financing.person_id.in_(allowed))
+    categories = db.scalars(select(Category).where(Category.workspace_id == wid,
+        Category.kind == TransactionType.expense).order_by(Category.parent_name, Category.name)).all()
+    return render(request, "financings/index.html", user=user,
+        items=db.scalars(query.order_by(Financing.status, Financing.description)).all(),
+        people=visible_people(user, wid, db), accounts=visible_accounts(user, wid, db), categories=categories)
+
+
+@router.post("/financings")
+def financing_create(request: Request, description: str = Form(), paid_installments: int = Form(),
+        total_installments: int = Form(), installment_amount: Decimal = Form(), person_id: int = Form(),
+        account_id: str | None = Form(None), category_id: str | None = Form(None),
+        financed_amount: str | None = Form(None), outstanding_balance: str | None = Form(None),
+        nominal_interest_rate: str | None = Form(None), institution: str | None = Form(None),
+        due_day: str | None = Form(None), notes: str | None = Form(None),
+        db: Session = Depends(get_db), user: User = Depends(current_user)):
+    wid = current_workspace_id(request, user, db)
+    ensure_area_access(person_id, user, wid, db)
+    account_value, category_value = optional_int(account_id), optional_int(category_id)
+    ensure_account_access(account_value, user, wid, db)
+    if total_installments < 1 or paid_installments < 0 or paid_installments >= total_installments or installment_amount <= 0:
+        flash(request, "Confira a quantidade de parcelas e o valor mensal.", "danger")
+        return redirect("/financings")
+    rule = RecurrenceRule(workspace_id=wid, frequency="monthly", transaction_type=TransactionType.expense,
+        start_date=date.today().replace(day=1),
+        description=f"{description.strip()} - parcela {paid_installments + 1}/{total_installments}", amount=installment_amount,
+        account_id=account_value, person_id=person_id, category_id=category_value,
+        notes=notes, created_by_id=user.id, is_active=True)
+    db.add(rule); db.flush()
+    db.add(Financing(workspace_id=wid, person_id=person_id, recurrence_rule_id=rule.id,
+        description=description.strip(), paid_installments=paid_installments,
+        total_installments=total_installments, installment_amount=installment_amount,
+        financed_amount=optional_decimal(financed_amount), outstanding_balance=optional_decimal(outstanding_balance),
+        nominal_interest_rate=optional_decimal(nominal_interest_rate), institution=(institution or "").strip() or None,
+        due_day=optional_int(due_day), notes=notes, status="active"))
+    db.commit()
+    flash(request, "Financiamento cadastrado e parcela mensal programada.")
+    return redirect("/financings")
 
 
 @router.post("/fixed-expenses/{rule_id}/delete")
@@ -656,6 +727,14 @@ def recurring_income_confirm(rule_id: int, request: Request, year: int = Form(),
         db.add(RecurrenceOccurrence(recurrence_rule_id=rule.id, year=year, month=month,
             status="partial" if is_partial else "confirmed", transaction_id=transaction.id,
             remaining_amount=remaining_before - confirmed_amount if is_partial else Decimal(0)))
+    financing = db.scalar(select(Financing).where(Financing.recurrence_rule_id == rule.id))
+    if financing and not is_partial:
+        financing.paid_installments = min(financing.total_installments, financing.paid_installments + 1)
+        if financing.paid_installments >= financing.total_installments:
+            financing.status = "paid"
+            rule.is_active = False
+        else:
+            rule.description = f"{financing.description} - parcela {financing.paid_installments + 1}/{financing.total_installments}"
     db.commit()
     label = "Receita" if rule.transaction_type == TransactionType.income else "Despesa"
     flash(request, f"{label} confirmada na competência {target_month:02d}/{target_year}.")

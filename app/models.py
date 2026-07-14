@@ -245,6 +245,29 @@ class RecurrenceOccurrence(Base):
     rule: Mapped[RecurrenceRule] = relationship()
 
 
+class Financing(Base):
+    __tablename__ = "financings"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    workspace_id: Mapped[int] = mapped_column(ForeignKey("workspaces.id", ondelete="CASCADE"), index=True)
+    person_id: Mapped[int] = mapped_column(ForeignKey("people.id", ondelete="CASCADE"), index=True)
+    recurrence_rule_id: Mapped[int | None] = mapped_column(ForeignKey("recurrence_rules.id", ondelete="SET NULL"), unique=True, nullable=True)
+    description: Mapped[str] = mapped_column(String(180))
+    paid_installments: Mapped[int] = mapped_column(default=0)
+    total_installments: Mapped[int] = mapped_column()
+    installment_amount: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+    financed_amount: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    outstanding_balance: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    nominal_interest_rate: Mapped[Decimal | None] = mapped_column(Numeric(7, 4), nullable=True)
+    institution: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    due_day: Mapped[int | None] = mapped_column(nullable=True)
+    start_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="active", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    person: Mapped[Person] = relationship()
+    recurrence_rule: Mapped[RecurrenceRule | None] = relationship()
+
+
 class AccountingPeriod(Base):
     __tablename__ = "accounting_periods"
     __table_args__ = (UniqueConstraint("workspace_id", "year", "month"),)

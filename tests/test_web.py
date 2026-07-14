@@ -2,7 +2,7 @@ from decimal import Decimal
 
 from app.database import SessionLocal
 from sqlalchemy import func, select
-from app.models import Account, AccountRole, AccountType, Card, Category, Person, PersonType, SystemAccount, SystemSetting, User, Workspace, WorkspaceMember, MemberRole, RecurrenceRule, RecurrenceOccurrence, Transaction, TransactionStatus, TransactionType
+from app.models import Account, AccountRole, AccountType, Card, Category, Financing, Person, PersonType, SystemAccount, SystemSetting, User, Workspace, WorkspaceMember, MemberRole, RecurrenceRule, RecurrenceOccurrence, Transaction, TransactionStatus, TransactionType
 from app.security import hash_password
 
 
@@ -123,6 +123,31 @@ def test_fixed_expense_partial_payment_keeps_remaining_and_uses_card(client):
     assert "R$ 250,00" in month.text
 
 
+def test_financing_creates_monthly_installment_and_advances_when_paid(client):
+    area_id = seed_test()
+    client.post("/login", data={"username":"vh", "password":"123456"})
+    with SessionLocal() as db:
+        workspace_id = db.scalar(select(Workspace.id))
+        account = Account(workspace_id=workspace_id, person_id=area_id, name="Conta", account_type=AccountType.checking)
+        db.add(account); db.commit(); account_id = account.id
+    response = client.post("/financings", data={"description":"Imóvel", "paid_installments":"162",
+        "total_installments":"360", "installment_amount":"1097.16", "person_id":str(area_id),
+        "account_id":str(account_id), "category_id":"", "financed_amount":"114000.00",
+        "outstanding_balance":"85081.93", "nominal_interest_rate":"7.66", "institution":"",
+        "due_day":"", "notes":""}, follow_redirects=False)
+    assert response.status_code == 303
+    page = client.get("/financings")
+    assert "198" in page.text and "85.081,93" in page.text
+    assert 'href="/financings" class="active"' in page.text
+    with SessionLocal() as db:
+        financing = db.scalar(select(Financing)); rule_id = financing.recurrence_rule_id
+        assert financing.paid_installments == 162 and financing.total_installments == 360
+    client.post(f"/recurrences/{rule_id}/confirm", data={"year":"2026", "month":"7",
+        "confirmed_amount":"1097.16", "payment_source":f"account:{account_id}"})
+    with SessionLocal() as db:
+        assert db.scalar(select(Financing.paid_installments)) == 163
+
+
 def test_account_admin_grants_only_selected_areas(client):
     first_area_id = seed_test()
     client.post("/login", data={"username": "vh", "password": "123456"})
@@ -178,6 +203,9 @@ def test_credit_and_debit_card_expenses_are_grouped_and_detailed(client):
     assert "Cartão Débito C6" in month.text
     detail = client.get(f"/cards/{card_id}?year=2026&month=7")
     assert "Compra" in detail.text and "Mercado" in detail.text
+    assert "Valor: maior para menor" in detail.text
+    assert "Data/hora: recentes" in detail.text
+    assert 'data-sort-target="creditExpenses"' in detail.text
     analysis = client.get("/analysis?history=12&horizon=24")
     assert analysis.status_code == 200
     assert "Análise financeira" in analysis.text
