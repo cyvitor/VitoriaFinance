@@ -122,6 +122,46 @@ class TelegramProcessedUpdate(Base):
     processed_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
+class TelegramConversationMessage(Base):
+    __tablename__ = "telegram_conversation_messages"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    role: Mapped[str] = mapped_column(String(20))
+    content: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+
+class TelegramPendingAction(Base):
+    __tablename__ = "telegram_pending_actions"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    action_type: Mapped[str] = mapped_column(String(60), index=True)
+    payload: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(30), default="collecting", index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class FinancingAmortization(Base):
+    __tablename__ = "financing_amortizations"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    financing_id: Mapped[int] = mapped_column(ForeignKey("financings.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"), index=True)
+    amortization_date: Mapped[date] = mapped_column(Date)
+    amortized_amount: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    previous_outstanding_balance: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    new_outstanding_balance: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+    previous_total_installments: Mapped[int] = mapped_column()
+    new_total_installments: Mapped[int] = mapped_column()
+    previous_installment_amount: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+    new_installment_amount: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+    strategy: Mapped[str] = mapped_column(String(30))
+    source: Mapped[str] = mapped_column(String(30), default="telegram")
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 class Workspace(Base):
     __tablename__ = "workspaces"
     id: Mapped[int] = mapped_column(primary_key=True)

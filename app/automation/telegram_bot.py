@@ -5,11 +5,8 @@ from sqlalchemy.orm import Session
 
 from app.models import TelegramLink, User
 from app.services.telegram_auth import consume_pairing_code
-from app.services.telegram_ai import AIUnavailableError, interpret_financial_message
-from app.services.telegram_expenses import (
-    cancel_expense_draft, confirm_expense_draft, create_expense_draft,
-    ExpenseInput, format_draft, get_active_draft,
-)
+from app.services.telegram_ai import AIUnavailableError
+from app.services.telegram_agent import run_financial_agent
 
 
 def handle_message(db: Session, message: dict) -> str:
@@ -37,20 +34,6 @@ def handle_message(db: Session, message: dict) -> str:
     if not user or not user.is_active or (user.system_account and not user.system_account.is_active):
         return "Seu Telegram ainda nao esta associado. Gere um codigo em Meu perfil e envie /start CODIGO."
     try:
-        intent = interpret_financial_message(db, user, text, get_active_draft(db, user.id))
+        return run_financial_agent(db, user, text)
     except AIUnavailableError:
         return "A Vitoria esta temporariamente indisponivel. Por seguranca, nenhum lancamento foi feito; use a interface web por enquanto."
-    if intent.intent == "create_expense":
-        draft = create_expense_draft(db, user, ExpenseInput(intent.amount, intent.description))
-        if not draft:
-            return "Defina uma area financeira padrao em Meu perfil antes de registrar gastos pelo Telegram."
-        return format_draft(draft)
-    if intent.intent == "confirm":
-        transaction = confirm_expense_draft(db, user)
-        if not transaction:
-            return "Nao ha um gasto aguardando confirmacao ou o rascunho expirou."
-        amount = f"{transaction.amount:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-        return f"Gasto registrado com sucesso: {transaction.description} - R$ {amount}."
-    if intent.intent == "cancel":
-        return "Gasto cancelado." if cancel_expense_draft(db, user) else "Nao ha um gasto aguardando confirmacao."
-    return intent.reply or "Como posso ajudar com seus gastos?"

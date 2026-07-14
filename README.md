@@ -19,9 +19,8 @@ O VitoriaFinance nasceu dessa necessidade: manter uma visão financeira clara e 
 - Fechamento e reabertura de competências mensais.
 - Análise financeira por período e área, com evolução mensal, categorias, setores e projeção de saldo de 3 a 60 meses.
 - Contas do sistema, usuários, administradores e permissões por área financeira.
-- Configuração global e teste de conexão com DeepInfra e Telegram.
-
-> A integração da IA e o bot do Telegram ainda não executam operações financeiras. Nesta fase, o sistema apenas armazena suas configurações e testa as conexões.
+- Configuração global e integração operacional com DeepInfra e Telegram.
+- Assistente financeira conversacional com consultas protegidas por área, registro confirmado de despesas e atualização confirmada de amortizações.
 
 ## Tecnologias
 
@@ -74,6 +73,12 @@ bot cria um rascunho valido por 30 minutos. Respostas naturais como `sim, pode
 registrar` ou `nao, cancela` confirmam ou descartam o rascunho. Se a IA estiver
 indisponivel, nenhum lancamento e criado e o bot orienta o uso da interface web.
 
+A Vitoria também consulta contas, cartões, receitas, despesas, gastos de cartão,
+resumos mensais e financiamentos. O backend injeta o escopo do usuário associado
+e reaplica as permissões em cada ferramenta; a IA nunca escolhe IDs de usuário,
+workspace ou áreas fora das permitidas. Amortizações são coletadas em conversa,
+apresentadas para conferência e somente alteram o contrato após confirmação clara.
+
 Acesse [http://localhost:8000](http://localhost:8000).
 
 O seed inicial cria o acesso abaixo somente para o ambiente recém-instalado:
@@ -107,6 +112,7 @@ Essa operação é destrutiva para os dados financeiros e deve ser usada com cui
 - [Guia funcional](docs/guia-funcional.md)
 - [Instalação e configuração](docs/instalacao-e-configuracao.md)
 - [Arquitetura e modelo de dados](docs/arquitetura.md)
+- [Agente financeiro do Telegram](docs/agente-telegram.md)
 - [Roadmap](docs/roadmap.md)
 - [Planejamento inicial](docs/plano-inicial.md)
 

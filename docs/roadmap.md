@@ -17,15 +17,19 @@ Este documento diferencia o que está disponível no código atual do que contin
 - Configuração e teste de conexão com DeepInfra e Telegram.
 - Migrações Alembic, seed inicial e testes funcionais automatizados.
 
-## Próxima etapa: assistente e Telegram
+## Assistente e Telegram
 
-- Executar o bot por long polling ou por uma arquitetura equivalente.
-- Vincular com segurança o identificador do Telegram ao usuário autenticado.
-- Interpretar mensagens em linguagem natural.
-- Registrar receitas e despesas após confirmação do usuário.
-- Responder a consultas como saldo, gastos, pendências e projeções.
-- Aplicar as mesmas permissões de workspace e área financeira usadas pela interface web.
-- Criar trilha de auditoria das ações realizadas pela IA.
+- [x] Executar o bot por long polling.
+- [x] Vincular com segurança o identificador do Telegram ao usuário autenticado.
+- [x] Interpretar mensagens em linguagem natural com DeepInfra.
+- [x] Registrar despesas após confirmação natural do usuário.
+- [x] Consultar contas, cartões, receitas, despesas, gastos de cartão, resumo mensal e financiamentos.
+- [x] Aplicar no backend as permissões de workspace, área financeira e escrita.
+- [x] Coletar e confirmar atualizações de amortização, preservando histórico.
+- [x] Persistir histórico curto de conversa e atualizações processadas.
+- [ ] Registrar receitas e transferências por conversa.
+- [ ] Adicionar consultas de pendências e projeções detalhadas.
+- [ ] Expor a trilha de ferramentas e ações em uma tela administrativa.
 
 ## Planejamento e relatórios
 
