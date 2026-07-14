@@ -1,0 +1,44 @@
+name: Testes
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: testes-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    name: Pytest no runner proprio
+    runs-on:
+      - self-hosted
+      - Linux
+      - X64
+      - vitoria-test
+    timeout-minutes: 15
+
+    steps:
+      - name: Baixar o codigo do commit
+        uses: actions/checkout@v6
+
+      - name: Configurar Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Instalar dependencias
+        run: python -m pip install -r requirements.txt
+
+      - name: Executar testes
+        run: python -m pytest -q
