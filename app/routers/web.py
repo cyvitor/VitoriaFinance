@@ -409,13 +409,14 @@ def card_expense_form(request: Request, db: Session = Depends(get_db), user: Use
     categories = db.scalars(select(Category).where(
         Category.workspace_id == wid, Category.kind == TransactionType.expense
     ).order_by(Category.parent_name, Category.name)).all()
-    return render(request, "cards/expense_form.html", user=user, cards=cards, categories=categories)
+    return render(request, "cards/expense_form.html", user=user, cards=cards, categories=categories,
+                  today=date.today())
 
 
 @router.post("/card-expenses/new")
 def card_expense_create(request: Request, card_id: int = Form(), description: str = Form(),
         amount: Decimal = Form(), payment_method: str = Form(), purchase_type: str = Form("cash"),
-        installments: int = Form(1), category_id: int = Form(),
+        installments: int = Form(1), category_id: int = Form(), purchase_date: date = Form(),
         db: Session = Depends(get_db), user: User = Depends(current_user)):
     wid = current_workspace_id(request, user, db)
     card = db.scalar(select(Card).where(Card.id == card_id, Card.workspace_id == wid, Card.is_active))
@@ -440,11 +441,10 @@ def card_expense_create(request: Request, card_id: int = Form(), description: st
         return redirect("/card-expenses/new")
     total_cents = int((amount * 100).quantize(Decimal("1")))
     base_cents, remainder = divmod(total_cents, count)
-    today = date.today()
     for index in range(count):
-        month_index = today.month - 1 + index
-        year, month = today.year + month_index // 12, month_index % 12 + 1
-        tx_date = date(year, month, min(today.day, monthrange(year, month)[1]))
+        month_index = purchase_date.month - 1 + index
+        year, month = purchase_date.year + month_index // 12, month_index % 12 + 1
+        tx_date = date(year, month, min(purchase_date.day, monthrange(year, month)[1]))
         cents = base_cents + (remainder if index == count - 1 else 0)
         label = f"{description.strip()} ({index + 1}/{count})" if count > 1 else description.strip()
         db.add(Transaction(
@@ -458,7 +458,7 @@ def card_expense_create(request: Request, card_id: int = Form(), description: st
         ))
     db.commit()
     flash(request, f"Gasto no cartão registrado{' em ' + str(count) + ' parcelas' if count > 1 else ''}.")
-    return redirect(f"/cards/{card.id}?year={today.year}&month={today.month}")
+    return redirect(f"/cards/{card.id}?year={purchase_date.year}&month={purchase_date.month}&view=detailed")
 
 
 @router.get("/future", response_class=HTMLResponse)
@@ -573,6 +573,7 @@ def fixed_expense_create(request: Request, description: str = Form(), amount: De
 
 @router.post("/fixed-expenses/{rule_id}/edit")
 def fixed_expense_edit(rule_id: int, request: Request, description: str = Form(), amount: Decimal = Form(),
+                       category_id: str | None = Form(None),
                        db: Session = Depends(get_db), user: User = Depends(current_user)):
     wid = current_workspace_id(request, user, db)
     rule = db.scalar(select(RecurrenceRule).where(RecurrenceRule.id == rule_id,
@@ -580,7 +581,15 @@ def fixed_expense_edit(rule_id: int, request: Request, description: str = Form()
         RecurrenceRule.is_active.is_(True)))
     if not rule or amount <= 0:
         raise HTTPException(404)
-    rule.description, rule.amount = description.strip(), amount
+    ensure_area_access(rule.person_id, user, wid, db)
+    category_value = optional_int(category_id)
+    if category_value and not db.scalar(select(Category.id).where(
+        Category.id == category_value, Category.workspace_id == wid,
+        Category.kind == TransactionType.expense,
+    )):
+        flash(request, "Selecione uma categoria de despesa válida.", "danger")
+        return redirect("/fixed-expenses")
+    rule.description, rule.amount, rule.category_id = description.strip(), amount, category_value
     db.commit()
     flash(request, "Despesa fixa atualizada.")
     return redirect("/fixed-expenses")
@@ -1061,7 +1070,7 @@ def cards(request: Request, db: Session = Depends(get_db), user: User = Depends(
 
 @router.get("/cards/{card_id}", response_class=HTMLResponse)
 def card_detail(card_id: int, request: Request, year: int | None = None, month: int | None = None,
-                view: str = "analytic", db: Session = Depends(get_db), user: User = Depends(current_user)):
+                view: str = "detailed", db: Session = Depends(get_db), user: User = Depends(current_user)):
     wid = current_workspace_id(request, user, db); today = date.today()
     selected_year, selected_month = year or today.year, month or today.month
     card = db.scalar(select(Card).where(Card.id == card_id, Card.workspace_id == wid))
@@ -1074,7 +1083,7 @@ def card_detail(card_id: int, request: Request, year: int | None = None, month: 
     ).order_by(Transaction.transaction_date, Transaction.id)).all()
     credit = [item for item in items if (item.payment_method or "").lower() in ("crédito", "credito")]
     debit = [item for item in items if item not in credit]
-    view = view if view in ("analytic", "detailed") else "analytic"
+    view = view if view in ("analytic", "detailed") else "detailed"
     grouped = {}
     for item in items:
         display_name = re.sub(r"\s*\(\d+/\d+\)\s*$", "", item.description).strip()
@@ -1108,6 +1117,7 @@ def card_detail(card_id: int, request: Request, year: int | None = None, month: 
 @router.post("/cards/{card_id}/expenses/{transaction_id}/edit")
 def card_expense_edit(card_id: int, transaction_id: int, request: Request,
                       description: str = Form(), amount: Decimal = Form(), category_id: int = Form(),
+                      transaction_date: date = Form(),
                       db: Session = Depends(get_db), user: User = Depends(current_user)):
     wid = current_workspace_id(request, user, db)
     card = db.scalar(select(Card).where(Card.id == card_id, Card.workspace_id == wid))
@@ -1129,9 +1139,12 @@ def card_expense_edit(card_id: int, transaction_id: int, request: Request,
     item.description = description.strip()
     item.amount = amount
     item.category_id = category.id
+    item.transaction_date = transaction_date
+    item.competence_year = transaction_date.year
+    item.competence_month = transaction_date.month
     db.commit()
     flash(request, "Gasto do cartão atualizado.")
-    return redirect(f"/cards/{card.id}?year={year}&month={month}")
+    return redirect(f"/cards/{card.id}?year={transaction_date.year}&month={transaction_date.month}&view=detailed")
 
 
 @router.post("/cards/{card_id}/confirm")

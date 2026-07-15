@@ -53,6 +53,16 @@ python main.py
 
 A aplicação fica disponível em [http://localhost:8000](http://localhost:8000). O endpoint `/health` retorna um JSON simples para verificação de disponibilidade.
 
+## Worker do Telegram
+
+No painel **Configurações globais**, informe e teste a chave da DeepInfra, o modelo e o token do bot. Depois execute o worker em outro processo:
+
+```powershell
+python -m app.automation.runner
+```
+
+O processo web continua responsável pela interface e pelos códigos de associação; o worker usa long polling para receber as mensagens. Em produção, mantenha ambos os processos supervisionados e reinicie o worker quando alterar suas configurações operacionais.
+
 ## Migrações e seed
 
 O histórico consolidado contém duas migrações:
@@ -97,3 +107,5 @@ O comando remove lançamentos, ocorrências e regras recorrentes, além dos fech
 - Proteja o arquivo `.env` e faça backup periódico do MySQL.
 - Restrinja o usuário do banco ao banco da aplicação.
 - Não exponha as configurações globais a contas que não devam administrar IA e Telegram.
+- Execute o processo web e o worker do Telegram com supervisão e logs.
+- Nunca versione chaves da DeepInfra, tokens do Telegram, dumps ou backups com dados reais.

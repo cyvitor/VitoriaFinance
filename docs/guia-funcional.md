@@ -48,6 +48,7 @@ A visão mensal é o centro do acompanhamento financeiro. Ela permite navegar pe
 - receitas recorrentes e despesas fixas aguardando decisão;
 - gastos de cartão agrupados por cartão, modalidade e situação;
 - meses com movimentação dentro do ano selecionado.
+- atalhos para receita, conta e gasto no cartão.
 
 O mês pode ser fechado e reaberto. Se uma confirmação for feita para uma competência fechada, o lançamento será direcionado ao próximo mês aberto.
 
@@ -56,7 +57,7 @@ O mês pode ser fechado e reaberto. Se uma confirmação for feita para uma comp
 O sistema aceita três tipos:
 
 - **Receita:** entrada de dinheiro vinculada a uma área, conta e, opcionalmente, categoria.
-- **Despesa:** saída de dinheiro com área, conta, categoria, forma de pagamento e cartão opcionais.
+- **Despesa:** saída de dinheiro com área, conta, categoria, forma de pagamento e cartão opcionais no fluxo geral.
 - **Transferência:** movimentação entre duas contas diferentes. Não é somada como receita nem despesa no cálculo consolidado.
 
 Os lançamentos possuem situação pendente, paga ou cancelada. Itens pendentes podem ser confirmados posteriormente, respeitando o fechamento das competências.
@@ -69,12 +70,16 @@ Os cartões podem ser vinculados a uma conta e armazenam bandeira, limite, dia d
 
 ### Regras dos gastos no cartão
 
+- O fluxo rápido exige descrição, valor, cartão e categoria de despesa.
+- A mesma descrição pode ser classificada de maneiras diferentes; por exemplo, compras no mesmo estabelecimento podem pertencer a `Alimentação > Mercado` ou `Lazer`.
 - Débito entra como despesa confirmada.
 - Crédito entra como despesa pendente até a confirmação da fatura.
 - Uma compra no crédito pode ser parcelada de 1 a 120 vezes.
 - As parcelas são distribuídas pelas competências seguintes.
 - Eventuais centavos restantes ficam na última parcela para preservar exatamente o valor total.
-- O extrato permite consultar os gastos do cartão, confirmar a fatura da competência e remover um gasto, tratado na interface como estorno.
+- Todas as parcelas recebem a categoria escolhida na compra.
+- O extrato exibe setor e categoria e permite editar descrição, valor e categoria de cada lançamento.
+- O extrato também permite confirmar a fatura da competência e remover um gasto, tratado na interface como estorno.
 
 ## Receitas recorrentes e despesas fixas
 
@@ -99,8 +104,20 @@ A tela apresenta receitas, despesas, gastos no crédito, saldo atual, taxa de ec
 
 A projeção é uma estimativa baseada no histórico e nas recorrências cadastradas, não uma garantia de saldo futuro.
 
+## Análise mensal e financiamentos
+
+A análise mensal detalha uma competência específica para facilitar a comparação das despesas e a leitura das categorias que mais pesaram no período.
+
+Financiamentos mantêm os dados atuais do contrato e podem ser associados a uma despesa fixa. Atualizações de amortização preservam o histórico anterior e só são aplicadas pelo agente depois de o usuário conferir e confirmar a alteração.
+
 ## Configurações de IA e Telegram
 
 O superadministrador pode salvar a chave da DeepInfra, carregar o catálogo de modelos, escolher um modelo e testar uma chamada curta. Também pode salvar um token do Telegram e validá-lo por meio do método `getMe`.
 
-Essas telas validam a conectividade, mas o assistente de IA e o bot operacional ainda fazem parte do roadmap. Atualmente não há interpretação de mensagens, vínculo de usuários do Telegram nem criação de lançamentos pela IA.
+O bot é executado separadamente por long polling. Cada usuário gera em **Meu perfil** um código temporário de oito dígitos e envia `/start CODIGO` ao bot para associar seu Telegram User ID.
+
+Depois do vínculo, a Vitoria interpreta mensagens naturais usando o modelo selecionado na DeepInfra. Ela pode consultar dados financeiros dentro das áreas permitidas, preparar despesas e atualizações de amortização e solicitar confirmação antes de persistir essas mudanças. Falhas da IA não criam lançamentos silenciosamente.
+
+## Interface responsiva
+
+O menu lateral mantém logo e ações de perfil fixos, enquanto a lista central possui rolagem própria. Em telas pequenas, o mesmo menu pode ser aberto pelo botão superior, rolado por toque e é fechado após a seleção de uma página.

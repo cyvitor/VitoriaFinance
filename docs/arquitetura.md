@@ -2,7 +2,7 @@
 
 ## Estrutura da aplicação
 
-O projeto é um monólito web em Python. Um único processo Uvicorn executa o FastAPI, renderiza páginas Jinja2 e atende os arquivos estáticos locais.
+O projeto mantém um monólito web em Python e um worker de automação separado. O processo Uvicorn executa o FastAPI, renderiza páginas Jinja2 e atende os arquivos estáticos locais; o worker recebe atualizações do Telegram por long polling e reutiliza os mesmos serviços e banco.
 
 ```text
 Navegador
@@ -14,6 +14,8 @@ Rotas web e regras de negócio
 SQLAlchemy
    |
 MySQL
+
+Telegram -> worker de automação -> agente financeiro -> serviços de domínio -> SQLAlchemy
 ```
 
 Bootstrap, Bootstrap Icons, HTMX e Chart.js são carregados por CDN. A interface atual usa principalmente formulários HTML tradicionais e redirecionamentos após operações de escrita.
@@ -28,6 +30,8 @@ app/
   models.py          enums e entidades persistidas
   routers/web.py     páginas, operações e regras de negócio
   security.py        hash e verificação de senhas
+  automation/        worker e processamento de atualizações do Telegram
+  services/          agente, ferramentas financeiras, IA e vínculo do Telegram
   templates/         páginas Jinja2
   static/            CSS, JavaScript, ícones e imagens
 alembic/              migrações do banco
@@ -66,6 +70,14 @@ As consultas financeiras filtram o workspace da sessão e, quando necessário, o
 | `RecurrenceOccurrence` | Decisão de confirmar ou ignorar uma recorrência em uma competência |
 | `AccountingPeriod` | Estado aberto ou fechado de um mês |
 | `SystemSetting` | Configurações globais, inclusive credenciais de serviços externos |
+| `Financing` | Estado atual de um financiamento e vínculo opcional com uma despesa fixa |
+| `FinancingAmortization` | Histórico das alterações confirmadas de uma amortização |
+| `TelegramLink` | Associação entre usuário do sistema e Telegram User ID |
+| `TelegramPairingCode` | Código temporário e de uso único para associação |
+| `TelegramExpenseDraft` | Despesa preparada e ainda não confirmada |
+| `TelegramPendingAction` | Alteração financeira aguardando confirmação |
+| `TelegramConversationMessage` | Histórico curto usado como contexto de conversa |
+| `TelegramProcessedUpdate` | Controle de idempotência das atualizações recebidas |
 
 ## Cálculo financeiro
 
@@ -81,9 +93,9 @@ O dashboard e a visão mensal priorizam a competência. A análise histórica us
 - Rotas protegidas validam usuário ativo e conta do sistema ativa.
 - As configurações de DeepInfra e Telegram são marcadas como secretas no banco, mas atualmente são armazenadas no campo textual da configuração; a proteção do banco e dos backups é, portanto, essencial.
 
-## Integrações externas atuais
+## Integrações externas e agente
 
-- **DeepInfra:** consulta o catálogo de modelos e testa uma chamada compatível com a API de chat da OpenAI.
-- **Telegram:** testa o token por meio do endpoint `getMe`.
+- **DeepInfra:** consulta o catálogo de modelos e usa a API de chat compatível com OpenAI para interpretar e redigir respostas.
+- **Telegram:** valida o token com `getMe` e recebe mensagens pelo worker de long polling.
 
-Não existe ainda um worker, scheduler, serviço de bot ou camada de ferramentas de IA. Essas peças permanecem como evolução planejada.
+O modelo não acessa o banco diretamente. O agente oferece ferramentas com argumentos de negócio, cria um contexto imutável de acesso e reaplica workspace, áreas e permissão de escrita no backend. Escritas financeiras sensíveis usam preparação e confirmação em duas etapas.

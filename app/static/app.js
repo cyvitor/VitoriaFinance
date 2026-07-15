@@ -7,3 +7,13 @@ document.querySelectorAll('select[name="person_id"]').forEach((select) => {
   const defaultArea = document.body.dataset.defaultArea;
   if (defaultArea && select.querySelector(`option[value="${defaultArea}"]`)) select.value = defaultArea;
 });
+
+const sidebar = document.querySelector('.sidebar');
+const activeMenuItem = sidebar?.querySelector('nav a.active');
+if (activeMenuItem) activeMenuItem.scrollIntoView({block: 'nearest'});
+
+sidebar?.querySelectorAll('nav a').forEach((link) => {
+  link.addEventListener('click', () => {
+    if (window.matchMedia('(max-width: 760px)').matches) sidebar.classList.remove('open');
+  });
+});

@@ -93,6 +93,29 @@ def test_fixed_expense_inline_confirm_and_skip(client):
         assert tx.amount == Decimal("732.45")
 
 
+def test_fixed_expense_category_can_be_edited(client):
+    area_id = seed_test()
+    client.post("/login", data={"username": "vh", "password": "123456"})
+    with SessionLocal() as db:
+        workspace_id = db.scalar(select(Workspace.id))
+        category = Category(workspace_id=workspace_id, kind=TransactionType.expense,
+                            parent_name="Moradia", name="Aluguel", color="#6c5ce7")
+        rule = RecurrenceRule(workspace_id=workspace_id, frequency="monthly",
+                              transaction_type=TransactionType.expense, description="Moradia",
+                              amount=Decimal("750.00"), person_id=area_id, is_active=True)
+        db.add_all([category, rule]); db.commit(); category_id = category.id; rule_id = rule.id
+    page = client.get("/fixed-expenses")
+    assert "Editar despesa fixa" in page.text and "Categoria" in page.text
+    response = client.post(f"/fixed-expenses/{rule_id}/edit", data={
+        "description": "Aluguel residencial", "amount": "760.00", "category_id": str(category_id),
+    }, follow_redirects=False)
+    assert response.status_code == 303
+    with SessionLocal() as db:
+        edited = db.get(RecurrenceRule, rule_id)
+        assert edited.category_id == category_id
+        assert edited.description == "Aluguel residencial"
+
+
 def test_fixed_expense_partial_payment_keeps_remaining_and_uses_card(client):
     area_id = seed_test()
     client.post("/login", data={"username": "vh", "password": "123456"})
@@ -201,13 +224,13 @@ def test_credit_and_debit_card_expenses_are_grouped_and_detailed(client):
     month = client.get("/month?year=2026&month=7")
     assert "Cartão Crédito C6" in month.text
     assert "Cartão Débito C6" in month.text
-    analytic = client.get(f"/cards/{card_id}?year=2026&month=7")
-    assert "Gastos agrupados" in analytic.text and "Analítica" in analytic.text and "Detalhada" in analytic.text
-    detail = client.get(f"/cards/{card_id}?year=2026&month=7&view=detailed")
+    detail = client.get(f"/cards/{card_id}?year=2026&month=7")
     assert "Compra" in detail.text and "Mercado" in detail.text
     assert "Valor: maior para menor" in detail.text
     assert "Data/hora: recentes" in detail.text
     assert 'data-sort-target="creditExpenses"' in detail.text
+    analytic = client.get(f"/cards/{card_id}?year=2026&month=7&view=analytic")
+    assert "Gastos agrupados" in analytic.text and "Analítica" in analytic.text and "Detalhada" in analytic.text
     analysis = client.get("/analysis?history=12&horizon=24")
     assert analysis.status_code == 200
     assert "Análise financeira" in analysis.text
@@ -222,9 +245,10 @@ def test_credit_and_debit_card_expenses_are_grouped_and_detailed(client):
     response = client.post("/card-expenses/new", data={
         "card_id": str(card_id), "description": "Notebook", "amount": "100.00",
         "payment_method": "Crédito", "purchase_type": "installments", "installments": "3",
-        "category_id": str(category_id),
+        "category_id": str(category_id), "purchase_date": "2026-07-14",
     }, follow_redirects=False)
     assert response.status_code == 303
+    assert response.headers["location"].endswith("&view=detailed")
     with SessionLocal() as db:
         parcels = db.scalars(select(Transaction).where(Transaction.description.like("Notebook%"))).all()
         assert len(parcels) == 3
@@ -234,12 +258,15 @@ def test_credit_and_debit_card_expenses_are_grouped_and_detailed(client):
         first_parcel_id = parcels[0].id
     response = client.post(f"/cards/{card_id}/expenses/{first_parcel_id}/edit", data={
         "description": "Notebook ajustado", "amount": "34.00", "category_id": str(category_id),
+        "transaction_date": "2026-08-02",
     }, follow_redirects=False)
     assert response.status_code == 303
     with SessionLocal() as db:
         edited = db.get(Transaction, first_parcel_id)
         assert edited.description == "Notebook ajustado"
         assert edited.amount == Decimal("34.00")
+        assert edited.transaction_date.isoformat() == "2026-08-02"
+        assert (edited.competence_year, edited.competence_month) == (2026, 8)
 
 
 def test_superadmin_creates_account_and_refreshes_deepinfra_models(client, monkeypatch):

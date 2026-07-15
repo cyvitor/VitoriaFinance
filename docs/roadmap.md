@@ -10,10 +10,11 @@ Este documento diferencia o que está disponível no código atual do que contin
 - Áreas financeiras pessoais ou compartilhadas e acesso por usuário.
 - Contas bancárias, cartões e categorias.
 - Receitas, despesas e transferências.
-- Gastos no cartão em crédito ou débito e parcelamento.
+- Gastos no cartão em crédito ou débito, categoria obrigatória, edição pelo extrato e parcelamento.
 - Receitas recorrentes e despesas fixas com confirmação mensal.
 - Visão por competência, fechamento e reabertura do mês.
-- Dashboard e análise financeira com projeção de saldo.
+- Dashboard, análise mensal e análise financeira com projeção de saldo.
+- Financiamentos e histórico confirmado de amortizações.
 - Configuração e teste de conexão com DeepInfra e Telegram.
 - Migrações Alembic, seed inicial e testes funcionais automatizados.
 

@@ -6,20 +6,22 @@ O VitoriaFinance é um sistema web de gestão financeira pessoal e compartilhada
 
 Ao conhecer os sistemas financeiros disponíveis no mercado, não encontrei um que mostrasse minhas finanças da mesma forma que a planilha de Excel que eu já usava. Com a evolução da inteligência artificial e a possibilidade de contar com ela durante o desenvolvimento, decidi transformar aquela experiência em um sistema próprio.
 
-O VitoriaFinance nasceu dessa necessidade: manter uma visão financeira clara e familiar, mas com espaço para evoluir. A ideia é que, no futuro, a **Vitoria** seja uma assistente financeira com IA disponível também pelo Telegram, ajudando a registrar movimentações, consultar informações e planejar melhor o uso do dinheiro.
+O VitoriaFinance nasceu dessa necessidade: manter uma visão financeira clara e familiar, mas com espaço para evoluir. A **Vitoria** já atua como assistente financeira pelo Telegram, ajudando a registrar despesas, consultar informações e acompanhar financiamentos com confirmação antes de alterações financeiras.
 
 ## O que já está disponível
 
 - Dashboard com saldo, entradas, saídas, compromissos, saldo livre e despesas por categoria.
-- Visão mensal e anual por competência, com valores realizados e previstos.
+- Visão mensal por competência, com navegação anual, valores realizados e previstos, fechamento de mês e atalhos de lançamento.
+- Análise mensal comparativa e análise financeira histórica com projeções.
 - Receitas, despesas e transferências entre contas.
 - Contas bancárias, cartões, categorias e áreas financeiras.
-- Gastos no crédito e no débito, extrato do cartão, confirmação de fatura e parcelamento em até 120 vezes.
+- Gastos no crédito e no débito com categoria obrigatória, extrato editável, confirmação de fatura e parcelamento em até 120 vezes.
 - Receitas recorrentes e despesas fixas, confirmadas ou ignoradas individualmente em cada mês.
 - Fechamento e reabertura de competências mensais.
 - Análise financeira por período e área, com evolução mensal, categorias, setores e projeção de saldo de 3 a 60 meses.
 - Contas do sistema, usuários, administradores e permissões por área financeira.
 - Configuração global e integração operacional com DeepInfra e Telegram.
+- Financiamentos vinculados a despesas fixas e histórico de amortizações.
 - Assistente financeira conversacional com consultas protegidas por área, registro confirmado de despesas e atualização confirmada de amortizações.
 
 ## Tecnologias
@@ -55,17 +57,17 @@ python -m alembic upgrade head
 python main.py
 ```
 
-Para iniciar o worker de automacao e o bot Telegram em outro terminal, configure
-primeiro o token em **Configuracoes globais** e execute:
+Para iniciar o worker de automação e o bot Telegram em outro terminal, configure
+primeiro o token e a DeepInfra em **Configurações globais** e execute:
 
 ```bash
 python -m app.automation.runner
 ```
 
-Cada usuario associa o proprio Telegram em **Meu perfil**. O sistema gera um
-codigo de oito digitos, de uso unico e valido por dez minutos, que deve ser
-enviado ao bot no formato `/start CODIGO`. A vinculacao usa o Telegram User ID,
-nao o username.
+Cada usuário associa o próprio Telegram em **Meu perfil**. O sistema gera um
+código de oito dígitos, de uso único e válido por dez minutos, que deve ser
+enviado ao bot no formato `/start CODIGO`. A vinculação usa o Telegram User ID,
+não o username.
 
 Depois da vinculacao, o usuario conversa naturalmente com a Vitoria, por exemplo:
 `gastei 85,90 no mercado`. O modelo ativo da DeepInfra interpreta a intencao e o
@@ -118,4 +120,4 @@ Essa operação é destrutiva para os dados financeiros e deve ser usada com cui
 
 ## Status
 
-O núcleo web está funcional e em evolução. As próximas etapas concentram-se no assistente financeiro com IA, na integração operacional com o Telegram e em novos recursos de planejamento e relatórios.
+O núcleo web e o agente financeiro pelo Telegram estão funcionais e em evolução. As próximas etapas concentram-se em metas, planejamento financeiro, relatórios, importações e ampliação das operações disponíveis por conversa.
