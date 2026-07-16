@@ -28,9 +28,13 @@ Este documento diferencia o que está disponível no código atual do que contin
 - [x] Aplicar no backend as permissões de workspace, área financeira e escrita.
 - [x] Coletar e confirmar atualizações de amortização, preservando histórico.
 - [x] Persistir histórico curto de conversa e atualizações processadas.
+- [x] Consultar saldo livre com simulação de um gasto planejado.
+- [x] Repetir decisões inválidas e exigir ferramenta em consultas financeiras.
+- [x] Registrar logs básicos ou detalhados do worker e do agente.
 - [ ] Registrar receitas e transferências por conversa.
 - [ ] Adicionar consultas de pendências e projeções detalhadas.
 - [ ] Expor a trilha de ferramentas e ações em uma tela administrativa.
+- [ ] Evoluir para um agente multi-turno de ferramentas, permitindo que o modelo execute várias consultas sequenciais no mesmo pedido, como nos fluxos de agentes do n8n, com limite de passos, orçamento, auditoria e prevenção de ciclos.
 
 ## Planejamento e relatórios
 

@@ -20,6 +20,10 @@ class Settings:
     db_password = os.getenv("DB_PASSWORD", "vitoria")
     db_charset = os.getenv("DB_CHARSET", "utf8mb4")
     session_https_only = os.getenv("SESSION_HTTPS_ONLY", "false").lower() == "true"
+    bot_log_dir = os.getenv("BOT_LOG_DIR", "logs")
+    bot_log_level = os.getenv("BOT_LOG_LEVEL", "basic").lower()
+    bot_log_max_bytes = int(os.getenv("BOT_LOG_MAX_BYTES", "10485760"))
+    bot_log_backup_count = int(os.getenv("BOT_LOG_BACKUP_COUNT", "7"))
 
     @property
     def database_url(self) -> str:

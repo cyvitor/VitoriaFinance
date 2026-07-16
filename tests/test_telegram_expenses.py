@@ -11,7 +11,7 @@ from app.models import (
 from app.security import hash_password
 from app.services.access_context import build_user_access_context
 from app.services.financial_tools import execute_tool
-from app.services.telegram_ai import AIUnavailableError
+from app.services.telegram_ai import AIResponseFormatError, AIUnavailableError
 
 
 def setup_linked_user(db):
@@ -72,3 +72,14 @@ def test_ai_failure_does_not_create_transaction(monkeypatch):
         response = handle_message(db, message("gastei 50 no posto"))
         assert "interface web" in response
         assert db.scalar(select(func.count(Transaction.id))) == 0
+
+
+def test_invalid_structured_response_has_specific_message(monkeypatch):
+    def invalid(*args):
+        raise AIResponseFormatError("json invalido")
+    monkeypatch.setattr("app.automation.telegram_bot.run_financial_agent", invalid)
+    with SessionLocal() as db:
+        setup_linked_user(db)
+        response = handle_message(db, message("quanto ainda posso gastar?"))
+        assert "organizar essa consulta" in response
+        assert "DeepInfra" not in response

@@ -14,6 +14,14 @@ class AIUnavailableError(RuntimeError):
     pass
 
 
+class AIResponseFormatError(AIUnavailableError):
+    """O provedor respondeu, mas nao entregou a decisao estruturada esperada."""
+
+
+class AIToolSelectionError(AIUnavailableError):
+    """O modelo nao selecionou uma ferramenta obrigatoria para dados atuais."""
+
+
 @dataclass(frozen=True)
 class FinancialIntent:
     intent: str

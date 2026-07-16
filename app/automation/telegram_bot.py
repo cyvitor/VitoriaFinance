@@ -4,9 +4,12 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models import TelegramLink, User
+from app.logging_config import get_bot_logger
 from app.services.telegram_auth import consume_pairing_code
-from app.services.telegram_ai import AIUnavailableError
+from app.services.telegram_ai import AIResponseFormatError, AIToolSelectionError, AIUnavailableError
 from app.services.telegram_agent import run_financial_agent
+
+logger = get_bot_logger()
 
 
 def handle_message(db: Session, message: dict) -> str:
@@ -35,5 +38,12 @@ def handle_message(db: Session, message: dict) -> str:
         return "Seu Telegram ainda nao esta associado. Gere um codigo em Meu perfil e envie /start CODIGO."
     try:
         return run_financial_agent(db, user, text)
-    except AIUnavailableError:
-        return "A Vitoria esta temporariamente indisponivel. Por seguranca, nenhum lancamento foi feito; use a interface web por enquanto."
+    except (AIResponseFormatError, AIToolSelectionError) as exc:
+        logger.error("agent_structured_response_failed user_id=%s error=%s", user.id, exc)
+        return "Não consegui organizar essa consulta com segurança agora. Nenhum lançamento foi feito; tente novamente em instantes."
+    except AIUnavailableError as exc:
+        logger.error("deepinfra_unavailable user_id=%s error=%s", user.id, exc)
+        return "Não consegui acessar a Vitoria pela DeepInfra agora. Nenhum lançamento foi feito; use a interface web por enquanto."
+    except Exception:
+        logger.exception("unexpected_agent_error user_id=%s", user.id)
+        return "Ocorreu um erro inesperado ao processar sua mensagem. Nenhum lançamento foi feito; use a interface web por enquanto."

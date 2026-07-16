@@ -1,3 +1,4 @@
+from datetime import date
 from decimal import Decimal
 import json
 
@@ -6,8 +7,8 @@ from sqlalchemy import select
 
 from app.database import SessionLocal
 from app.models import (
-    AccountRole, Financing, FinancingAmortization, MemberRole, Person, PersonType,
-    RecurrenceRule, SystemAccount, SystemSetting, Transaction, TransactionType, User, UserMemory, UserPersonAccess, Workspace, WorkspaceMember,
+    Account, AccountRole, AccountType, Financing, FinancingAmortization, MemberRole, Person, PersonType,
+    RecurrenceRule, SystemAccount, SystemSetting, Transaction, TransactionStatus, TransactionType, User, UserMemory, UserPersonAccess, Workspace, WorkspaceMember,
 )
 from app.security import hash_password
 from app.services.access_context import build_user_access_context
@@ -141,3 +142,52 @@ def test_agent_automatically_extracts_permanent_memory(monkeypatch):
         memory = db.scalar(select(UserMemory).where(UserMemory.user_id == user.id))
         assert memory.memory_type == "merchant_alias" and memory.subject == "padaria"
         assert relevant_memories(db, user.id, "gastei quinze na padaria") == [memory]
+
+
+def test_free_balance_tool_simulates_planned_spending():
+    with SessionLocal() as db:
+        user, financing, hidden, rule = setup_financings(db)
+        person = db.scalar(select(Person).where(Person.name == "Vitor"))
+        account = Account(workspace_id=person.workspace_id, person_id=person.id, name="Conta",
+                          account_type=AccountType.checking, initial_balance=Decimal("1000"))
+        db.add(account); db.flush()
+        today = date.today()
+        db.add_all([
+            Transaction(workspace_id=person.workspace_id, person_id=person.id, account_id=account.id,
+                        transaction_type=TransactionType.income, description="Receita", amount=Decimal("500"),
+                        transaction_date=today, status=TransactionStatus.paid, created_by_id=user.id),
+            Transaction(workspace_id=person.workspace_id, person_id=person.id, account_id=account.id,
+                        transaction_type=TransactionType.expense, description="Pago", amount=Decimal("200"),
+                        transaction_date=today, status=TransactionStatus.paid, created_by_id=user.id),
+            Transaction(workspace_id=person.workspace_id, person_id=person.id, account_id=account.id,
+                        transaction_type=TransactionType.expense, description="Pendente", amount=Decimal("300"),
+                        transaction_date=today, competence_year=today.year, competence_month=today.month,
+                        status=TransactionStatus.pending, created_by_id=user.id),
+        ])
+        # A regra criada pelo financiamento vale 1.097,16 e ainda nao foi resolvida no mes.
+        db.commit()
+        context = build_user_access_context(db, user)
+        result = execute_tool(db, context, "consultar_saldo_livre", {"planned_spending": 100})
+        assert result["current_balance"] == "1300.00"
+        assert result["pending_transactions"] == "300.00"
+        assert result["unresolved_recurring_commitments"] == "1097.16"
+        assert result["free_balance_after_planned_spending"] == "-197.16"
+        assert result["can_afford"] is False
+
+
+def test_agent_retries_plain_text_and_forces_financial_tool(monkeypatch):
+    responses = iter([
+        "Deixa eu verificar seus dados para voce.",
+        json.dumps({"action": "tool", "tool": "consultar_saldo_livre",
+                    "arguments": {"planned_spending": 100}}),
+        "Depois de considerar seus compromissos, o gasto de R$ 100,00 nao cabe no saldo livre.",
+    ])
+    monkeypatch.setattr("app.services.telegram_agent._complete", lambda *args, **kwargs: next(responses))
+    monkeypatch.setattr("app.services.telegram_agent._extract_memories", lambda *args: None)
+    with SessionLocal() as db:
+        user, financing, hidden, rule = setup_financings(db)
+        db.add_all([SystemSetting(key="deepinfra_api_key", value="secret", is_secret=True),
+                    SystemSetting(key="deepinfra_model", value="deepseek")])
+        db.commit()
+        reply = run_financial_agent(db, user, "ainda tenho saldo livre? pretendo gastar 100 reais")
+        assert "R$ 100,00" in reply

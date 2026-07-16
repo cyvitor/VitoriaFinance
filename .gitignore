@@ -9,4 +9,4 @@ htmlcov/
 *.sqlite3
 .idea/
 .vscode/
-
+logs/

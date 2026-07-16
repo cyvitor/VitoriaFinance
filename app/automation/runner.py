@@ -1,4 +1,3 @@
-import logging
 import time
 
 from sqlalchemy import select
@@ -6,10 +5,10 @@ from sqlalchemy import select
 from app.automation.telegram_bot import handle_message
 from app.database import SessionLocal
 from app.integrations.telegram import TelegramClient
+from app.logging_config import configure_bot_logging
 from app.models import SystemSetting, TelegramProcessedUpdate
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger(__name__)
+logger = configure_bot_logging()
 
 
 def load_telegram_token() -> str | None:
@@ -31,6 +30,8 @@ def run() -> None:
                 message = update.get("message")
                 if not message:
                     continue
+                logger.debug("telegram_message_received update_id=%s telegram_user_id=%s text=%r",
+                             update.get("update_id"), (message.get("from") or {}).get("id"), message.get("text"))
                 with SessionLocal() as db:
                     update_key = str(update["update_id"])
                     if db.scalar(select(TelegramProcessedUpdate.id).where(TelegramProcessedUpdate.update_id == update_key)):
@@ -38,6 +39,8 @@ def run() -> None:
                     response = handle_message(db, message)
                     db.add(TelegramProcessedUpdate(update_id=update_key))
                     db.commit()
+                logger.debug("telegram_message_reply update_id=%s telegram_user_id=%s reply=%r",
+                             update.get("update_id"), (message.get("from") or {}).get("id"), response)
                 client.send_message(message["chat"]["id"], response)
         except KeyboardInterrupt:
             logger.info("Worker encerrado.")

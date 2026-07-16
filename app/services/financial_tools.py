@@ -6,7 +6,7 @@ from sqlalchemy import case, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.models import (
-    Account, Card, Category, Financing, FinancingAmortization, Person, RecurrenceRule,
+    Account, Card, Category, Financing, FinancingAmortization, Person, RecurrenceOccurrence, RecurrenceRule,
     TelegramPendingAction, Transaction, TransactionStatus, TransactionType, User,
 )
 from app.services.access_context import UserAccessContext
@@ -224,6 +224,60 @@ def monthly_summary(db: Session, context: UserAccessContext, args: dict) -> dict
             "definition": "receitas menos despesas registradas no periodo"}
 
 
+def calculate_free_balance(db: Session, context: UserAccessContext, args: dict) -> dict:
+    today = date.today()
+    person = _resolve_person(db, context, args.get("area")) if args.get("area") else None
+    person_ids = (person.id,) if person else context.allowed_person_ids
+    planned_spending = _decimal(args.get("planned_spending"), "gasto planejado") or Decimal(0)
+    initial_balance = Decimal(db.scalar(select(func.coalesce(func.sum(Account.initial_balance), 0)).where(
+        Account.workspace_id.in_(context.workspace_ids), Account.person_id.in_(person_ids),
+        Account.is_active.is_(True),
+    )))
+    paid_flow = Decimal(db.scalar(select(func.coalesce(func.sum(case(
+        (Transaction.transaction_type == TransactionType.income, Transaction.amount),
+        (Transaction.transaction_type == TransactionType.expense, -Transaction.amount), else_=0,
+    )), 0)).where(
+        Transaction.workspace_id.in_(context.workspace_ids), Transaction.person_id.in_(person_ids),
+        Transaction.status == TransactionStatus.paid,
+    )))
+    pending_transactions = Decimal(db.scalar(select(func.coalesce(func.sum(Transaction.amount), 0)).where(
+        Transaction.workspace_id.in_(context.workspace_ids), Transaction.person_id.in_(person_ids),
+        Transaction.transaction_type == TransactionType.expense,
+        Transaction.status == TransactionStatus.pending,
+        Transaction.competence_year == today.year, Transaction.competence_month == today.month,
+    )))
+    rules = db.scalars(select(RecurrenceRule).where(
+        RecurrenceRule.workspace_id.in_(context.workspace_ids), RecurrenceRule.person_id.in_(person_ids),
+        RecurrenceRule.transaction_type == TransactionType.expense, RecurrenceRule.is_active.is_(True),
+    )).all()
+    recurring_commitments = Decimal(0)
+    for rule in rules:
+        occurrence = db.scalar(select(RecurrenceOccurrence).where(
+            RecurrenceOccurrence.recurrence_rule_id == rule.id,
+            RecurrenceOccurrence.year == today.year, RecurrenceOccurrence.month == today.month,
+        ))
+        if occurrence and occurrence.status in ("confirmed", "skipped"):
+            continue
+        if occurrence and occurrence.status == "partial" and occurrence.remaining_amount is not None:
+            recurring_commitments += Decimal(occurrence.remaining_amount)
+        else:
+            recurring_commitments += Decimal(rule.amount or 0)
+    current_balance = initial_balance + paid_flow
+    free_balance = current_balance - pending_transactions - recurring_commitments
+    after_planned_spending = free_balance - planned_spending
+    return {
+        "as_of": today.isoformat(), "area": person.name if person else "todas as areas permitidas",
+        "current_balance": _money(current_balance),
+        "pending_transactions": _money(pending_transactions),
+        "unresolved_recurring_commitments": _money(recurring_commitments),
+        "free_balance": _money(free_balance), "planned_spending": _money(planned_spending),
+        "free_balance_after_planned_spending": _money(after_planned_spending),
+        "can_afford": after_planned_spending >= 0,
+        "definition": "saldo atual menos despesas pendentes e recorrencias ainda nao resolvidas no mes, depois do gasto informado",
+        "warning": "Nao inclui transacoes ainda nao cadastradas nem compromissos fora do VitoriaFinance.",
+    }
+
+
 def list_financings(db: Session, context: UserAccessContext, args: dict) -> dict:
     person = _resolve_person(db, context, args.get("area")) if args.get("area") else None
     query = select(Financing).where(
@@ -420,6 +474,7 @@ TOOLS = {
     "consultar_receitas": lambda db, context, args: query_transactions(db, context, args, TransactionType.income),
     "consultar_despesas": lambda db, context, args: query_transactions(db, context, args, TransactionType.expense),
     "consultar_resumo_mensal": monthly_summary,
+    "consultar_saldo_livre": calculate_free_balance,
     "consultar_financiamentos": list_financings,
     "preparar_amortizacao_financiamento": prepare_financing_amortization,
     "confirmar_acao_pendente": confirm_pending_action,
