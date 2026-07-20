@@ -17,11 +17,12 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.dependencies import allowed_person_ids, current_user, current_workspace_id
 from app.models import (
-    Account, AccountRole, AccountType, Card, Category, Person, PersonType, SystemAccount, SystemSetting,
+    Account, AccountRole, AccountType, Card, CardBillingPeriod, Category, Person, PersonType, SystemAccount, SystemSetting,
     Transaction, TransactionStatus, TransactionType, User, UserPersonAccess, WorkspaceMember, TelegramLink,
     RecurrenceRule, RecurrenceOccurrence, AccountingPeriod, Financing, MemberRole, UserMemory, Workspace,
 )
 from app.security import hash_password, verify_password
+from app.services.card_billing import card_purchase_competence, shift_month as shift_competence_month
 from app.services.telegram_auth import PAIRING_TTL_MINUTES, create_pairing_code, unlink_telegram
 from scripts.seed import seed_categories
 
@@ -441,9 +442,12 @@ def card_expense_create(request: Request, card_id: int = Form(), description: st
         return redirect("/card-expenses/new")
     total_cents = int((amount * 100).quantize(Decimal("1")))
     base_cents, remainder = divmod(total_cents, count)
+    first_year, first_month = (
+        card_purchase_competence(db, card, purchase_date) if is_credit
+        else (purchase_date.year, purchase_date.month)
+    )
     for index in range(count):
-        month_index = purchase_date.month - 1 + index
-        year, month = purchase_date.year + month_index // 12, month_index % 12 + 1
+        year, month = shift_competence_month(first_year, first_month, index)
         tx_date = date(year, month, min(purchase_date.day, monthrange(year, month)[1]))
         cents = base_cents + (remainder if index == count - 1 else 0)
         label = f"{description.strip()} ({index + 1}/{count})" if count > 1 else description.strip()
@@ -458,7 +462,7 @@ def card_expense_create(request: Request, card_id: int = Form(), description: st
         ))
     db.commit()
     flash(request, f"Gasto no cartão registrado{' em ' + str(count) + ' parcelas' if count > 1 else ''}.")
-    return redirect(f"/cards/{card.id}?year={purchase_date.year}&month={purchase_date.month}&view=detailed")
+    return redirect(f"/cards/{card.id}?year={first_year}&month={first_month}&view=detailed")
 
 
 @router.get("/future", response_class=HTMLResponse)
@@ -512,6 +516,42 @@ def recurring_income_create(request: Request, description: str = Form(), amount:
     ))
     db.commit()
     flash(request, "Receita recorrente adicionada. Ela aparecerá para confirmação a cada mês.")
+    return redirect("/recurring-incomes")
+
+
+@router.post("/recurring-incomes/{rule_id}/edit")
+def recurring_income_edit(rule_id: int, request: Request, description: str = Form(), amount: Decimal = Form(),
+                          account_id: str | None = Form(None), person_id: int = Form(),
+                          category_id: str | None = Form(None), notes: str | None = Form(None),
+                          db: Session = Depends(get_db), user: User = Depends(current_user)):
+    wid = current_workspace_id(request, user, db)
+    rule = db.scalar(select(RecurrenceRule).where(
+        RecurrenceRule.id == rule_id, RecurrenceRule.workspace_id == wid,
+        RecurrenceRule.transaction_type == TransactionType.income,
+        RecurrenceRule.is_active.is_(True),
+    ))
+    if not rule: raise HTTPException(404)
+    ensure_area_access(rule.person_id, user, wid, db)
+    ensure_area_access(person_id, user, wid, db)
+    account_value, category_value = optional_int(account_id), optional_int(category_id)
+    ensure_account_access(account_value, user, wid, db)
+    if category_value and not db.scalar(select(Category.id).where(
+        Category.id == category_value, Category.workspace_id == wid,
+        Category.kind == TransactionType.income,
+    )):
+        flash(request, "Selecione uma categoria de receita válida.", "danger")
+        return redirect("/recurring-incomes")
+    if amount <= 0 or not description.strip():
+        flash(request, "Informe descrição e valor válidos.", "danger")
+        return redirect("/recurring-incomes")
+    rule.description = description.strip()
+    rule.amount = amount
+    rule.account_id = account_value
+    rule.person_id = person_id
+    rule.category_id = category_value
+    rule.notes = (notes or "").strip() or None
+    db.commit()
+    flash(request, "Receita recorrente atualizada. As alterações valem para os próximos meses.")
     return redirect("/recurring-incomes")
 
 
@@ -886,13 +926,17 @@ def family_view(request: Request, year: int | None = None, month: int | None = N
         Card.account_id.in_(account_ids)).order_by(Card.name)).all() if account_ids else []
     expense_categories = db.scalars(select(Category).where(Category.workspace_id == wid,
         Category.kind == TransactionType.expense).order_by(Category.parent_name, Category.name)).all()
+    transaction_categories = db.scalars(select(Category).where(
+        Category.workspace_id == wid
+    ).order_by(Category.kind, Category.parent_name, Category.name)).all()
     return render(request, "family/index.html", user=user, months=months, selected_year=selected_year,
                   selected_month=selected_month, confirmed=confirmed, forecasts=forecasts, people=people,
                   selected_summary=selected_summary, income_items=income_items, expense_items=expense_items,
                   period_closed=bool(period and period.is_closed), visible_months=visible_months,
                   recurring_pending=recurring_pending, fixed_expense_pending=fixed_expense_pending,
                   card_groups=card_groups, accounts=accounts, cards=cards,
-                  expense_categories=expense_categories, today=today)
+                  expense_categories=expense_categories, transaction_categories=transaction_categories,
+                  today=today)
 
 
 @router.get("/family", include_in_schema=False)
@@ -995,6 +1039,7 @@ def transaction_create(request: Request, transaction_type: TransactionType = For
     card_id = optional_int(card_id)
     person_id = optional_int(person_id)
     category_id = optional_int(category_id)
+    competence_year, competence_month = transaction_date.year, transaction_date.month
     if transaction_type != TransactionType.transfer and not person_id:
         flash(request, "Selecione uma área financeira.", "danger")
         return redirect(f"/transactions/new?kind={transaction_type.value}")
@@ -1008,6 +1053,8 @@ def transaction_create(request: Request, transaction_type: TransactionType = For
         ensure_account_access(card.account_id, user, wid, db)
         method = (payment_method or "Crédito").lower()
         status = TransactionStatus.pending if method in ("crédito", "credito") else TransactionStatus.paid
+        if status == TransactionStatus.pending:
+            competence_year, competence_month = card_purchase_competence(db, card, transaction_date)
         if not account_id: account_id = card.account_id
     if amount <= 0:
         flash(request, "O valor deve ser maior que zero.", "danger")
@@ -1020,7 +1067,7 @@ def transaction_create(request: Request, transaction_type: TransactionType = For
         transaction_date=transaction_date, status=status, account_id=account_id,
         destination_account_id=destination_account_id, card_id=card_id, person_id=person_id,
         category_id=category_id, payment_method=payment_method, notes=notes, created_by_id=user.id,
-        competence_year=transaction_date.year, competence_month=transaction_date.month,
+        competence_year=competence_year, competence_month=competence_month,
     ))
     db.commit()
     flash(request, "Lançamento registrado.")
@@ -1028,12 +1075,66 @@ def transaction_create(request: Request, transaction_type: TransactionType = For
 
 
 @router.post("/transactions/{item_id}/delete")
-def transaction_delete(item_id: int, request: Request, db: Session = Depends(get_db), user: User = Depends(current_user)):
+def transaction_delete(item_id: int, request: Request, return_year: int | None = Form(None),
+                       return_month: int | None = Form(None),
+                       db: Session = Depends(get_db), user: User = Depends(current_user)):
     wid = current_workspace_id(request, user, db)
     item = db.scalar(select(Transaction).where(Transaction.id == item_id, Transaction.workspace_id == wid))
     if not item: raise HTTPException(404)
+    if item.person_id:
+        ensure_area_access(item.person_id, user, wid, db)
+    occurrence = db.scalar(select(RecurrenceOccurrence).where(RecurrenceOccurrence.transaction_id == item.id))
+    if occurrence:
+        db.delete(occurrence)
+    financing = db.scalar(select(Financing).where(Financing.recurrence_rule_id == item.recurrence_rule_id)) \
+        if item.recurrence_rule_id else None
+    if financing and item.status == TransactionStatus.paid:
+        financing.paid_installments = max(0, financing.paid_installments - 1)
+        financing.status = "active"
+        rule = db.get(RecurrenceRule, financing.recurrence_rule_id)
+        if rule:
+            rule.is_active = True
+            rule.description = f"{financing.description} - parcela {financing.paid_installments + 1}/{financing.total_installments}"
     db.delete(item); db.commit(); flash(request, "Lançamento removido.")
+    if return_year and return_month and 1 <= return_month <= 12:
+        return redirect(f"/month?year={return_year}&month={return_month}")
     return redirect("/transactions")
+
+
+@router.post("/transactions/{item_id}/edit")
+def transaction_edit(item_id: int, request: Request, description: str = Form(), amount: Decimal = Form(),
+                     transaction_date: date = Form(), category_id: str | None = Form(None),
+                     notes: str | None = Form(None), return_year: int | None = Form(None),
+                     return_month: int | None = Form(None), db: Session = Depends(get_db),
+                     user: User = Depends(current_user)):
+    wid = current_workspace_id(request, user, db)
+    item = db.scalar(select(Transaction).where(
+        Transaction.id == item_id, Transaction.workspace_id == wid,
+        Transaction.status == TransactionStatus.paid,
+    ))
+    if not item: raise HTTPException(404)
+    if item.person_id:
+        ensure_area_access(item.person_id, user, wid, db)
+    category_value = optional_int(category_id)
+    if category_value and not db.scalar(select(Category.id).where(
+        Category.id == category_value, Category.workspace_id == wid,
+        Category.kind == item.transaction_type,
+    )):
+        flash(request, "Selecione uma categoria válida para o lançamento.", "danger")
+        return redirect(f"/month?year={return_year or item.competence_year}&month={return_month or item.competence_month}")
+    if amount <= 0 or not description.strip():
+        flash(request, "Informe descrição e valor válidos.", "danger")
+        return redirect(f"/month?year={return_year or item.competence_year}&month={return_month or item.competence_month}")
+    item.description = description.strip()
+    item.amount = amount
+    item.transaction_date = transaction_date
+    item.competence_year = transaction_date.year
+    item.competence_month = transaction_date.month
+    item.category_id = category_value
+    item.notes = (notes or "").strip() or None
+    db.commit()
+    flash(request, "Lançamento atualizado.")
+    return redirect(f"/month?year={item.competence_year}&month={item.competence_month}")
 
 
 def crud_list(request, db, user, model, template):
@@ -1083,6 +1184,10 @@ def card_detail(card_id: int, request: Request, year: int | None = None, month: 
     ).order_by(Transaction.transaction_date, Transaction.id)).all()
     credit = [item for item in items if (item.payment_method or "").lower() in ("crédito", "credito")]
     debit = [item for item in items if item not in credit]
+    billing_period = db.scalar(select(CardBillingPeriod).where(
+        CardBillingPeriod.card_id == card.id, CardBillingPeriod.year == selected_year,
+        CardBillingPeriod.month == selected_month,
+    ))
     view = view if view in ("analytic", "detailed") else "detailed"
     grouped = {}
     for item in items:
@@ -1109,6 +1214,7 @@ def card_detail(card_id: int, request: Request, year: int | None = None, month: 
     ).order_by(Category.parent_name, Category.name)).all()
     return render(request, "cards/detail.html", user=user, card=card, credit=credit, debit=debit,
                   categories=categories, view=view, analytic_rows=analytic_rows,
+                  invoice_closed=bool(billing_period and billing_period.is_closed),
                   selected_year=selected_year, selected_month=selected_month,
                   credit_total=sum((Decimal(x.amount) for x in credit), Decimal(0)),
                   debit_total=sum((Decimal(x.amount) for x in debit), Decimal(0)))
@@ -1140,11 +1246,16 @@ def card_expense_edit(card_id: int, transaction_id: int, request: Request,
     item.amount = amount
     item.category_id = category.id
     item.transaction_date = transaction_date
-    item.competence_year = transaction_date.year
-    item.competence_month = transaction_date.month
+    is_credit = (item.payment_method or "").lower() in ("crédito", "credito")
+    target_year, target_month = (
+        card_purchase_competence(db, card, transaction_date) if is_credit
+        else (transaction_date.year, transaction_date.month)
+    )
+    item.competence_year = target_year
+    item.competence_month = target_month
     db.commit()
     flash(request, "Gasto do cartão atualizado.")
-    return redirect(f"/cards/{card.id}?year={transaction_date.year}&month={transaction_date.month}&view=detailed")
+    return redirect(f"/cards/{card.id}?year={target_year}&month={target_month}&view=detailed")
 
 
 @router.post("/cards/{card_id}/confirm")
@@ -1159,8 +1270,38 @@ def card_confirm(card_id: int, request: Request, year: int = Form(), month: int 
         Transaction.competence_month == month, Transaction.status == TransactionStatus.pending,
     )).all()
     for item in items: item.status = TransactionStatus.paid
+    period = db.scalar(select(CardBillingPeriod).where(
+        CardBillingPeriod.card_id == card.id, CardBillingPeriod.year == year,
+        CardBillingPeriod.month == month,
+    ))
+    if not period:
+        period = CardBillingPeriod(workspace_id=wid, card_id=card.id, year=year, month=month)
+        db.add(period)
+    period.is_closed = True
+    period.closed_at = datetime.utcnow()
+    period.closed_by_id = user.id
     db.commit(); flash(request, f"Fatura do cartão {card.name} confirmada.")
     return redirect(f"/cards/{card.id}?year={year}&month={month}")
+
+
+@router.post("/cards/{card_id}/reopen")
+def card_reopen(card_id: int, request: Request, year: int = Form(), month: int = Form(),
+                db: Session = Depends(get_db), user: User = Depends(current_user)):
+    wid = current_workspace_id(request, user, db)
+    card = db.scalar(select(Card).where(Card.id == card_id, Card.workspace_id == wid))
+    if not card: raise HTTPException(404)
+    ensure_account_access(card.account_id, user, wid, db)
+    period = db.scalar(select(CardBillingPeriod).where(
+        CardBillingPeriod.card_id == card.id, CardBillingPeriod.year == year,
+        CardBillingPeriod.month == month,
+    ))
+    if period:
+        period.is_closed = False
+        period.closed_at = None
+        period.closed_by_id = None
+        db.commit()
+    flash(request, f"Fatura do cartão {card.name} reaberta.")
+    return redirect(f"/cards/{card.id}?year={year}&month={month}&view=detailed")
 
 
 @router.post("/cards/{card_id}/expenses/{transaction_id}/delete")

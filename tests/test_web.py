@@ -1,3 +1,4 @@
+from datetime import date
 from decimal import Decimal
 
 from app.database import SessionLocal
@@ -64,6 +65,41 @@ def test_recurring_income_monthly_confirmation_skip_and_delete(client):
         assert db.scalar(select(func.count(Transaction.id))) == 1
     september = client.get("/month?year=2026&month=9")
     assert "Não receber neste mês" not in september.text
+
+
+def test_recurring_income_can_be_edited_without_changing_confirmed_history(client):
+    area_id = seed_test()
+    client.post("/login", data={"username": "vh", "password": "123456"})
+    with SessionLocal() as db:
+        workspace_id = db.scalar(select(Workspace.id))
+        user_id = db.scalar(select(User.id).where(User.username == "vh"))
+        category = Category(workspace_id=workspace_id, kind=TransactionType.income,
+                            parent_name="Receitas", name="Salário", color="#00b894")
+        account = Account(workspace_id=workspace_id, person_id=area_id, name="Conta salário",
+                          account_type=AccountType.checking)
+        rule = RecurrenceRule(workspace_id=workspace_id, transaction_type=TransactionType.income,
+                              frequency="monthly", description="Salário", amount=Decimal("1000.00"),
+                              person_id=area_id, created_by_id=user_id, is_active=True)
+        db.add_all([category, account, rule]); db.flush()
+        confirmed = Transaction(workspace_id=workspace_id, transaction_type=TransactionType.income,
+            description="Salário", amount=Decimal("1000.00"), transaction_date=date(2026, 7, 5),
+            competence_year=2026, competence_month=7, status=TransactionStatus.paid,
+            person_id=area_id, recurrence_rule_id=rule.id, created_by_id=user_id)
+        db.add(confirmed); db.commit()
+        category_id, account_id, rule_id, confirmed_id = category.id, account.id, rule.id, confirmed.id
+    page = client.get("/recurring-incomes")
+    assert "Editar receita recorrente" in page.text
+    response = client.post(f"/recurring-incomes/{rule_id}/edit", data={
+        "description": "Salário líquido", "amount": "1125.50", "account_id": str(account_id),
+        "person_id": str(area_id), "category_id": str(category_id), "notes": "Novo acordo",
+    }, follow_redirects=False)
+    assert response.status_code == 303
+    with SessionLocal() as db:
+        edited = db.get(RecurrenceRule, rule_id)
+        historical = db.get(Transaction, confirmed_id)
+        assert edited.description == "Salário líquido" and edited.amount == Decimal("1125.50")
+        assert edited.account_id == account_id and edited.category_id == category_id
+        assert historical.description == "Salário" and historical.amount == Decimal("1000.00")
 
 
 def test_fixed_expense_inline_confirm_and_skip(client):
@@ -212,7 +248,7 @@ def test_credit_and_debit_card_expenses_are_grouped_and_detailed(client):
         db.add(account); db.flush()
         card = Card(workspace_id=workspace_id, account_id=account.id, name="C6", closing_day=5, due_day=12)
         db.add(card); db.commit(); card_id = card.id; account_id = account.id
-    common = {"transaction_type":"expense", "transaction_date":"2026-07-10", "description":"Compra",
+    common = {"transaction_type":"expense", "transaction_date":"2026-07-04", "description":"Compra",
               "amount":"100.00", "person_id":str(area_id), "account_id":str(account_id),
               "card_id":str(card_id), "category_id":"", "notes":""}
     client.post("/transactions/new", data={**common, "status":"paid", "payment_method":"Crédito"})
@@ -255,7 +291,21 @@ def test_credit_and_debit_card_expenses_are_grouped_and_detailed(client):
         assert sum((item.amount for item in parcels), Decimal(0)) == Decimal("100.00")
         assert all(item.status == TransactionStatus.pending for item in parcels)
         assert all(item.category_id == category_id for item in parcels)
+        assert [(item.competence_year, item.competence_month) for item in parcels] == [(2026, 7), (2026, 8), (2026, 9)]
         first_parcel_id = parcels[0].id
+    close_response = client.post(f"/cards/{card_id}/confirm", data={"year": "2026", "month": "7"}, follow_redirects=False)
+    assert close_response.status_code == 303
+    closed_page = client.get(f"/cards/{card_id}?year=2026&month=7")
+    assert "Fechada" in closed_page.text and "Reabrir fatura" in closed_page.text
+    next_invoice = client.post("/card-expenses/new", data={
+        "card_id": str(card_id), "description": "Compra após fechamento", "amount": "25.00",
+        "payment_method": "Crédito", "purchase_type": "cash", "installments": "1",
+        "category_id": str(category_id), "purchase_date": "2026-07-20",
+    }, follow_redirects=False)
+    assert "year=2026&month=8" in next_invoice.headers["location"]
+    with SessionLocal() as db:
+        later = db.scalar(select(Transaction).where(Transaction.description == "Compra após fechamento"))
+        assert (later.competence_year, later.competence_month) == (2026, 8)
     response = client.post(f"/cards/{card_id}/expenses/{first_parcel_id}/edit", data={
         "description": "Notebook ajustado", "amount": "34.00", "category_id": str(category_id),
         "transaction_date": "2026-08-02",
@@ -267,6 +317,53 @@ def test_credit_and_debit_card_expenses_are_grouped_and_detailed(client):
         assert edited.amount == Decimal("34.00")
         assert edited.transaction_date.isoformat() == "2026-08-02"
         assert (edited.competence_year, edited.competence_month) == (2026, 8)
+
+
+def test_confirmed_month_transaction_can_be_edited_and_deleted(client):
+    area_id = seed_test()
+    client.post("/login", data={"username": "vh", "password": "123456"})
+    with SessionLocal() as db:
+        workspace_id = db.scalar(select(Workspace.id))
+        user_id = db.scalar(select(User.id).where(User.username == "vh"))
+        category = Category(workspace_id=workspace_id, kind=TransactionType.expense,
+                            parent_name="Moradia", name="Energia", color="#fdcb6e")
+        rule = RecurrenceRule(workspace_id=workspace_id, transaction_type=TransactionType.expense,
+                              frequency="monthly", description="Energia", amount=Decimal("120.00"),
+                              person_id=area_id, created_by_id=user_id, is_active=True)
+        db.add_all([category, rule]); db.flush()
+        tx = Transaction(workspace_id=workspace_id, transaction_type=TransactionType.expense,
+                         description="Energia", amount=Decimal("120.00"), transaction_date=date(2026, 7, 10),
+                         competence_year=2026, competence_month=7, status=TransactionStatus.paid,
+                         person_id=area_id, category_id=category.id, recurrence_rule_id=rule.id,
+                         created_by_id=user_id)
+        db.add(tx); db.flush()
+        occurrence = RecurrenceOccurrence(recurrence_rule_id=rule.id, year=2026, month=7,
+                                          status="confirmed", transaction_id=tx.id)
+        db.add(occurrence); db.commit(); tx_id = tx.id; category_id = category.id; rule_id = rule.id
+    page = client.get("/month?year=2026&month=7")
+    assert f'data-bs-target="#manageTransaction{tx_id}"' in page.text
+    assert "Editar lançamento" in page.text
+    response = client.post(f"/transactions/{tx_id}/edit", data={
+        "description": "Energia ajustada", "amount": "127.45", "transaction_date": "2026-07-12",
+        "category_id": str(category_id), "notes": "Leitura corrigida", "return_year": "2026",
+        "return_month": "7",
+    }, follow_redirects=False)
+    assert response.status_code == 303
+    with SessionLocal() as db:
+        edited = db.get(Transaction, tx_id)
+        assert edited.description == "Energia ajustada" and edited.amount == Decimal("127.45")
+        assert edited.notes == "Leitura corrigida"
+    response = client.post(f"/transactions/{tx_id}/delete", data={
+        "return_year": "2026", "return_month": "7",
+    }, follow_redirects=False)
+    assert response.headers["location"] == "/month?year=2026&month=7"
+    with SessionLocal() as db:
+        assert db.get(Transaction, tx_id) is None
+        assert db.scalar(select(RecurrenceOccurrence).where(
+            RecurrenceOccurrence.recurrence_rule_id == rule_id,
+            RecurrenceOccurrence.year == 2026, RecurrenceOccurrence.month == 7,
+        )) is None
+    assert "Confirmar pagamento" in client.get("/month?year=2026&month=7").text
 
 
 def test_superadmin_creates_account_and_refreshes_deepinfra_models(client, monkeypatch):

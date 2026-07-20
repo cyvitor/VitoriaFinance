@@ -256,6 +256,19 @@ class Card(Base):
     account: Mapped[Account | None] = relationship()
 
 
+class CardBillingPeriod(Base):
+    __tablename__ = "card_billing_periods"
+    __table_args__ = (UniqueConstraint("card_id", "year", "month"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    workspace_id: Mapped[int] = mapped_column(ForeignKey("workspaces.id", ondelete="CASCADE"), index=True)
+    card_id: Mapped[int] = mapped_column(ForeignKey("cards.id", ondelete="CASCADE"), index=True)
+    year: Mapped[int] = mapped_column()
+    month: Mapped[int] = mapped_column()
+    is_closed: Mapped[bool] = mapped_column(Boolean, default=False)
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    closed_by_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+
+
 class Category(Base):
     __tablename__ = "categories"
     __table_args__ = (UniqueConstraint("workspace_id", "parent_name", "name", "kind"),)
