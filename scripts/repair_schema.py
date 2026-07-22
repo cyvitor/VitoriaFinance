@@ -26,6 +26,20 @@ def run():
             )
         print("Coluna system_accounts.is_super_account adicionada.")
         changes += 1
+    draft_columns = {column["name"] for column in inspect(engine).get_columns("telegram_expense_drafts")}
+    draft_additions = {
+        "account_id": "INTEGER NULL",
+        "card_id": "INTEGER NULL",
+        "payment_method": "VARCHAR(40) NULL",
+    }
+    for column, definition in draft_additions.items():
+        if column not in draft_columns:
+            with engine.begin() as connection:
+                connection.exec_driver_sql(
+                    f"ALTER TABLE telegram_expense_drafts ADD COLUMN {column} {definition}"
+                )
+            print(f"Coluna telegram_expense_drafts.{column} adicionada.")
+            changes += 1
     with engine.begin() as connection:
         result = connection.exec_driver_sql(
             "UPDATE system_accounts SET is_super_account = TRUE "

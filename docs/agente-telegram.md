@@ -67,3 +67,12 @@ Se a DeepInfra falhar antes da execução de uma ferramenta, nenhuma operação 
 realizada e o bot orienta o uso da interface web. Se uma escrita já tiver sido
 confirmada e persistida, mas a IA falhar apenas ao formatar a resposta, o backend
 envia uma confirmação determinística para não induzir o usuário a repetir a ação.
+
+## Diagnóstico e logs
+
+O worker possui os níveis `basic` e `detailed`. O nível básico registra somente
+eventos operacionais relevantes e erros; o detalhado inclui mensagens, respostas
+da DeepInfra, ferramentas, resultados e a resposta final. Como o modo detalhado
+pode conter informações financeiras pessoais, ele deve ser usado apenas durante
+investigações. A configuração completa, rotação e comandos de acompanhamento
+estão em [Instalação e configuração](instalacao-e-configuracao.md#logs-do-worker-e-do-agente).

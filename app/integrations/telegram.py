@@ -1,4 +1,16 @@
+from html import escape
+import re
+
 import httpx
+
+
+def telegram_html(text: str) -> str:
+    """Converte o subconjunto de Markdown usado pelo agente em HTML seguro do Telegram."""
+    safe = escape(text, quote=False)
+    safe = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", safe)
+    safe = re.sub(r"(?<!\*)\*([^*\n]+?)\*(?!\*)", r"<i>\1</i>", safe)
+    safe = re.sub(r"`([^`\n]+?)`", r"<code>\1</code>", safe)
+    return safe
 
 
 class TelegramClient:
@@ -18,5 +30,9 @@ class TelegramClient:
         return payload.get("result", [])
 
     def send_message(self, chat_id: int | str, text: str) -> None:
-        response = httpx.post(f"{self.base_url}/sendMessage", json={"chat_id": chat_id, "text": text}, timeout=15.0)
+        response = httpx.post(
+            f"{self.base_url}/sendMessage",
+            json={"chat_id": chat_id, "text": telegram_html(text), "parse_mode": "HTML"},
+            timeout=15.0,
+        )
         response.raise_for_status()

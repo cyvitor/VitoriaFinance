@@ -7,13 +7,16 @@ from sqlalchemy import select
 
 from app.database import SessionLocal
 from app.models import (
-    Account, AccountRole, AccountType, Financing, FinancingAmortization, MemberRole, Person, PersonType,
+    Account, AccountRole, AccountType, Card, CardBillingPeriod, Financing, FinancingAmortization, MemberRole, Person, PersonType,
     RecurrenceRule, SystemAccount, SystemSetting, Transaction, TransactionStatus, TransactionType, User, UserMemory, UserPersonAccess, Workspace, WorkspaceMember,
 )
 from app.security import hash_password
 from app.services.access_context import build_user_access_context
 from app.services.financial_tools import ToolError, execute_tool
-from app.services.telegram_agent import run_financial_agent
+from app.services.telegram_agent import (
+    _enforce_balance_intent, _enforce_pending_expense_intent, _requires_financial_tool,
+    run_financial_agent,
+)
 from app.services.telegram_ai import AIUnavailableError
 from app.services.user_memory import relevant_memories
 
@@ -152,13 +155,20 @@ def test_free_balance_tool_simulates_planned_spending():
                           account_type=AccountType.checking, initial_balance=Decimal("1000"))
         db.add(account); db.flush()
         today = date.today()
+        card = Card(workspace_id=person.workspace_id, account_id=account.id, name="Cartao",
+                    closing_day=max(1, today.day - 1), due_day=10, credit_limit=Decimal("2000"))
+        income_rule = RecurrenceRule(workspace_id=person.workspace_id, person_id=person.id,
+            transaction_type=TransactionType.income, description="Salario futuro", amount=Decimal("2000"))
         db.add_all([
+            card, income_rule,
             Transaction(workspace_id=person.workspace_id, person_id=person.id, account_id=account.id,
                         transaction_type=TransactionType.income, description="Receita", amount=Decimal("500"),
-                        transaction_date=today, status=TransactionStatus.paid, created_by_id=user.id),
+                        transaction_date=today, competence_year=today.year, competence_month=today.month,
+                        status=TransactionStatus.paid, created_by_id=user.id),
             Transaction(workspace_id=person.workspace_id, person_id=person.id, account_id=account.id,
                         transaction_type=TransactionType.expense, description="Pago", amount=Decimal("200"),
-                        transaction_date=today, status=TransactionStatus.paid, created_by_id=user.id),
+                        transaction_date=today, competence_year=today.year, competence_month=today.month,
+                        status=TransactionStatus.paid, created_by_id=user.id),
             Transaction(workspace_id=person.workspace_id, person_id=person.id, account_id=account.id,
                         transaction_type=TransactionType.expense, description="Pendente", amount=Decimal("300"),
                         transaction_date=today, competence_year=today.year, competence_month=today.month,
@@ -173,6 +183,67 @@ def test_free_balance_tool_simulates_planned_spending():
         assert result["unresolved_recurring_commitments"] == "1097.16"
         assert result["free_balance_after_planned_spending"] == "-197.16"
         assert result["can_afford"] is False
+        assert result["projected_income_month"] == "2500.00"
+        assert result["projected_expense_month"] == "1597.16"
+        assert result["projected_month_result_after_planned_spending"] == "802.84"
+        credit = execute_tool(db, context, "consultar_saldo_livre", {
+            "planned_spending": 100, "payment_method": "credit", "card": "Cartao",
+        })
+        assert credit["card_context"]["affects_current_month"] is True
+        assert credit["projected_month_result_after_planned_spending"] == "802.84"
+        assert credit["card_context"]["next_competence_commitment"] == "0.00"
+        assert credit["can_close_month"] is True
+        db.add(CardBillingPeriod(workspace_id=person.workspace_id, card_id=card.id,
+                                 year=today.year, month=today.month, is_closed=True))
+        db.commit()
+        after_close = execute_tool(db, context, "consultar_saldo_livre", {
+            "planned_spending": 100, "payment_method": "credit", "card": "Cartao",
+        })
+        assert after_close["card_context"]["affects_current_month"] is False
+        assert after_close["projected_month_result_after_planned_spending"] == "902.84"
+        assert after_close["card_context"]["next_competence_commitment"] == "100.00"
+
+
+def test_credit_spending_and_month_close_are_forced_to_projection():
+    first = _enforce_balance_intent(
+        "Posso gastar 150 no crédito?", [],
+        {"action": "tool", "tool": "consultar_saldo_livre", "arguments": {"planned_spending": 150}},
+    )
+    assert first == {"action": "tool", "tool": "consultar_saldo_livre", "arguments": {
+        "planned_spending": 150.0, "payment_method": "credit",
+    }}
+
+    history = [
+        {"role": "user", "content": "Posso gastar 150 no crédito?"},
+        {"role": "assistant", "content": "Resposta anterior"},
+    ]
+    follow_up = _enforce_balance_intent(
+        "E no cartão de crédito? Consigo fechar o mês?", history,
+        {"action": "tool", "tool": "consultar_cartoes", "arguments": {"area": "Vitor"}},
+    )
+    assert follow_up["tool"] == "consultar_saldo_livre"
+    assert follow_up["arguments"] == {
+        "area": "Vitor", "payment_method": "credit", "planned_spending": 150.0,
+    }
+
+    card_list = _enforce_balance_intent(
+        "Quais cartões eu tenho?", [],
+        {"action": "tool", "tool": "consultar_cartoes", "arguments": {}},
+    )
+    assert card_list["tool"] == "consultar_cartoes"
+
+
+def test_expense_typo_with_financial_context_still_requires_tool():
+    assert _requires_financial_tool("gatei 5 no credito c6 na doce pão") is True
+
+
+def test_category_reply_updates_existing_expense_instead_of_recreating_it():
+    decision = {"action": "tool", "tool": "preparar_despesa", "arguments": {
+        "amount": 57, "description": "GameStation", "category": "Jogos",
+    }}
+    corrected = _enforce_pending_expense_intent("Jogos", True, decision)
+    assert corrected["tool"] == "atualizar_despesa"
+    assert corrected["arguments"]["category"] == "Jogos"
 
 
 def test_agent_retries_plain_text_and_forces_financial_tool(monkeypatch):

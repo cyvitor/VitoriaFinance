@@ -3,7 +3,7 @@ from decimal import Decimal
 
 from app.database import SessionLocal
 from sqlalchemy import func, select
-from app.models import Account, AccountRole, AccountType, Card, Category, Financing, Person, PersonType, SystemAccount, SystemSetting, User, Workspace, WorkspaceMember, MemberRole, RecurrenceRule, RecurrenceOccurrence, Transaction, TransactionStatus, TransactionType
+from app.models import Account, AccountRole, AccountType, Card, Category, Financing, FinancingAmortization, Person, PersonType, SystemAccount, SystemSetting, User, Workspace, WorkspaceMember, MemberRole, RecurrenceRule, RecurrenceOccurrence, Transaction, TransactionStatus, TransactionType
 from app.security import hash_password
 
 
@@ -199,10 +199,38 @@ def test_financing_creates_monthly_installment_and_advances_when_paid(client):
     assert "198" in page.text and "85.081,93" in page.text
     assert 'href="/financings" class="active"' in page.text
     with SessionLocal() as db:
-        financing = db.scalar(select(Financing)); rule_id = financing.recurrence_rule_id
+        financing = db.scalar(select(Financing)); rule_id = financing.recurrence_rule_id; financing_id = financing.id
         assert financing.paid_installments == 162 and financing.total_installments == 360
+    detail = client.get(f"/financings/{financing_id}")
+    assert detail.status_code == 200 and "Histórico de amortizações" in detail.text
+    response = client.post(f"/financings/{financing_id}/edit", data={
+        "description":"Imóvel residencial", "person_id":str(area_id), "institution":"Caixa",
+        "account_id":str(account_id), "category_id":"", "financed_amount":"114000.00",
+        "nominal_interest_rate":"7.50", "due_day":"10", "start_date":"2020-01-10",
+        "notes":"Contrato atualizado",
+    }, follow_redirects=False)
+    assert response.status_code == 303
+    response = client.post(f"/financings/{financing_id}/amortize", data={
+        "amortization_date":"2026-07-20", "amortized_amount":"10000.00",
+        "new_outstanding_balance":"74000.00", "strategy":"reduce_both",
+        "remaining_installments":"120", "new_installment_amount":"900.00",
+        "notes":"Uso de FGTS",
+    }, follow_redirects=False)
+    assert response.status_code == 303
+    with SessionLocal() as db:
+        financing = db.get(Financing, financing_id)
+        rule = db.get(RecurrenceRule, rule_id)
+        history = db.scalar(select(FinancingAmortization))
+        assert financing.description == "Imóvel residencial" and financing.institution == "Caixa"
+        assert financing.outstanding_balance == Decimal("74000.00")
+        assert financing.total_installments == 282 and financing.installment_amount == Decimal("900.00")
+        assert rule.amount == Decimal("900.00") and "163/282" in rule.description
+        assert history.amortized_amount == Decimal("10000.00") and history.source == "web"
+        assert history.previous_total_installments == 360 and history.new_total_installments == 282
+    history_page = client.get(f"/financings/{financing_id}")
+    assert "Uso de FGTS" in history_page.text and "R$ 10.000,00" in history_page.text
     client.post(f"/recurrences/{rule_id}/confirm", data={"year":"2026", "month":"7",
-        "confirmed_amount":"1097.16", "payment_source":f"account:{account_id}"})
+        "confirmed_amount":"900.00", "payment_source":f"account:{account_id}"})
     with SessionLocal() as db:
         assert db.scalar(select(Financing.paid_installments)) == 163
 

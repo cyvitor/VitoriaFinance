@@ -5,7 +5,7 @@ from sqlalchemy import func, select
 from app.automation.telegram_bot import handle_message
 from app.database import SessionLocal
 from app.models import (
-    AccountRole, Category, Person, PersonType, SystemAccount, TelegramLink,
+    Account, AccountRole, AccountType, Card, Category, Person, PersonType, SystemAccount, TelegramLink,
     Transaction, TransactionType, User, Workspace, WorkspaceMember,
 )
 from app.security import hash_password
@@ -54,6 +54,53 @@ def test_expense_tool_can_cancel_draft():
         execute_tool(db, context, "preparar_despesa", {"amount": 20, "description": "Lanche"})
         assert execute_tool(db, context, "cancelar_despesa", {})["cancelled"] is True
         assert db.scalar(select(func.count(Transaction.id))) == 0
+
+
+def test_expense_draft_persists_category_and_credit_card_before_confirmation():
+    with SessionLocal() as db:
+        user = setup_linked_user(db); context = build_user_access_context(db, user)
+        person = db.get(Person, user.default_person_id)
+        category = Category(workspace_id=person.workspace_id, name="Padaria", parent_name="Alimentacao",
+                            kind=TransactionType.expense)
+        account = Account(workspace_id=person.workspace_id, person_id=person.id, name="Conta C6",
+                          account_type=AccountType.checking)
+        db.add_all([category, account]); db.flush()
+        card = Card(workspace_id=person.workspace_id, account_id=account.id, name="C6", closing_day=5, due_day=10)
+        db.add(card); db.commit()
+        execute_tool(db, context, "preparar_despesa", {"amount": 5, "description": "Doce Pao"})
+        updated = execute_tool(db, context, "atualizar_despesa", {
+            "category": "Alimentacao Padaria", "payment_method": "credit", "card": "C6",
+        })
+        assert updated["status"] == "awaiting_confirmation"
+        execute_tool(db, context, "confirmar_despesa", {})
+        transaction = db.scalar(select(Transaction))
+        assert transaction.category.name == "Padaria"
+        assert transaction.payment_method == "Crédito" and transaction.card.name == "C6"
+        assert transaction.account_id == account.id and str(transaction.status) == "TransactionStatus.pending"
+
+
+def test_parent_category_returns_real_subcategories_and_preserves_relative_date():
+    with SessionLocal() as db:
+        user = setup_linked_user(db); context = build_user_access_context(db, user)
+        person = db.get(Person, user.default_person_id)
+        db.add_all([
+            Category(workspace_id=person.workspace_id, name="Cinema", parent_name="Lazer",
+                     kind=TransactionType.expense),
+            Category(workspace_id=person.workspace_id, name="Jogos", parent_name="Lazer",
+                     kind=TransactionType.expense),
+        ])
+        db.commit()
+        result = execute_tool(db, context, "preparar_despesa", {
+            "amount": 57, "description": "GameStation", "category": "Lazer",
+            "transaction_date": "2026-07-21",
+        })
+        assert result["status"] == "missing_information"
+        assert result["missing_fields"] == ["subcategoria"]
+        assert result["category_options"] == ["Lazer > Cinema", "Lazer > Jogos"]
+        result = execute_tool(db, context, "atualizar_despesa", {"category": "Jogos"})
+        assert result["status"] == "awaiting_confirmation"
+        assert "Data: 21/07/2026" in result["summary"]
+        assert "Categoria: Lazer > Jogos" in result["summary"]
 
 
 def test_unlinked_telegram_cannot_use_agent(monkeypatch):

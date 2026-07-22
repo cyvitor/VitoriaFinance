@@ -11,6 +11,7 @@ class Settings:
     app_name = os.getenv("APP_NAME", "VitoriaFinance")
     app_env = os.getenv("APP_ENV", "development")
     debug = os.getenv("APP_DEBUG", "false").lower() == "true"
+    http_port = int(os.getenv("HTTP_PORT", "8000"))
     secret_key = os.getenv("SECRET_KEY", "change-me")
     db_driver = os.getenv("DB_DRIVER", "mysql+pymysql")
     db_host = os.getenv("DB_HOST", "127.0.0.1")

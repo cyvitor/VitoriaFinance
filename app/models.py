@@ -106,6 +106,9 @@ class TelegramExpenseDraft(Base):
     amount: Mapped[Decimal] = mapped_column(Numeric(14, 2))
     transaction_date: Mapped[date] = mapped_column(Date)
     category_id: Mapped[int | None] = mapped_column(ForeignKey("categories.id", ondelete="SET NULL"), nullable=True)
+    account_id: Mapped[int | None] = mapped_column(ForeignKey("accounts.id", ondelete="SET NULL"), nullable=True)
+    card_id: Mapped[int | None] = mapped_column(ForeignKey("cards.id", ondelete="SET NULL"), nullable=True)
+    payment_method: Mapped[str | None] = mapped_column(String(40), nullable=True)
     status: Mapped[str] = mapped_column(String(30), default="awaiting_confirmation", index=True)
     expires_at: Mapped[datetime] = mapped_column(DateTime, index=True)
     transaction_id: Mapped[int | None] = mapped_column(ForeignKey("transactions.id", ondelete="SET NULL"), nullable=True)
@@ -113,6 +116,8 @@ class TelegramExpenseDraft(Base):
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     person: Mapped["Person"] = relationship()
     category: Mapped["Category | None"] = relationship()
+    account: Mapped["Account | None"] = relationship()
+    card: Mapped["Card | None"] = relationship()
 
 
 class TelegramProcessedUpdate(Base):

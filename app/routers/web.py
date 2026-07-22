@@ -19,7 +19,8 @@ from app.dependencies import allowed_person_ids, current_user, current_workspace
 from app.models import (
     Account, AccountRole, AccountType, Card, CardBillingPeriod, Category, Person, PersonType, SystemAccount, SystemSetting,
     Transaction, TransactionStatus, TransactionType, User, UserPersonAccess, WorkspaceMember, TelegramLink,
-    RecurrenceRule, RecurrenceOccurrence, AccountingPeriod, Financing, MemberRole, UserMemory, Workspace,
+    RecurrenceRule, RecurrenceOccurrence, AccountingPeriod, Financing, FinancingAmortization,
+    MemberRole, UserMemory, Workspace,
 )
 from app.security import hash_password, verify_password
 from app.services.card_billing import card_purchase_competence, shift_month as shift_competence_month
@@ -679,6 +680,134 @@ def financing_create(request: Request, description: str = Form(), paid_installme
     db.commit()
     flash(request, "Financiamento cadastrado e parcela mensal programada.")
     return redirect("/financings")
+
+
+@router.get("/financings/{financing_id}", response_class=HTMLResponse)
+def financing_detail(financing_id: int, request: Request, db: Session = Depends(get_db),
+                     user: User = Depends(current_user)):
+    wid = current_workspace_id(request, user, db)
+    financing = db.scalar(select(Financing).where(
+        Financing.id == financing_id, Financing.workspace_id == wid,
+    ))
+    if not financing: raise HTTPException(404)
+    ensure_area_access(financing.person_id, user, wid, db)
+    histories = db.scalars(select(FinancingAmortization).where(
+        FinancingAmortization.financing_id == financing.id
+    ).order_by(FinancingAmortization.amortization_date.desc(),
+               FinancingAmortization.id.desc())).all()
+    user_ids = {history.user_id for history in histories}
+    history_users = {item.id: item for item in db.scalars(select(User).where(User.id.in_(user_ids))).all()} \
+        if user_ids else {}
+    categories = db.scalars(select(Category).where(
+        Category.workspace_id == wid, Category.kind == TransactionType.expense
+    ).order_by(Category.parent_name, Category.name)).all()
+    return render(request, "financings/detail.html", user=user, financing=financing,
+                  histories=histories, history_users=history_users,
+                  people=visible_people(user, wid, db), accounts=visible_accounts(user, wid, db),
+                  categories=categories, today=date.today())
+
+
+@router.post("/financings/{financing_id}/edit")
+def financing_edit(financing_id: int, request: Request, description: str = Form(), person_id: int = Form(),
+                   institution: str | None = Form(None), account_id: str | None = Form(None),
+                   category_id: str | None = Form(None), financed_amount: str | None = Form(None),
+                   nominal_interest_rate: str | None = Form(None), due_day: str | None = Form(None),
+                   start_date: date | None = Form(None), notes: str | None = Form(None),
+                   db: Session = Depends(get_db), user: User = Depends(current_user)):
+    wid = current_workspace_id(request, user, db)
+    financing = db.scalar(select(Financing).where(
+        Financing.id == financing_id, Financing.workspace_id == wid,
+    ))
+    if not financing: raise HTTPException(404)
+    ensure_area_access(financing.person_id, user, wid, db)
+    ensure_area_access(person_id, user, wid, db)
+    account_value, category_value = optional_int(account_id), optional_int(category_id)
+    ensure_account_access(account_value, user, wid, db)
+    if category_value and not db.scalar(select(Category.id).where(
+        Category.id == category_value, Category.workspace_id == wid,
+        Category.kind == TransactionType.expense,
+    )):
+        flash(request, "Selecione uma categoria de despesa válida.", "danger")
+        return redirect(f"/financings/{financing.id}")
+    due_day_value = optional_int(due_day)
+    if not description.strip() or (due_day_value and not 1 <= due_day_value <= 31):
+        flash(request, "Confira a descrição e o dia de vencimento.", "danger")
+        return redirect(f"/financings/{financing.id}")
+    financing.description = description.strip()
+    financing.person_id = person_id
+    financing.institution = (institution or "").strip() or None
+    financing.financed_amount = optional_decimal(financed_amount)
+    financing.nominal_interest_rate = optional_decimal(nominal_interest_rate)
+    financing.due_day = due_day_value
+    financing.start_date = start_date
+    financing.notes = (notes or "").strip() or None
+    rule = db.get(RecurrenceRule, financing.recurrence_rule_id) if financing.recurrence_rule_id else None
+    if rule:
+        rule.person_id = person_id
+        rule.account_id = account_value
+        rule.category_id = category_value
+        rule.notes = financing.notes
+        rule.description = f"{financing.description} - parcela {financing.paid_installments + 1}/{financing.total_installments}"
+    db.commit()
+    flash(request, "Informações do financiamento atualizadas.")
+    return redirect(f"/financings/{financing.id}")
+
+
+@router.post("/financings/{financing_id}/amortize")
+def financing_amortize(financing_id: int, request: Request, amortization_date: date = Form(),
+                       new_outstanding_balance: Decimal = Form(), strategy: str = Form(),
+                       amortized_amount: str | None = Form(None), remaining_installments: str | None = Form(None),
+                       new_installment_amount: str | None = Form(None), notes: str | None = Form(None),
+                       db: Session = Depends(get_db), user: User = Depends(current_user)):
+    wid = current_workspace_id(request, user, db)
+    financing = db.scalar(select(Financing).where(
+        Financing.id == financing_id, Financing.workspace_id == wid, Financing.status == "active",
+    ))
+    if not financing: raise HTTPException(404)
+    ensure_area_access(financing.person_id, user, wid, db)
+    if strategy not in ("reduce_term", "reduce_installment", "reduce_both") or new_outstanding_balance < 0:
+        flash(request, "Confira a estratégia e o novo saldo devedor.", "danger")
+        return redirect(f"/financings/{financing.id}")
+    remaining_value = optional_int(remaining_installments)
+    installment_value = optional_decimal(new_installment_amount)
+    if strategy in ("reduce_term", "reduce_both") and remaining_value is None:
+        flash(request, "Informe a nova quantidade de parcelas restantes.", "danger")
+        return redirect(f"/financings/{financing.id}")
+    if strategy in ("reduce_installment", "reduce_both") and installment_value is None:
+        flash(request, "Informe o novo valor da parcela.", "danger")
+        return redirect(f"/financings/{financing.id}")
+    remaining_value = remaining_value if remaining_value is not None \
+        else financing.total_installments - financing.paid_installments
+    installment_value = installment_value if installment_value is not None else Decimal(financing.installment_amount)
+    if remaining_value < 0 or installment_value <= 0:
+        flash(request, "A quantidade restante e o valor da parcela devem ser válidos.", "danger")
+        return redirect(f"/financings/{financing.id}")
+    new_total = financing.paid_installments + remaining_value
+    history = FinancingAmortization(
+        financing_id=financing.id, user_id=user.id, amortization_date=amortization_date,
+        amortized_amount=optional_decimal(amortized_amount),
+        previous_outstanding_balance=financing.outstanding_balance,
+        new_outstanding_balance=new_outstanding_balance,
+        previous_total_installments=financing.total_installments,
+        new_total_installments=new_total,
+        previous_installment_amount=financing.installment_amount,
+        new_installment_amount=installment_value,
+        strategy=strategy, source="web", notes=(notes or "").strip() or None,
+    )
+    db.add(history)
+    financing.outstanding_balance = new_outstanding_balance
+    financing.total_installments = new_total
+    financing.installment_amount = installment_value
+    rule = db.get(RecurrenceRule, financing.recurrence_rule_id) if financing.recurrence_rule_id else None
+    if remaining_value == 0 or new_outstanding_balance == 0:
+        financing.status = "paid"
+        if rule: rule.is_active = False
+    elif rule:
+        rule.amount = installment_value
+        rule.description = f"{financing.description} - parcela {financing.paid_installments + 1}/{new_total}"
+    db.commit()
+    flash(request, "Amortização registrada e próximas parcelas atualizadas.")
+    return redirect(f"/financings/{financing.id}")
 
 
 @router.post("/fixed-expenses/{rule_id}/delete")

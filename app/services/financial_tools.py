@@ -1,3 +1,4 @@
+from calendar import monthrange
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 import json
@@ -10,9 +11,10 @@ from app.models import (
     TelegramPendingAction, Transaction, TransactionStatus, TransactionType, User,
 )
 from app.services.access_context import UserAccessContext
+from app.services.card_billing import card_purchase_competence
 from app.services.telegram_expenses import (
     ExpenseInput, cancel_expense_draft, confirm_expense_draft, create_expense_draft,
-    format_draft, get_active_draft,
+    format_draft, get_active_draft, update_expense_draft,
 )
 
 
@@ -248,10 +250,15 @@ def calculate_free_balance(db: Session, context: UserAccessContext, args: dict) 
     )))
     rules = db.scalars(select(RecurrenceRule).where(
         RecurrenceRule.workspace_id.in_(context.workspace_ids), RecurrenceRule.person_id.in_(person_ids),
-        RecurrenceRule.transaction_type == TransactionType.expense, RecurrenceRule.is_active.is_(True),
+        RecurrenceRule.transaction_type.in_([TransactionType.income, TransactionType.expense]),
+        RecurrenceRule.is_active.is_(True),
     )).all()
+    recurring_income = Decimal(0)
     recurring_commitments = Decimal(0)
+    month_end = today.replace(day=monthrange(today.year, today.month)[1])
     for rule in rules:
+        if rule.start_date and rule.start_date > month_end:
+            continue
         occurrence = db.scalar(select(RecurrenceOccurrence).where(
             RecurrenceOccurrence.recurrence_rule_id == rule.id,
             RecurrenceOccurrence.year == today.year, RecurrenceOccurrence.month == today.month,
@@ -259,12 +266,62 @@ def calculate_free_balance(db: Session, context: UserAccessContext, args: dict) 
         if occurrence and occurrence.status in ("confirmed", "skipped"):
             continue
         if occurrence and occurrence.status == "partial" and occurrence.remaining_amount is not None:
-            recurring_commitments += Decimal(occurrence.remaining_amount)
+            amount = Decimal(occurrence.remaining_amount)
         else:
-            recurring_commitments += Decimal(rule.amount or 0)
+            amount = Decimal(rule.amount or 0)
+        if rule.transaction_type == TransactionType.income:
+            recurring_income += amount
+        else:
+            recurring_commitments += amount
+    month_rows = db.execute(select(
+        Transaction.transaction_type, func.coalesce(func.sum(Transaction.amount), 0)
+    ).where(
+        Transaction.workspace_id.in_(context.workspace_ids), Transaction.person_id.in_(person_ids),
+        Transaction.status != TransactionStatus.cancelled,
+        Transaction.competence_year == today.year, Transaction.competence_month == today.month,
+        Transaction.transaction_type.in_([TransactionType.income, TransactionType.expense]),
+    ).group_by(Transaction.transaction_type)).all()
+    month_totals = {kind: Decimal(amount) for kind, amount in month_rows}
+    projected_income = month_totals.get(TransactionType.income, Decimal(0)) + recurring_income
+    projected_expense = month_totals.get(TransactionType.expense, Decimal(0)) + recurring_commitments
+    projected_month_result = projected_income - projected_expense
     current_balance = initial_balance + paid_flow
     free_balance = current_balance - pending_transactions - recurring_commitments
     after_planned_spending = free_balance - planned_spending
+    payment_method = str(args.get("payment_method") or "cash").casefold()
+    is_credit = payment_method in ("credit", "credito", "crédito", "cartao", "cartão")
+    card_context = None
+    projected_after_planned = projected_month_result - planned_spending
+    if is_credit:
+        cards = db.scalars(select(Card).join(Account, Account.id == Card.account_id).where(
+            Card.is_active.is_(True), Account.person_id.in_(person_ids),
+        ).order_by(Card.name)).all()
+        requested_card = str(args.get("card") or "").strip()
+        if requested_card:
+            normalized = requested_card.casefold()
+            cards = [card for card in cards if normalized in card.name.casefold()]
+            if len(cards) != 1:
+                raise ToolError("Cartao nao encontrado, ambiguo ou sem permissao")
+        if not cards:
+            raise ToolError("Nenhum cartao permitido foi encontrado")
+        competences = {card.name: card_purchase_competence(db, card, today) for card in cards}
+        unique_competences = set(competences.values())
+        selection_required = len(unique_competences) > 1 and not requested_card
+        purchase_competence = next(iter(unique_competences)) if len(unique_competences) == 1 else None
+        affects_current_month = purchase_competence == (today.year, today.month) if purchase_competence else None
+        projected_after_planned = (
+            projected_month_result - planned_spending if affects_current_month is not False
+            else projected_month_result
+        )
+        card_context = {
+            "cards": [{"name": card.name, "closing_day": card.closing_day, "due_day": card.due_day,
+                       "purchase_competence": f"{competences[card.name][0]:04d}-{competences[card.name][1]:02d}"}
+                      for card in cards],
+            "card_selection_required": selection_required,
+            "purchase_competence": f"{purchase_competence[0]:04d}-{purchase_competence[1]:02d}" if purchase_competence else None,
+            "affects_current_month": affects_current_month,
+            "next_competence_commitment": _money(planned_spending) if affects_current_month is False else "0.00",
+        }
     return {
         "as_of": today.isoformat(), "area": person.name if person else "todas as areas permitidas",
         "current_balance": _money(current_balance),
@@ -273,7 +330,17 @@ def calculate_free_balance(db: Session, context: UserAccessContext, args: dict) 
         "free_balance": _money(free_balance), "planned_spending": _money(planned_spending),
         "free_balance_after_planned_spending": _money(after_planned_spending),
         "can_afford": after_planned_spending >= 0,
-        "definition": "saldo atual menos despesas pendentes e recorrencias ainda nao resolvidas no mes, depois do gasto informado",
+        "payment_method": "credit" if is_credit else "cash",
+        "projected_income_month": _money(projected_income),
+        "projected_expense_month": _money(projected_expense),
+        "projected_month_result": _money(projected_month_result),
+        "projected_month_result_after_planned_spending": _money(projected_after_planned),
+        "can_close_month": projected_after_planned >= 0,
+        "card_context": card_context,
+        "definition": {
+            "cash": "saldo em conta agora menos despesas pendentes e recorrencias ainda nao resolvidas",
+            "month_projection": "receitas confirmadas e previstas menos despesas confirmadas e previstas da competencia",
+        },
         "warning": "Nao inclui transacoes ainda nao cadastradas nem compromissos fora do VitoriaFinance.",
     }
 
@@ -450,15 +517,45 @@ def prepare_expense(db: Session, context: UserAccessContext, args: dict) -> dict
     draft = create_expense_draft(db, user, ExpenseInput(amount, description[:180]))
     if not draft:
         raise ToolError("Defina uma area financeira padrao antes de registrar pelo Telegram")
-    return {"status": "awaiting_confirmation", "summary": format_draft(draft)}
+    missing = []
+    category_options = []
+    transaction_date = _date(args.get("transaction_date"), date.today()) if args.get("transaction_date") else None
+    if any(args.get(field) for field in ("category", "payment_method", "card", "transaction_date")):
+        draft, missing, category_options = update_expense_draft(
+            db, user, category=args.get("category"), payment_method=args.get("payment_method"),
+            card=args.get("card"), transaction_date=transaction_date,
+        )
+    return {"status": "missing_information" if missing else "awaiting_confirmation",
+            "missing_fields": missing, "category_options": category_options,
+            "summary": format_draft(draft)}
 
 
 def confirm_expense(db: Session, context: UserAccessContext, args: dict) -> dict:
     user = db.get(User, context.user_id)
+    draft = get_active_draft(db, user.id)
+    if draft and draft.payment_method == "Crédito" and not draft.card_id:
+        return {"status": "missing_information", "missing_fields": ["cartao"],
+                "summary": format_draft(draft)}
     transaction = confirm_expense_draft(db, user)
     if not transaction:
         raise ToolError("Nao ha despesa aguardando confirmacao")
     return {"registered": True, "description": transaction.description, "amount": _money(transaction.amount)}
+
+
+def update_expense(db: Session, context: UserAccessContext, args: dict) -> dict:
+    if not context.can_write:
+        raise ToolError("Usuario sem permissao para alterar despesas")
+    user = db.get(User, context.user_id)
+    transaction_date = _date(args.get("transaction_date"), date.today()) if args.get("transaction_date") else None
+    draft, missing, category_options = update_expense_draft(
+        db, user, category=args.get("category"), payment_method=args.get("payment_method"),
+        card=args.get("card"), transaction_date=transaction_date,
+    )
+    if not draft:
+        raise ToolError("Nao ha despesa aguardando confirmacao")
+    return {"status": "missing_information" if missing else "awaiting_confirmation",
+            "missing_fields": missing, "category_options": category_options,
+            "summary": format_draft(draft)}
 
 
 def cancel_expense(db: Session, context: UserAccessContext, args: dict) -> dict:
@@ -480,6 +577,7 @@ TOOLS = {
     "confirmar_acao_pendente": confirm_pending_action,
     "cancelar_acao_pendente": cancel_pending_action,
     "preparar_despesa": prepare_expense,
+    "atualizar_despesa": update_expense,
     "confirmar_despesa": confirm_expense,
     "cancelar_despesa": cancel_expense,
 }
