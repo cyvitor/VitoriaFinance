@@ -1,14 +1,15 @@
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from decimal import Decimal
+import json
 import unicodedata
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models import (
-    Account, AccountRole, Card, Category, Person, TelegramExpenseDraft, Transaction, TransactionStatus,
-    TransactionType, User, UserPersonAccess, WorkspaceMember,
+    Account, AccountRole, Card, Category, Person, TelegramExpenseDraft, TelegramExpenseQueueItem,
+    Transaction, TransactionStatus, TransactionType, User, UserPersonAccess, WorkspaceMember,
 )
 from app.services.card_billing import card_purchase_competence
 
@@ -66,6 +67,21 @@ def _resolve_category(db: Session, workspace_id: int, value: str) -> tuple[Categ
     categories = db.scalars(select(Category).where(
         Category.workspace_id == workspace_id, Category.kind == TransactionType.expense,
     )).all()
+    aliases = {
+        "farmacia": ("saude", "medicamentos"),
+        "drogaria": ("saude", "medicamentos"),
+        "saude farmacia": ("saude", "medicamentos"),
+        "saude drogaria": ("saude", "medicamentos"),
+    }
+    alias_target = aliases.get(normalized_value)
+    if alias_target:
+        alias_matches = [
+            category for category in categories
+            if _normalize(category.parent_name or "") == alias_target[0]
+            and _normalize(category.name) == alias_target[1]
+        ]
+        if len(alias_matches) == 1:
+            return alias_matches[0], []
     exact_names = [category for category in categories if _normalize(category.name) == normalized_value]
     if len(exact_names) == 1:
         return exact_names[0], []
@@ -77,6 +93,13 @@ def _resolve_category(db: Session, workspace_id: int, value: str) -> tuple[Categ
     )]
     if len(matches) == 1:
         return matches[0], []
+    requested_parent = normalized_value.split(" ", 1)[0] if words else ""
+    parent_matches = [
+        category for category in categories
+        if _normalize(category.parent_name or "") == requested_parent
+    ]
+    if parent_matches:
+        return None, [f"{category.parent_name} > {category.name}" for category in parent_matches]
     return None, [f"{category.parent_name} > {category.name}" for category in matches[:12]]
 
 
@@ -203,6 +226,55 @@ def cancel_expense_draft(db: Session, user: User, now: datetime | None = None) -
     draft.resolved_at = now
     db.commit()
     return True
+
+
+def replace_expense_queue(db: Session, user_id: int, items: list[dict]) -> int:
+    now = datetime.utcnow()
+    active_items = db.scalars(select(TelegramExpenseQueueItem).where(
+        TelegramExpenseQueueItem.user_id == user_id,
+        TelegramExpenseQueueItem.status.in_(["queued", "processing"]),
+    )).all()
+    for item in active_items:
+        item.status = "cancelled"
+        item.resolved_at = now
+    for position, payload in enumerate(items, start=1):
+        db.add(TelegramExpenseQueueItem(
+            user_id=user_id, position=position,
+            payload=json.dumps(payload, ensure_ascii=False), status="queued",
+        ))
+    db.commit()
+    return len(items)
+
+
+def pop_next_queued_expense(db: Session, user_id: int) -> dict | None:
+    item = db.scalar(select(TelegramExpenseQueueItem).where(
+        TelegramExpenseQueueItem.user_id == user_id,
+        TelegramExpenseQueueItem.status == "queued",
+    ).order_by(TelegramExpenseQueueItem.position, TelegramExpenseQueueItem.id))
+    if not item:
+        return None
+    item.status = "processing"
+    item.resolved_at = datetime.utcnow()
+    db.commit()
+    return json.loads(item.payload)
+
+
+def queued_expense_count(db: Session, user_id: int) -> int:
+    return len(db.scalars(select(TelegramExpenseQueueItem.id).where(
+        TelegramExpenseQueueItem.user_id == user_id,
+        TelegramExpenseQueueItem.status == "queued",
+    )).all())
+
+
+def finish_processing_queue_item(db: Session, user_id: int, status: str) -> None:
+    item = db.scalar(select(TelegramExpenseQueueItem).where(
+        TelegramExpenseQueueItem.user_id == user_id,
+        TelegramExpenseQueueItem.status == "processing",
+    ).order_by(TelegramExpenseQueueItem.id.desc()))
+    if item:
+        item.status = status
+        item.resolved_at = datetime.utcnow()
+        db.commit()
 
 
 def format_draft(draft: TelegramExpenseDraft) -> str:

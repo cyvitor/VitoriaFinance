@@ -1,3 +1,4 @@
+from datetime import date
 from decimal import Decimal
 
 from sqlalchemy import func, select
@@ -6,7 +7,7 @@ from app.automation.telegram_bot import handle_message
 from app.database import SessionLocal
 from app.models import (
     Account, AccountRole, AccountType, Card, Category, Person, PersonType, SystemAccount, TelegramLink,
-    Transaction, TransactionType, User, Workspace, WorkspaceMember,
+    TelegramExpenseQueueItem, Transaction, TransactionType, User, Workspace, WorkspaceMember,
 )
 from app.security import hash_password
 from app.services.access_context import build_user_access_context
@@ -101,6 +102,61 @@ def test_parent_category_returns_real_subcategories_and_preserves_relative_date(
         assert result["status"] == "awaiting_confirmation"
         assert "Data: 21/07/2026" in result["summary"]
         assert "Categoria: Lazer > Jogos" in result["summary"]
+
+
+def test_pharmacy_alias_resolves_to_health_medication_category():
+    with SessionLocal() as db:
+        user = setup_linked_user(db); context = build_user_access_context(db, user)
+        person = db.get(Person, user.default_person_id)
+        medication = Category(workspace_id=person.workspace_id, name="Medicamentos",
+                              parent_name="Saude", kind=TransactionType.expense)
+        db.add(medication); db.commit()
+        execute_tool(db, context, "preparar_despesa", {
+            "amount": 4.99, "description": "Fraumed",
+        })
+        result = execute_tool(db, context, "atualizar_despesa", {
+            "category": "Saúde > Farmácia",
+        })
+        assert result["status"] == "awaiting_confirmation"
+        assert "Categoria: Saude > Medicamentos" in result["summary"]
+
+
+def test_multiple_expenses_advance_sequentially_after_confirmation():
+    with SessionLocal() as db:
+        user = setup_linked_user(db); context = build_user_access_context(db, user)
+        person = db.get(Person, user.default_person_id)
+        cafe = Category(workspace_id=person.workspace_id, name="Cafe", parent_name="Alimentacao",
+                        kind=TransactionType.expense)
+        account = Account(workspace_id=person.workspace_id, person_id=person.id, name="Conta C6",
+                          account_type=AccountType.checking)
+        db.add_all([cafe, account]); db.flush()
+        card = Card(workspace_id=person.workspace_id, account_id=account.id, name="C6",
+                    closing_day=5, due_day=10)
+        db.add(card); db.commit()
+        result = execute_tool(db, context, "preparar_despesas", {"expenses": [
+            {"amount": 96.02, "description": "Hiperideal", "transaction_date": "2026-07-22",
+             "category": "Alimentacao > Mercado", "payment_method": "credit", "card": "C6"},
+            {"amount": 8, "description": "Afemaria", "transaction_date": "2026-07-23",
+             "category": "Alimentacao > Cafe", "payment_method": "credit", "card": "C6"},
+        ]})
+        assert result["batch"] == {"total": 2, "current": 1, "queued": 1}
+        assert "Hiperideal" in result["summary"]
+        assert db.scalar(select(func.count(TelegramExpenseQueueItem.id))) == 1
+
+        first = execute_tool(db, context, "confirmar_despesa", {})
+        assert first["registered"] is True
+        assert "Afemaria" in first["next_expense"]["summary"]
+        assert first["next_expense"]["queue"]["remaining_after_current"] == 0
+        first_queue_item = db.scalar(select(TelegramExpenseQueueItem))
+        assert first_queue_item.status == "processing"
+
+        second = execute_tool(db, context, "confirmar_despesa", {})
+        assert second["registered"] is True and second["next_expense"] is None
+        assert first_queue_item.status == "confirmed"
+        transactions = db.scalars(select(Transaction).order_by(Transaction.id)).all()
+        assert [(item.description, item.transaction_date) for item in transactions] == [
+            ("Hiperideal", date(2026, 7, 22)), ("Afemaria", date(2026, 7, 23)),
+        ]
 
 
 def test_unlinked_telegram_cannot_use_agent(monkeypatch):

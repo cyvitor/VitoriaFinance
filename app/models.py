@@ -120,6 +120,17 @@ class TelegramExpenseDraft(Base):
     card: Mapped["Card | None"] = relationship()
 
 
+class TelegramExpenseQueueItem(Base):
+    __tablename__ = "telegram_expense_queue_items"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    position: Mapped[int] = mapped_column()
+    payload: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(30), default="queued", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
 class TelegramProcessedUpdate(Base):
     __tablename__ = "telegram_processed_updates"
     id: Mapped[int] = mapped_column(primary_key=True)

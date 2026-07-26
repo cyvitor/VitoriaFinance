@@ -2,11 +2,17 @@
 from sqlalchemy import inspect
 
 from app.database import engine
+from app.models import TelegramExpenseQueueItem
 
 
 def run():
     inspector = inspect(engine)
     changes = 0
+    queue_table = TelegramExpenseQueueItem.__table__
+    if not inspector.has_table(queue_table.name):
+        queue_table.create(engine)
+        print("Tabela telegram_expense_queue_items adicionada.")
+        changes += 1
     user_columns = {column["name"] for column in inspector.get_columns("users")}
     if "default_person_id" not in user_columns:
         with engine.begin() as connection:

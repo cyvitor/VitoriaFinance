@@ -14,7 +14,9 @@ from app.services.access_context import UserAccessContext
 from app.services.card_billing import card_purchase_competence
 from app.services.telegram_expenses import (
     ExpenseInput, cancel_expense_draft, confirm_expense_draft, create_expense_draft,
-    format_draft, get_active_draft, update_expense_draft,
+    finish_processing_queue_item, format_draft, get_active_draft,
+    pop_next_queued_expense, queued_expense_count,
+    replace_expense_queue, update_expense_draft,
 )
 
 
@@ -167,15 +169,49 @@ def query_transactions(db: Session, context: UserAccessContext, args: dict, kind
     total = db.scalar(select(func.coalesce(func.sum(Transaction.amount), 0)).where(
         Transaction.id.in_(select(query.order_by(None).subquery().c.id))
     ))
-    items = db.scalars(query.order_by(Transaction.transaction_date.desc()).limit(20)).all()
+    all_items = db.scalars(query.order_by(Transaction.transaction_date.desc(), Transaction.id.desc())).all()
+    breakdown = {}
+    for item in all_items:
+        method = (item.payment_method or "").casefold()
+        if item.card_id and method in ("crédito", "credito", "credit"):
+            key = "cartao_credito"
+            label = f"Crédito — {item.card.name}" if item.card else "Cartão de crédito"
+        elif item.card_id and method in ("débito", "debito", "debit"):
+            key = "cartao_debito"
+            label = f"Débito — {item.card.name}" if item.card else "Cartão de débito"
+        elif item.account_id:
+            key = "conta"
+            label = f"Conta — {item.account.name}" if item.account else "Conta"
+        else:
+            key = "nao_informado"
+            label = "Forma de pagamento não informada"
+        bucket_key = f"{key}:{label}"
+        bucket = breakdown.setdefault(bucket_key, {
+            "type": key, "label": label, "amount": Decimal(0), "count": 0,
+        })
+        bucket["amount"] += Decimal(item.amount)
+        bucket["count"] += 1
+    items = all_items[:20]
     return {
         "type": kind.value, "start_date": start.isoformat(), "end_date": end.isoformat(),
         "area": person.name if person else "todas as areas permitidas",
         "category": category_name, "total": _money(total),
         "count": count,
+        "payment_breakdown": [
+            {**bucket, "amount": _money(bucket["amount"])} for bucket in breakdown.values()
+        ],
+        "coverage": {
+            "cards": "todos os cartões permitidos, incluindo crédito e débito",
+            "accounts": "todas as contas permitidas",
+            "statuses": "lançamentos pagos e pendentes; cancelados excluídos",
+        },
         "items": [{"date": item.transaction_date.isoformat(), "description": item.description,
                    "amount": _money(item.amount), "area": item.person.name if item.person else None,
-                   "category": item.category.name if item.category else None} for item in items[:20]],
+                   "category": item.category.name if item.category else None,
+                   "payment_method": item.payment_method,
+                   "card": item.card.name if item.card else None,
+                   "account": item.account.name if item.account else None,
+                   "status": item.status.value} for item in items[:20]],
         "truncated": count > 20,
     }
 
@@ -530,6 +566,39 @@ def prepare_expense(db: Session, context: UserAccessContext, args: dict) -> dict
             "summary": format_draft(draft)}
 
 
+def prepare_expenses(db: Session, context: UserAccessContext, args: dict) -> dict:
+    if not context.can_write:
+        raise ToolError("Usuario sem permissao para registrar despesas")
+    expenses = args.get("expenses")
+    if not isinstance(expenses, list) or len(expenses) < 2:
+        return {"status": "missing_information", "missing_fields": ["ao menos duas despesas"]}
+    normalized = [item for item in expenses[:20] if isinstance(item, dict)]
+    if len(normalized) < 2:
+        return {"status": "missing_information", "missing_fields": ["despesas validas"]}
+    invalid_positions = [
+        index for index, item in enumerate(normalized, start=1)
+        if not str(item.get("description") or "").strip()
+        or (_decimal(item.get("amount"), f"valor da despesa {index}") or Decimal(0)) <= 0
+    ]
+    if invalid_positions:
+        return {"status": "missing_information",
+                "missing_fields": [f"valor e descricao da despesa {index}" for index in invalid_positions]}
+    user = db.get(User, context.user_id)
+    replace_expense_queue(db, user.id, normalized[1:])
+    first = prepare_expense(db, context, normalized[0])
+    first["batch"] = {"total": len(normalized), "current": 1, "queued": len(normalized) - 1}
+    return first
+
+
+def _advance_expense_queue(db: Session, context: UserAccessContext) -> dict | None:
+    payload = pop_next_queued_expense(db, context.user_id)
+    if not payload:
+        return None
+    result = prepare_expense(db, context, payload)
+    result["queue"] = {"remaining_after_current": queued_expense_count(db, context.user_id)}
+    return result
+
+
 def confirm_expense(db: Session, context: UserAccessContext, args: dict) -> dict:
     user = db.get(User, context.user_id)
     draft = get_active_draft(db, user.id)
@@ -539,7 +608,9 @@ def confirm_expense(db: Session, context: UserAccessContext, args: dict) -> dict
     transaction = confirm_expense_draft(db, user)
     if not transaction:
         raise ToolError("Nao ha despesa aguardando confirmacao")
-    return {"registered": True, "description": transaction.description, "amount": _money(transaction.amount)}
+    finish_processing_queue_item(db, context.user_id, "confirmed")
+    return {"registered": True, "description": transaction.description, "amount": _money(transaction.amount),
+            "next_expense": _advance_expense_queue(db, context)}
 
 
 def update_expense(db: Session, context: UserAccessContext, args: dict) -> dict:
@@ -560,7 +631,14 @@ def update_expense(db: Session, context: UserAccessContext, args: dict) -> dict:
 
 def cancel_expense(db: Session, context: UserAccessContext, args: dict) -> dict:
     user = db.get(User, context.user_id)
-    return {"cancelled": cancel_expense_draft(db, user)}
+    draft = get_active_draft(db, user.id)
+    description = draft.description if draft else None
+    amount = _money(draft.amount) if draft else None
+    cancelled = cancel_expense_draft(db, user)
+    if cancelled:
+        finish_processing_queue_item(db, context.user_id, "cancelled")
+    return {"cancelled": cancelled, "description": description, "amount": amount,
+            "next_expense": _advance_expense_queue(db, context) if cancelled else None}
 
 
 TOOLS = {
@@ -577,6 +655,7 @@ TOOLS = {
     "confirmar_acao_pendente": confirm_pending_action,
     "cancelar_acao_pendente": cancel_pending_action,
     "preparar_despesa": prepare_expense,
+    "preparar_despesas": prepare_expenses,
     "atualizar_despesa": update_expense,
     "confirmar_despesa": confirm_expense,
     "cancelar_despesa": cancel_expense,

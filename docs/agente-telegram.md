@@ -45,6 +45,13 @@ Despesas e amortizações seguem duas etapas. Primeiro o sistema cria um rascunh
 ou ação pendente e apresenta um resumo. Somente uma confirmação natural posterior
 efetiva a mudança.
 
+Quando uma mensagem contém várias despesas, o backend exige que a IA extraia
+todos os itens. A primeira despesa vira o rascunho ativo e as demais ficam em
+uma fila persistente no banco. Depois de confirmar ou cancelar o item atual, o
+bot abre automaticamente o próximo, preservando valor, data, categoria, forma
+de pagamento e cartão já informados. A fila sobrevive à reinicialização do
+worker e impede que parte de uma mensagem seja ignorada silenciosamente.
+
 Para amortizações, o agente coleta:
 
 - financiamento;

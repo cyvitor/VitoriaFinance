@@ -14,8 +14,9 @@ from app.security import hash_password
 from app.services.access_context import build_user_access_context
 from app.services.financial_tools import ToolError, execute_tool
 from app.services.telegram_agent import (
-    _enforce_balance_intent, _enforce_pending_expense_intent, _requires_financial_tool,
-    run_financial_agent,
+    _enforce_balance_intent, _enforce_pending_confirmation_intent,
+    _enforce_pending_expense_intent, _expense_tool_reply, _requires_financial_tool,
+    _enforce_transaction_period_intent, _looks_like_multiple_expenses, run_financial_agent,
 )
 from app.services.telegram_ai import AIUnavailableError
 from app.services.user_memory import relevant_memories
@@ -244,6 +245,83 @@ def test_category_reply_updates_existing_expense_instead_of_recreating_it():
     corrected = _enforce_pending_expense_intent("Jogos", True, decision)
     assert corrected["tool"] == "atualizar_despesa"
     assert corrected["arguments"]["category"] == "Jogos"
+
+
+def test_multiple_expenses_are_detected_without_confusing_dates_or_card_name():
+    text = "gastei 96,02 no hiperideal ontem, e 8 no afemaria hj, os dois no credito c6"
+    assert _looks_like_multiple_expenses(text) is True
+    assert _looks_like_multiple_expenses("gastei 57 no C6 em 22/07/2026") is False
+
+
+def test_expense_replies_always_identify_pending_and_next_item():
+    missing = _expense_tool_reply("atualizar_despesa", {
+        "status": "missing_information", "missing_fields": ["subcategoria"],
+        "category_options": ["Saúde > Medicamentos", "Saúde > Consulta"],
+        "summary": "Confirme este gasto:\n\nDescricao: Fraumed\nValor: R$ 4,99\n\nPosso registrar?",
+    }, "resposta vaga")
+    assert "Fraumed" in missing and "Saúde > Medicamentos" in missing
+    assert "Posso registrar?" not in missing
+
+    advanced = _expense_tool_reply("confirmar_despesa", {
+        "registered": True, "description": "Drogasil", "amount": "109.92",
+        "next_expense": {"summary": "Descricao: Fraumed\nValor: R$ 4,99"},
+    }, "resposta incompleta")
+    assert "Drogasil" in advanced and "Fraumed" in advanced
+
+
+def test_pending_expense_confirmation_does_not_recreate_batch_from_history():
+    batch_decision = {"action": "tool", "tool": "preparar_despesas", "arguments": {
+        "expenses": [{"amount": 13.43}, {"amount": 29.90}],
+    }}
+    assert _enforce_pending_confirmation_intent("yes", True, batch_decision)["tool"] == "confirmar_despesa"
+    assert _enforce_pending_confirmation_intent("pode", True, batch_decision)["tool"] == "confirmar_despesa"
+    assert _enforce_pending_confirmation_intent(
+        "não, já foi registrado", True, batch_decision
+    )["tool"] == "cancelar_despesa"
+
+
+def test_today_expense_query_includes_credit_debit_and_accounts():
+    with SessionLocal() as db:
+        user, financing, hidden, rule = setup_financings(db)
+        person = db.scalar(select(Person).where(Person.name == "Vitor"))
+        account = Account(workspace_id=person.workspace_id, person_id=person.id, name="Conta",
+                          account_type=AccountType.checking)
+        db.add(account); db.flush()
+        card = Card(workspace_id=person.workspace_id, account_id=account.id, name="C6",
+                    closing_day=5, due_day=10)
+        db.add(card); db.flush()
+        today = date.today()
+        db.add_all([
+            Transaction(workspace_id=person.workspace_id, person_id=person.id, account_id=account.id,
+                        card_id=card.id, transaction_type=TransactionType.expense,
+                        description="Credito", amount=Decimal("10"), transaction_date=today,
+                        status=TransactionStatus.pending, payment_method="Crédito", created_by_id=user.id),
+            Transaction(workspace_id=person.workspace_id, person_id=person.id, account_id=account.id,
+                        card_id=card.id, transaction_type=TransactionType.expense,
+                        description="Debito", amount=Decimal("20"), transaction_date=today,
+                        status=TransactionStatus.paid, payment_method="Débito", created_by_id=user.id),
+            Transaction(workspace_id=person.workspace_id, person_id=person.id, account_id=account.id,
+                        transaction_type=TransactionType.expense, description="Conta",
+                        amount=Decimal("30"), transaction_date=today,
+                        status=TransactionStatus.paid, payment_method="Pix", created_by_id=user.id),
+        ])
+        db.commit()
+        context = build_user_access_context(db, user)
+        result = execute_tool(db, context, "consultar_despesas", {
+            "start_date": today.isoformat(), "end_date": today.isoformat(),
+        })
+        assert result["total"] == "60.00"
+        assert {item["type"] for item in result["payment_breakdown"]} == {
+            "cartao_credito", "cartao_debito", "conta",
+        }
+        assert result["coverage"]["statuses"].startswith("lançamentos pagos e pendentes")
+
+    decision = _enforce_transaction_period_intent("quanto gastei hj?", {
+        "action": "tool", "tool": "consultar_despesas", "arguments": {},
+    })
+    assert decision["arguments"] == {
+        "start_date": date.today().isoformat(), "end_date": date.today().isoformat(),
+    }
 
 
 def test_agent_retries_plain_text_and_forces_financial_tool(monkeypatch):
