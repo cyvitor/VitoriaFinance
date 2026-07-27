@@ -43,5 +43,8 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
 
+      - name: Validar script de deploy
+        run: sh -n devops/deploy.sh
+
       - name: Executar testes
         run: python -m pytest -q

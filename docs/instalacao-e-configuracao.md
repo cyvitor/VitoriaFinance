@@ -40,6 +40,7 @@ Copie `.env.example` para `.env` e configure:
 | `BOT_LOG_LEVEL` | Nível de detalhes do bot: `basic` ou `detailed` | `basic` |
 | `BOT_LOG_MAX_BYTES` | Tamanho máximo de cada arquivo antes da rotação | `10485760` |
 | `BOT_LOG_BACKUP_COUNT` | Quantidade de arquivos antigos preservados | `7` |
+| `BOT_SERVICE_ENABLED` | Habilita o serviço systemd do bot | `false` |
 
 A variável `DATABASE_URL` também é aceita como substituição da configuração separada do banco. Ela é usada principalmente por testes e ambientes gerenciados.
 
@@ -127,12 +128,17 @@ Para acompanhar as últimas linhas no PowerShell:
 Get-Content .\logs\vitoria-bot.log -Tail 100 -Wait
 ```
 
+## Instalação em servidor
+
+Para instalar em uma VPS com Git, ambiente virtual Python, serviços systemd,
+backup pré-deploy e atualização por branch ou tag, consulte o
+[guia de instalação e deploy DevOps](deploy-devops.md).
+
 ## Migrações e seed
 
-O histórico consolidado contém duas migrações:
-
-- `0001_schema`: cria as tabelas e restrições;
-- `0002_seed`: cria a conta inicial `VH`, o usuário global `vh` e as categorias padrão.
+As migrations versionadas ficam em `alembic/versions`. O comando
+`alembic upgrade head` cria um banco novo ou aplica apenas as revisões ainda
+pendentes em uma instalação existente.
 
 Credenciais iniciais:
 

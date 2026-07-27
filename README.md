@@ -113,6 +113,7 @@ Essa operação é destrutiva para os dados financeiros e deve ser usada com cui
 - [Índice da documentação](docs/README.md)
 - [Guia funcional](docs/guia-funcional.md)
 - [Instalação e configuração](docs/instalacao-e-configuracao.md)
+- [Instalação e deploy DevOps](docs/deploy-devops.md)
 - [Arquitetura e modelo de dados](docs/arquitetura.md)
 - [Agente financeiro do Telegram](docs/agente-telegram.md)
 - [Roadmap](docs/roadmap.md)
