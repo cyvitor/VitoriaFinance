@@ -9,6 +9,9 @@ depends_on = None
 
 
 def upgrade():
+    if sa.inspect(op.get_bind()).has_table("financings"):
+        return
+
     op.create_table("financings",
         sa.Column("id", sa.Integer(), primary_key=True),
         sa.Column("workspace_id", sa.Integer(), sa.ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False),
@@ -34,4 +37,5 @@ def upgrade():
 
 
 def downgrade():
-    op.drop_table("financings")
+    if sa.inspect(op.get_bind()).has_table("financings"):
+        op.drop_table("financings")

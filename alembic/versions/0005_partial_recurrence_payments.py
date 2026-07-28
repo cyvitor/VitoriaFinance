@@ -9,8 +9,14 @@ depends_on = None
 
 
 def upgrade():
-    op.add_column("recurrence_occurrences", sa.Column("remaining_amount", sa.Numeric(14, 2), nullable=True))
+    bind = op.get_bind()
+    columns = {column["name"] for column in sa.inspect(bind).get_columns("recurrence_occurrences")}
+    if "remaining_amount" not in columns:
+        op.add_column("recurrence_occurrences", sa.Column("remaining_amount", sa.Numeric(14, 2), nullable=True))
 
 
 def downgrade():
-    op.drop_column("recurrence_occurrences", "remaining_amount")
+    bind = op.get_bind()
+    columns = {column["name"] for column in sa.inspect(bind).get_columns("recurrence_occurrences")}
+    if "remaining_amount" in columns:
+        op.drop_column("recurrence_occurrences", "remaining_amount")

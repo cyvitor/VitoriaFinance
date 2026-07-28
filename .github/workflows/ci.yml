@@ -46,5 +46,15 @@ jobs:
       - name: Validar script de deploy
         run: sh -n devops/deploy.sh
 
+      - name: Validar migrations em banco vazio
+        env:
+          DATABASE_URL: sqlite:///./migration_test.db
+          SECRET_KEY: migration-test-secret
+        run: |
+          rm -f migration_test.db
+          python -m alembic upgrade head
+          python -m alembic current
+          rm -f migration_test.db
+
       - name: Executar testes
         run: python -m pytest -q
