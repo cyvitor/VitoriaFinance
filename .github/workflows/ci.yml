@@ -12,10 +12,6 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: testes-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
   pytest:
     name: Pytest no runner proprio
@@ -25,6 +21,9 @@ jobs:
       - X64
       - vitoria-test
     timeout-minutes: 15
+    concurrency:
+      group: testes-${{ github.ref }}
+      cancel-in-progress: true
 
     steps:
       - name: Baixar o codigo do commit
@@ -58,3 +57,21 @@ jobs:
 
       - name: Executar testes
         run: python -m pytest -q
+
+  deploy-homologation:
+    name: Deploy em homologacao
+    needs: pytest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on:
+      - self-hosted
+      - Linux
+      - X64
+      - vitoria-homologation
+    timeout-minutes: 30
+    concurrency:
+      group: deploy-homologation
+      cancel-in-progress: false
+
+    steps:
+      - name: Publicar versao aprovada na homologacao
+        run: sudo -n /usr/local/sbin/vitoriafinance-deploy

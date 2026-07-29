@@ -590,7 +590,6 @@ deploy_application() {
 
     [ -f "$ENV_FILE" ] || die "Instalacao ausente. Execute install primeiro."
     [ -x "$PYTHON" ] || die "Ambiente virtual ausente. Execute install primeiro."
-    create_virtualenv
     validate_environment
     ensure_clean_repository
     resolve_deploy_target "${1:-}"
