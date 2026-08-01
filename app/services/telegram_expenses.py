@@ -45,13 +45,71 @@ def _telegram_context(db: Session, user: User) -> tuple[int, Person] | None:
     return None
 
 
-def _infer_category(db: Session, workspace_id: int, description: str) -> Category | None:
+def _category_label(category: Category) -> str:
+    return f"{category.parent_name} > {category.name}" if category.parent_name else category.name
+
+
+def _infer_category(
+    db: Session, workspace_id: int, person_id: int, description: str,
+) -> tuple[Category | None, str | None]:
     categories = db.scalars(select(Category).where(
         Category.workspace_id == workspace_id, Category.kind == TransactionType.expense,
     )).all()
-    normalized = description.casefold()
-    exact = [category for category in categories if category.name.casefold() in normalized]
-    return max(exact, key=lambda category: len(category.name)) if exact else None
+    normalized = _normalize(description)
+    history = db.scalars(select(Transaction).where(
+        Transaction.workspace_id == workspace_id,
+        Transaction.person_id == person_id,
+        Transaction.transaction_type == TransactionType.expense,
+        Transaction.status != TransactionStatus.cancelled,
+        Transaction.category_id.is_not(None),
+    ).order_by(Transaction.transaction_date.desc(), Transaction.id.desc()).limit(500)).all()
+    same_merchant = [item for item in history if _normalize(item.description) == normalized]
+    if same_merchant:
+        counts: dict[int, int] = {}
+        for item in same_merchant:
+            counts[item.category_id] = counts.get(item.category_id, 0) + 1
+        best_id = max(counts, key=lambda category_id: (
+            counts[category_id],
+            next(index for index, item in enumerate(reversed(same_merchant), start=1)
+                 if item.category_id == category_id),
+        ))
+        category = next((item for item in categories if item.id == best_id), None)
+        if category:
+            return category, "historico do estabelecimento"
+    merchant_aliases = {
+        "ifood": ("alimentacao", "delivery"),
+        "hiperideal": ("alimentacao", "mercado"),
+        "barbeiro": ("cuidados pessoais", "barbearia"),
+        "barbearia": ("cuidados pessoais", "barbearia"),
+        "drogasil": ("saude", "medicamentos"),
+        "pague menos": ("saude", "medicamentos"),
+    }
+    for merchant, target in merchant_aliases.items():
+        if merchant in normalized:
+            category = next((item for item in categories if (
+                _normalize(item.parent_name or "") == target[0]
+                and _normalize(item.name) == target[1]
+            )), None)
+            if category:
+                return category, "tipo de estabelecimento"
+    exact = [category for category in categories if _normalize(category.name) in normalized]
+    if exact:
+        return max(exact, key=lambda category: len(category.name)), "descricao"
+    return None, None
+
+
+def suggest_expense_category(db: Session, user: User) -> tuple[TelegramExpenseDraft | None, Category | None, str | None]:
+    draft = get_active_draft(db, user.id)
+    if not draft:
+        return None, None, None
+    category, source = _infer_category(
+        db, draft.workspace_id, draft.person_id, draft.description,
+    )
+    if category:
+        draft.category_id = category.id
+        db.commit()
+        db.refresh(draft)
+    return draft, category, source
 
 
 def _normalize(value: str) -> str:
@@ -160,7 +218,7 @@ def create_expense_draft(db: Session, user: User, expense: ExpenseInput, now: da
     if active:
         active.status = "cancelled"
         active.resolved_at = now
-    category = _infer_category(db, workspace_id, expense.description)
+    category, _ = _infer_category(db, workspace_id, person.id, expense.description)
     draft = TelegramExpenseDraft(
         user_id=user.id, workspace_id=workspace_id, person_id=person.id,
         description=expense.description, amount=expense.amount, transaction_date=date.today(),

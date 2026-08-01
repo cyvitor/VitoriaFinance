@@ -16,7 +16,7 @@ from app.services.telegram_expenses import (
     ExpenseInput, cancel_expense_draft, confirm_expense_draft, create_expense_draft,
     finish_processing_queue_item, format_draft, get_active_draft,
     pop_next_queued_expense, queued_expense_count,
-    replace_expense_queue, update_expense_draft,
+    replace_expense_queue, suggest_expense_category, update_expense_draft,
 )
 
 
@@ -148,6 +148,21 @@ def list_cards(db: Session, context: UserAccessContext, args: dict) -> dict:
                        "available_limit": _money(Decimal(card.credit_limit) - spent),
                        "closing_day": card.closing_day, "due_day": card.due_day})
     return {"month": start.strftime("%Y-%m"), "cards": result}
+
+
+def list_income_categories(db: Session, context: UserAccessContext, args: dict) -> dict:
+    person = _resolve_person(db, context, args.get("area")) if args.get("area") else None
+    workspace_ids = [person.workspace_id] if person else context.workspace_ids
+    categories = db.scalars(select(Category).where(
+        Category.workspace_id.in_(workspace_ids),
+        Category.kind == TransactionType.income,
+    ).order_by(Category.parent_name, Category.name)).all()
+    labels = []
+    for item in categories:
+        label = f"{item.parent_name} > {item.name}" if item.parent_name else item.name
+        if label not in labels:
+            labels.append(label)
+    return {"categories": labels}
 
 
 def query_transactions(db: Session, context: UserAccessContext, args: dict, kind: TransactionType) -> dict:
@@ -415,6 +430,250 @@ def _active_action(db: Session, user_id: int) -> TelegramPendingAction | None:
     return action
 
 
+def _resolve_income_account(
+    db: Session, context: UserAccessContext, person: Person, name: str | None,
+) -> tuple[Account | None, list[str]]:
+    accounts = db.scalars(select(Account).where(
+        Account.workspace_id == person.workspace_id,
+        Account.person_id == person.id,
+        Account.is_active.is_(True),
+    ).order_by(Account.name)).all()
+    if not name:
+        return (accounts[0], []) if len(accounts) == 1 else (None, [item.name for item in accounts])
+    normalized = name.casefold().strip()
+    exact = [item for item in accounts if item.name.casefold() == normalized]
+    matches = exact or [
+        item for item in accounts
+        if normalized in item.name.casefold() or item.name.casefold() in normalized
+    ]
+    if len(matches) == 1:
+        return matches[0], []
+    if not matches:
+        raise ToolError(f"Conta '{name}' nao encontrada ou nao permitida nesta area")
+    raise ToolError("Conta ambigua: " + ", ".join(item.name for item in matches))
+
+
+def _resolve_income_category(
+    db: Session, workspace_id: int, name: str | None, payment_method: str | None,
+) -> Category | None:
+    requested = name
+    if not requested and (payment_method or "").casefold() == "pix":
+        requested = "PIX"
+    if not requested:
+        return None
+    categories = db.scalars(select(Category).where(
+        Category.workspace_id == workspace_id,
+        Category.kind == TransactionType.income,
+    )).all()
+    normalized = requested.casefold().strip()
+    exact = [
+        item for item in categories
+        if item.name.casefold() == normalized
+        or f"{item.parent_name or ''} > {item.name}".casefold().strip(" >") == normalized
+    ]
+    if len(exact) == 1:
+        return exact[0]
+    partial = [
+        item for item in categories
+        if normalized in item.name.casefold()
+        or (item.parent_name and normalized in item.parent_name.casefold())
+    ]
+    if len(partial) == 1:
+        return partial[0]
+    if not exact and not partial:
+        raise ToolError(f"Categoria de receita '{requested}' nao encontrada")
+    raise ToolError("Categoria de receita ambigua: " + ", ".join(
+        f"{item.parent_name} > {item.name}" if item.parent_name else item.name
+        for item in (exact or partial)
+    ))
+
+
+def prepare_income(db: Session, context: UserAccessContext, args: dict) -> dict:
+    if not context.can_write:
+        raise ToolError("Usuario sem permissao para registrar receitas")
+    action = _active_action(db, context.user_id)
+    payload = json.loads(action.payload) if action and action.action_type == "income_registration" else {}
+    if action and action.action_type != "income_registration":
+        raise ToolError("Conclua ou cancele a alteracao pendente antes de registrar uma receita")
+    for field in ("amount", "description", "transaction_date", "area", "account", "category", "payment_method"):
+        if args.get(field) not in (None, ""):
+            payload[field] = args[field]
+    amount = _decimal(payload.get("amount"), "valor")
+    description = " ".join(str(payload.get("description") or "").split())
+    person = _resolve_person(db, context, payload.get("area"))
+    missing = []
+    if amount is None or amount <= 0:
+        missing.append("valor")
+    if not description:
+        missing.append("origem ou descricao")
+    if not person:
+        missing.append("area financeira")
+    account = None
+    account_options = []
+    category = None
+    category_options = []
+    if person:
+        if person.workspace_id not in context.writable_workspace_ids:
+            raise ToolError("Usuario possui somente leitura nesta area financeira")
+        account, account_options = _resolve_income_account(db, context, person, payload.get("account"))
+        if not account:
+            missing.append("conta de destino")
+        category = _resolve_income_category(
+            db, person.workspace_id, payload.get("category"), payload.get("payment_method")
+        )
+        if not category:
+            category_options = list_income_categories(db, context, {"area": person.name})["categories"]
+            missing.append("categoria")
+    if account:
+        payload["account_id"] = account.id
+        payload["account"] = account.name
+    if category:
+        payload["category_id"] = category.id
+        payload["category"] = (
+            f"{category.parent_name} > {category.name}" if category.parent_name else category.name
+        )
+    if person:
+        payload["person_id"] = person.id
+        payload["area"] = person.name
+        payload["workspace_id"] = person.workspace_id
+    if amount is not None:
+        payload["amount"] = _money(amount)
+    if description:
+        payload["description"] = description[:180]
+    payload["transaction_date"] = _date(payload.get("transaction_date")).isoformat()
+    payload["payment_method"] = str(payload.get("payment_method") or "PIX").upper()
+    if not action:
+        action = TelegramPendingAction(
+            user_id=context.user_id, action_type="income_registration", payload="{}",
+            expires_at=datetime.utcnow() + timedelta(minutes=30),
+        )
+        db.add(action)
+    action.payload = json.dumps(payload, ensure_ascii=False)
+    action.status = "collecting" if missing else "awaiting_confirmation"
+    db.commit()
+    return {
+        "action": "income_registration", "status": action.status,
+        "missing_fields": missing, "account_options": account_options,
+        "category_options": category_options,
+        "preview": {
+            key: payload.get(key) for key in (
+                "description", "amount", "transaction_date", "area", "account",
+                "category", "payment_method",
+            )
+        },
+        "instruction": (
+            "Pergunte somente os dados ausentes" if missing
+            else "Apresente o resumo e solicite confirmacao clara antes de registrar"
+        ),
+    }
+
+
+def prepare_transaction_update(db: Session, context: UserAccessContext, args: dict) -> dict:
+    if not context.can_write:
+        raise ToolError("Usuario sem permissao para corrigir lancamentos")
+    active = _active_action(db, context.user_id)
+    if active:
+        if active.action_type == "transaction_update":
+            active.status = "cancelled"
+            active.resolved_at = datetime.utcnow()
+            db.commit()
+        else:
+            raise ToolError("Conclua ou cancele a alteracao pendente antes de corrigir um lancamento")
+    description = " ".join(str(args.get("target_description") or "").split())
+    amount = _decimal(args.get("target_amount"), "valor original")
+    if not description and amount is None:
+        return {
+            "status": "missing_information",
+            "missing_fields": ["descricao ou valor do lancamento que deve ser corrigido"],
+        }
+    query = select(Transaction).where(
+        *_base_transaction_filters(context),
+        Transaction.transaction_type.in_([TransactionType.income, TransactionType.expense]),
+    )
+    if description:
+        query = query.where(func.lower(Transaction.description).contains(description.casefold()))
+    if amount is not None:
+        query = query.where(Transaction.amount == amount)
+    if args.get("target_transaction_date"):
+        query = query.where(Transaction.transaction_date == _date(args["target_transaction_date"]))
+    if args.get("area"):
+        person = _resolve_person(db, context, args["area"])
+        query = query.where(Transaction.person_id == person.id)
+    matches = db.scalars(query.order_by(Transaction.transaction_date.desc(), Transaction.id.desc()).limit(10)).all()
+    if not matches:
+        return {
+            "status": "not_found",
+            "message": "Nenhum lancamento registrado corresponde aos dados informados",
+        }
+    if len(matches) > 1:
+        return {
+            "status": "selection_required",
+            "message": "Encontrei mais de um lancamento; pergunte qual deve ser corrigido",
+            "candidates": [{
+                "description": item.description, "amount": _money(item.amount),
+                "transaction_date": item.transaction_date.isoformat(),
+                "area": item.person.name if item.person else None,
+            } for item in matches],
+        }
+    item = matches[0]
+    if item.workspace_id not in context.writable_workspace_ids:
+        raise ToolError("Usuario possui somente leitura neste lancamento")
+    new_description = " ".join(str(args.get("new_description") or item.description).split())[:180]
+    new_amount = _decimal(args.get("new_amount"), "novo valor") or Decimal(item.amount)
+    new_date = _date(args.get("new_transaction_date"), item.transaction_date)
+    category = item.category
+    if args.get("new_category"):
+        categories = db.scalars(select(Category).where(
+            Category.workspace_id == item.workspace_id,
+            Category.kind == item.transaction_type,
+        )).all()
+        normalized = str(args["new_category"]).casefold().strip()
+        matches_category = [
+            candidate for candidate in categories
+            if candidate.name.casefold() == normalized
+            or f"{candidate.parent_name or ''} > {candidate.name}".casefold().strip(" >") == normalized
+        ]
+        if len(matches_category) != 1:
+            raise ToolError("Categoria nova nao encontrada ou ambigua")
+        category = matches_category[0]
+    payload = {
+        "transaction_id": item.id,
+        "workspace_id": item.workspace_id,
+        "original": {
+            "description": item.description, "amount": _money(item.amount),
+            "transaction_date": item.transaction_date.isoformat(),
+            "category_id": item.category_id,
+            "category": (
+                f"{item.category.parent_name} > {item.category.name}"
+                if item.category and item.category.parent_name else item.category.name if item.category else None
+            ),
+        },
+        "updated": {
+            "description": new_description, "amount": _money(new_amount),
+            "transaction_date": new_date.isoformat(),
+            "category_id": category.id if category else None,
+            "category": (
+                f"{category.parent_name} > {category.name}"
+                if category and category.parent_name else category.name if category else None
+            ),
+        },
+    }
+    if payload["original"] == payload["updated"]:
+        return {"status": "unchanged", "message": "Nenhuma alteracao foi informada"}
+    action = TelegramPendingAction(
+        user_id=context.user_id, action_type="transaction_update",
+        payload=json.dumps(payload, ensure_ascii=False), status="awaiting_confirmation",
+        expires_at=datetime.utcnow() + timedelta(minutes=30),
+    )
+    db.add(action)
+    db.commit()
+    return {
+        "action": "transaction_update", "status": "awaiting_confirmation",
+        "before": payload["original"], "after": payload["updated"],
+        "instruction": "Mostre antes e depois e solicite confirmacao clara antes de alterar",
+    }
+
+
 def _resolve_financing(db: Session, context: UserAccessContext, name: str | None) -> Financing:
     query = select(Financing).where(
         Financing.workspace_id.in_(context.workspace_ids), Financing.person_id.in_(context.allowed_person_ids),
@@ -482,6 +741,83 @@ def confirm_pending_action(db: Session, context: UserAccessContext, args: dict) 
     action = _active_action(db, context.user_id)
     if not action or action.status != "awaiting_confirmation":
         raise ToolError("Nao ha alteracao completa aguardando confirmacao")
+    if action.action_type == "transaction_update":
+        payload = json.loads(action.payload)
+        item = db.scalar(select(Transaction).where(
+            Transaction.id == payload["transaction_id"],
+            Transaction.workspace_id.in_(context.writable_workspace_ids),
+            Transaction.person_id.in_(context.allowed_person_ids),
+            Transaction.status != TransactionStatus.cancelled,
+        ))
+        original = payload["original"]
+        if not item or any((
+            item.description != original["description"],
+            _money(item.amount) != original["amount"],
+            item.transaction_date.isoformat() != original["transaction_date"],
+            item.category_id != original["category_id"],
+        )):
+            action.status = "cancelled"; action.resolved_at = datetime.utcnow(); db.commit()
+            raise ToolError("O lancamento mudou ou foi excluido desde o resumo; inicie a correcao novamente")
+        updated = payload["updated"]
+        item.description = updated["description"]
+        item.amount = _decimal(updated["amount"], "valor")
+        item.transaction_date = _date(updated["transaction_date"])
+        item.category_id = updated["category_id"]
+        if item.card and (item.payment_method or "").casefold() in ("credito", "crédito", "credit"):
+            item.competence_year, item.competence_month = card_purchase_competence(db, item.card, item.transaction_date)
+        else:
+            item.competence_year, item.competence_month = item.transaction_date.year, item.transaction_date.month
+        action.status = "confirmed"; action.resolved_at = datetime.utcnow()
+        db.commit()
+        return {
+            "updated": True, "transaction_updated": True,
+            "description": item.description, "amount": _money(item.amount),
+            "transaction_date": item.transaction_date.isoformat(),
+            "category": updated["category"],
+        }
+    if action.action_type == "income_registration":
+        payload = json.loads(action.payload)
+        person = db.scalar(select(Person).where(
+            Person.id == payload["person_id"],
+            Person.id.in_(context.allowed_person_ids),
+            Person.workspace_id.in_(context.writable_workspace_ids),
+        ))
+        account = db.scalar(select(Account).where(
+            Account.id == payload["account_id"],
+            Account.workspace_id.in_(context.writable_workspace_ids),
+            Account.person_id == payload["person_id"],
+            Account.is_active.is_(True),
+        ))
+        category = db.scalar(select(Category).where(
+            Category.id == payload["category_id"],
+            Category.workspace_id == payload["workspace_id"],
+            Category.kind == TransactionType.income,
+        )) if payload.get("category_id") else None
+        if not person or not account:
+            action.status = "cancelled"; action.resolved_at = datetime.utcnow(); db.commit()
+            raise ToolError("A area ou conta mudou desde o resumo; inicie o recebimento novamente")
+        transaction_date = _date(payload.get("transaction_date"))
+        transaction = Transaction(
+            workspace_id=payload["workspace_id"], transaction_type=TransactionType.income,
+            description=payload["description"], amount=_decimal(payload["amount"], "valor"),
+            transaction_date=transaction_date, competence_year=transaction_date.year,
+            competence_month=transaction_date.month, status=TransactionStatus.paid,
+            account_id=account.id, person_id=person.id,
+            category_id=category.id if category else None,
+            payment_method=payload.get("payment_method"), created_by_id=context.user_id,
+            source="telegram",
+        )
+        db.add(transaction)
+        action.status = "confirmed"; action.resolved_at = datetime.utcnow()
+        db.commit()
+        return {
+            "registered": True, "transaction_type": "income",
+            "description": transaction.description, "amount": _money(transaction.amount),
+            "transaction_date": transaction.transaction_date.isoformat(),
+            "area": person.name, "account": account.name,
+            "category": payload.get("category"), "payment_method": transaction.payment_method,
+            "transaction_id": transaction.id,
+        }
     if action.action_type != "financing_amortization":
         raise ToolError("Tipo de acao pendente nao suportado")
     payload = json.loads(action.payload)
@@ -629,6 +965,34 @@ def update_expense(db: Session, context: UserAccessContext, args: dict) -> dict:
             "summary": format_draft(draft)}
 
 
+def recommend_expense_category(db: Session, context: UserAccessContext, args: dict) -> dict:
+    user = db.get(User, context.user_id)
+    draft, category, source = suggest_expense_category(db, user)
+    if not draft:
+        raise ToolError("Nao ha despesa pendente para categorizar")
+    if not category:
+        categories = db.scalars(select(Category).where(
+            Category.workspace_id == draft.workspace_id,
+            Category.kind == TransactionType.expense,
+        ).order_by(Category.parent_name, Category.name)).all()
+        return {
+            "status": "recommendation_unavailable",
+            "message": "Nao foi possivel escolher uma categoria com seguranca",
+            "description": draft.description,
+            "category_options": [
+                f"{item.parent_name} > {item.name}" if item.parent_name else item.name
+                for item in categories
+            ],
+            "summary": format_draft(draft),
+        }
+    return {
+        "status": "awaiting_confirmation", "recommended": True,
+        "description": draft.description,
+        "category": f"{category.parent_name} > {category.name}" if category.parent_name else category.name,
+        "recommendation_source": source, "summary": format_draft(draft),
+    }
+
+
 def cancel_expense(db: Session, context: UserAccessContext, args: dict) -> dict:
     user = db.get(User, context.user_id)
     draft = get_active_draft(db, user.id)
@@ -645,18 +1009,22 @@ TOOLS = {
     "listar_areas_financeiras": list_financial_areas,
     "consultar_contas": list_accounts,
     "consultar_cartoes": list_cards,
+    "consultar_categorias_receita": list_income_categories,
     "consultar_gastos_cartao": query_card_spending,
     "consultar_receitas": lambda db, context, args: query_transactions(db, context, args, TransactionType.income),
     "consultar_despesas": lambda db, context, args: query_transactions(db, context, args, TransactionType.expense),
     "consultar_resumo_mensal": monthly_summary,
     "consultar_saldo_livre": calculate_free_balance,
     "consultar_financiamentos": list_financings,
+    "preparar_receita": prepare_income,
+    "preparar_correcao_lancamento": prepare_transaction_update,
     "preparar_amortizacao_financiamento": prepare_financing_amortization,
     "confirmar_acao_pendente": confirm_pending_action,
     "cancelar_acao_pendente": cancel_pending_action,
     "preparar_despesa": prepare_expense,
     "preparar_despesas": prepare_expenses,
     "atualizar_despesa": update_expense,
+    "sugerir_categoria_despesa": recommend_expense_category,
     "confirmar_despesa": confirm_expense,
     "cancelar_despesa": cancel_expense,
 }

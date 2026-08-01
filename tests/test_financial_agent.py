@@ -3,18 +3,19 @@ from decimal import Decimal
 import json
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.database import SessionLocal
 from app.models import (
-    Account, AccountRole, AccountType, Card, CardBillingPeriod, Financing, FinancingAmortization, MemberRole, Person, PersonType,
+    Account, AccountRole, AccountType, Card, CardBillingPeriod, Category, Financing, FinancingAmortization, MemberRole, Person, PersonType,
     RecurrenceRule, SystemAccount, SystemSetting, Transaction, TransactionStatus, TransactionType, User, UserMemory, UserPersonAccess, Workspace, WorkspaceMember,
 )
 from app.security import hash_password
 from app.services.access_context import build_user_access_context
 from app.services.financial_tools import ToolError, execute_tool
 from app.services.telegram_agent import (
-    _enforce_balance_intent, _enforce_pending_confirmation_intent,
+    _ai_category_recommendation, _enforce_balance_intent, _enforce_category_recommendation_intent,
+    _enforce_expense_reference_date, _enforce_pending_confirmation_intent,
     _enforce_pending_expense_intent, _expense_tool_reply, _requires_financial_tool,
     _enforce_transaction_period_intent, _looks_like_multiple_expenses, run_financial_agent,
 )
@@ -94,6 +95,97 @@ def test_read_only_members_cannot_amortize():
         assert context.can_write is False
         with pytest.raises(ToolError, match="permissao"):
             execute_tool(db, context, "preparar_amortizacao_financiamento", {"financing": "Imovel"})
+
+
+def test_income_collects_destination_account_and_registers_only_after_confirmation():
+    with SessionLocal() as db:
+        user, financing, hidden, rule = setup_financings(db)
+        vitor = db.get(Person, user.default_person_id)
+        db.add_all([
+            Account(
+                workspace_id=vitor.workspace_id, person_id=vitor.id, name="C6",
+                bank_name="C6", account_type=AccountType.checking, initial_balance=0,
+            ),
+            Account(
+                workspace_id=vitor.workspace_id, person_id=vitor.id, name="NU",
+                bank_name="Nubank", account_type=AccountType.checking, initial_balance=0,
+            ),
+            Category(
+                workspace_id=vitor.workspace_id, parent_name="Receitas", name="PIX",
+                kind=TransactionType.income,
+            ),
+        ])
+        db.commit()
+        context = build_user_access_context(db, user)
+
+        first = execute_tool(db, context, "preparar_receita", {
+            "amount": 260, "description": "Central VT",
+            "transaction_date": "2026-07-29", "payment_method": "PIX",
+        })
+        assert first["status"] == "collecting"
+        assert first["missing_fields"] == ["conta de destino"]
+        assert first["account_options"] == ["C6", "NU"]
+        assert db.scalar(select(Transaction)) is None
+
+        second = execute_tool(db, context, "preparar_receita", {"account": "C6"})
+        assert second["status"] == "awaiting_confirmation"
+        assert second["preview"]["category"] == "Receitas > PIX"
+        assert db.scalar(select(Transaction)) is None
+
+        result = execute_tool(db, context, "confirmar_acao_pendente", {})
+        transaction = db.scalar(select(Transaction))
+        assert result["registered"] is True
+        assert result["transaction_type"] == "income"
+        assert transaction.amount == Decimal("260.00")
+        assert transaction.description == "Central VT"
+        assert transaction.transaction_date == date(2026, 7, 29)
+        assert transaction.transaction_type == TransactionType.income
+        assert transaction.status == TransactionStatus.paid
+        assert transaction.account.name == "C6"
+        assert transaction.category.name == "PIX"
+        assert transaction.payment_method == "PIX"
+        assert transaction.source == "telegram"
+        categories = execute_tool(db, context, "consultar_categorias_receita", {})
+        assert categories["categories"] == ["Receitas > PIX"]
+
+
+def test_registered_transaction_is_corrected_only_after_confirmation():
+    with SessionLocal() as db:
+        user, financing, hidden, rule = setup_financings(db)
+        vitor = db.get(Person, user.default_person_id)
+        category = Category(
+            workspace_id=vitor.workspace_id, parent_name="Lazer", name="Cinema",
+            kind=TransactionType.expense,
+        )
+        db.add(category); db.flush()
+        expense = Transaction(
+            workspace_id=vitor.workspace_id, transaction_type=TransactionType.expense,
+            description="Pipoca no cinema", amount=Decimal("61.00"),
+            transaction_date=date(2026, 7, 30), competence_year=2026, competence_month=7,
+            status=TransactionStatus.paid, person_id=vitor.id, category_id=category.id,
+            payment_method="Crédito", created_by_id=user.id, source="telegram",
+        )
+        db.add(expense); db.commit()
+        context = build_user_access_context(db, user)
+
+        prepared = execute_tool(db, context, "preparar_correcao_lancamento", {
+            "target_description": "Pipoca no cinema", "target_amount": 61,
+            "new_transaction_date": "2026-07-29",
+        })
+        assert prepared["status"] == "awaiting_confirmation"
+        assert prepared["before"]["transaction_date"] == "2026-07-30"
+        assert prepared["after"]["transaction_date"] == "2026-07-29"
+        db.refresh(expense)
+        assert expense.transaction_date == date(2026, 7, 30)
+
+        result = execute_tool(db, context, "confirmar_acao_pendente", {})
+        db.refresh(expense)
+        assert result["transaction_updated"] is True
+        assert expense.transaction_date == date(2026, 7, 29)
+        assert expense.amount == Decimal("61.00")
+        assert db.scalar(select(func.count(Transaction.id)).where(
+            Transaction.description == "Pipoca no cinema"
+        )) == 1
 
 
 def test_agent_uses_natural_conversation_and_keeps_confirmed_write_on_synthesis_failure(monkeypatch):
@@ -245,6 +337,36 @@ def test_category_reply_updates_existing_expense_instead_of_recreating_it():
     corrected = _enforce_pending_expense_intent("Jogos", True, decision)
     assert corrected["tool"] == "atualizar_despesa"
     assert corrected["arguments"]["category"] == "Jogos"
+
+
+def test_category_help_and_message_date_are_enforced_without_model_guessing():
+    recommendation = _enforce_category_recommendation_intent(
+        "procure a categoria que mais se encaixa", True, {"action": "undecided"},
+    )
+    assert recommendation["tool"] == "sugerir_categoria_despesa"
+    dated = _enforce_expense_reference_date({
+        "action": "tool", "tool": "preparar_despesa",
+        "arguments": {"amount": 101.40, "description": "Hiperideal"},
+    }, date(2026, 7, 31))
+    assert dated["arguments"]["transaction_date"] == "2026-07-31"
+
+
+def test_ai_category_recommendation_is_restricted_to_valid_options(monkeypatch):
+    monkeypatch.setattr("app.services.telegram_agent._complete", lambda *args, **kwargs: json.dumps({
+        "category": "Alimentação > Delivery", "confidence": 0.91,
+    }))
+    result = _ai_category_recommendation("token", "model", {
+        "description": "Ifood",
+        "category_options": ["Alimentação > Mercado", "Alimentação > Delivery"],
+    })
+    assert result == "Alimentação > Delivery"
+
+    monkeypatch.setattr("app.services.telegram_agent._complete", lambda *args, **kwargs: json.dumps({
+        "category": "Categoria inventada", "confidence": 0.99,
+    }))
+    assert _ai_category_recommendation("token", "model", {
+        "description": "Loja", "category_options": ["Outros > Diversos"],
+    }) is None
 
 
 def test_multiple_expenses_are_detected_without_confusing_dates_or_card_name():

@@ -8,7 +8,7 @@ import httpx
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models import Person, SystemSetting, TelegramConversationMessage, TelegramPendingAction, User
+from app.models import Account, Person, SystemSetting, TelegramConversationMessage, TelegramPendingAction, User
 from app.logging_config import get_bot_logger
 from app.services.access_context import build_user_access_context
 from app.services.financial_tools import ToolError, execute_tool
@@ -18,9 +18,10 @@ from app.services.user_memory import format_memory_context, relevant_memories, s
 
 logger = get_bot_logger()
 WRITE_TOOLS = {
+    "preparar_receita", "preparar_correcao_lancamento",
     "preparar_amortizacao_financiamento", "confirmar_acao_pendente", "cancelar_acao_pendente",
     "preparar_despesa", "confirmar_despesa", "cancelar_despesa",
-    "atualizar_despesa", "preparar_despesas",
+    "atualizar_despesa", "preparar_despesas", "sugerir_categoria_despesa",
 }
 
 
@@ -29,18 +30,22 @@ Ferramentas permitidas e argumentos:
 - listar_areas_financeiras: {}
 - consultar_contas: {"area": texto opcional}
 - consultar_cartoes: {"area": texto opcional}
+- consultar_categorias_receita: {"area": texto opcional}
 - consultar_gastos_cartao: {"card":texto opcional,"start_date":"YYYY-MM-DD" opcional,"end_date":"YYYY-MM-DD" opcional}
 - consultar_receitas: {"start_date":"YYYY-MM-DD" opcional,"end_date":"YYYY-MM-DD" opcional,"area":texto opcional,"category":texto opcional}
 - consultar_despesas: mesmos filtros de consultar_receitas
 - consultar_resumo_mensal: {"start_date":"YYYY-MM-DD" opcional,"end_date":"YYYY-MM-DD" opcional,"area":texto opcional}
 - consultar_saldo_livre: {"area":texto opcional,"planned_spending":numero opcional,"payment_method":"cash|credit" opcional,"card":texto opcional}
 - consultar_financiamentos: {"area":texto opcional,"include_paid":booleano opcional}
+- preparar_receita: {"amount":numero opcional,"description":texto opcional,"transaction_date":"YYYY-MM-DD" opcional,"area":texto opcional,"account":texto opcional,"category":texto opcional,"payment_method":texto opcional}
+- preparar_correcao_lancamento: {"target_description":texto opcional,"target_amount":numero opcional,"target_transaction_date":"YYYY-MM-DD" opcional,"area":texto opcional,"new_description":texto opcional,"new_amount":numero opcional,"new_transaction_date":"YYYY-MM-DD" opcional,"new_category":texto opcional}
 - preparar_amortizacao_financiamento: {"financing":texto opcional,"new_outstanding_balance":numero opcional,"remaining_installments":inteiro opcional,"new_installment_amount":numero opcional,"amortized_amount":numero opcional,"strategy":"reduce_term|reduce_installment|reduce_both" opcional,"amortization_date":"YYYY-MM-DD" opcional,"notes":texto opcional}
 - confirmar_acao_pendente: {}
 - cancelar_acao_pendente: {}
 - preparar_despesa: {"amount":numero,"description":texto,"transaction_date":"YYYY-MM-DD" opcional,"category":texto opcional,"payment_method":"cash|credit" opcional,"card":texto opcional}
 - preparar_despesas: {"expenses":[objetos com os mesmos campos de preparar_despesa, um para cada gasto]}
 - atualizar_despesa: {"transaction_date":"YYYY-MM-DD" opcional,"category":texto opcional,"payment_method":"cash|credit" opcional,"card":texto opcional}
+- sugerir_categoria_despesa: {}
 - confirmar_despesa: {}
 - cancelar_despesa: {}
 """
@@ -163,25 +168,61 @@ def _enforce_balance_intent(text: str, history: list[dict], decision: dict) -> d
     return corrected
 
 
-def _enforce_transaction_period_intent(text: str, decision: dict) -> dict:
+def _enforce_transaction_period_intent(text: str, decision: dict, reference_date: date | None = None) -> dict:
     if decision.get("action") != "tool" or decision.get("tool") not in (
         "consultar_despesas", "consultar_receitas",
     ):
         return decision
     normalized = _normalized_text(text)
+    today = reference_date or date.today()
     target_date = None
     if re.search(r"\b(hoje|hj)\b", normalized):
-        target_date = date.today()
+        target_date = today
     elif re.search(r"\b(ontem)\b", normalized):
-        target_date = date.today() - timedelta(days=1)
+        target_date = today - timedelta(days=1)
     elif re.search(r"\b(anteontem)\b", normalized):
-        target_date = date.today() - timedelta(days=2)
+        target_date = today - timedelta(days=2)
     if not target_date:
         return decision
     arguments = dict(decision.get("arguments") or {})
     arguments["start_date"] = target_date.isoformat()
     arguments["end_date"] = target_date.isoformat()
     return {**decision, "arguments": arguments}
+
+
+def _enforce_expense_reference_date(decision: dict, reference_date: date) -> dict:
+    if decision.get("action") != "tool":
+        return decision
+    tool_name = decision.get("tool")
+    arguments = dict(decision.get("arguments") or {})
+    if tool_name in ("preparar_despesa", "preparar_receita"):
+        arguments.setdefault("transaction_date", reference_date.isoformat())
+    elif tool_name == "preparar_despesas":
+        expenses = []
+        for item in arguments.get("expenses") or []:
+            normalized_item = dict(item)
+            normalized_item.setdefault("transaction_date", reference_date.isoformat())
+            expenses.append(normalized_item)
+        arguments["expenses"] = expenses
+    else:
+        return decision
+    return {**decision, "arguments": arguments}
+
+
+def _enforce_category_recommendation_intent(text: str, has_draft: bool, decision: dict) -> dict:
+    if not has_draft:
+        return decision
+    normalized = _normalized_text(text)
+    asks_category = "categoria" in normalized and any(term in normalized for term in (
+        "procure", "busque", "escolha", "sugira", "indique", "mais se encaixa",
+        "mais se aproxima", "mais adequada", "melhor categoria",
+    ))
+    if not asks_category:
+        return decision
+    corrected = {"action": "tool", "tool": "sugerir_categoria_despesa", "arguments": {}}
+    logger.info("agent_decision_corrected reason=expense_category_recommendation original=%s corrected=%s",
+                decision, corrected)
+    return corrected
 
 
 def _enforce_pending_expense_intent(text: str, has_draft: bool, decision: dict) -> dict:
@@ -211,6 +252,54 @@ def _enforce_pending_confirmation_intent(text: str, has_draft: bool, decision: d
     if corrected != decision:
         logger.info("agent_decision_corrected reason=pending_expense_confirmation original=%s corrected=%s",
                     decision, corrected)
+    return corrected
+
+
+def _enforce_pending_action_confirmation_intent(
+    text: str, pending_action: TelegramPendingAction | None, decision: dict,
+) -> dict:
+    if not pending_action or pending_action.status != "awaiting_confirmation":
+        return decision
+    normalized = _normalized_text(text).strip(" .,!?:;")
+    negative_terms = ("nao", "cancela", "cancelar", "cancele", "ignore")
+    if any(term in normalized for term in negative_terms):
+        corrected = {"action": "tool", "tool": "cancelar_acao_pendente", "arguments": {}}
+    elif normalized in {"sim", "pode", "confirmo", "confirmar", "yes", "ok", "okay", "certo"}:
+        corrected = {"action": "tool", "tool": "confirmar_acao_pendente", "arguments": {}}
+    else:
+        return decision
+    if corrected != decision:
+        logger.info("agent_decision_corrected reason=pending_action_confirmation original=%s corrected=%s",
+                    decision, corrected)
+    return corrected
+
+
+def _enforce_pending_income_collection_intent(
+    db: Session, text: str, pending_action: TelegramPendingAction | None, decision: dict,
+) -> dict:
+    if (
+        not pending_action
+        or pending_action.action_type != "income_registration"
+        or pending_action.status != "collecting"
+    ):
+        return decision
+    payload = json.loads(pending_action.payload)
+    person_id = payload.get("person_id")
+    if not person_id:
+        return decision
+    normalized = _normalized_text(text).strip(" .,!?:;")
+    accounts = db.scalars(select(Account).where(
+        Account.person_id == person_id, Account.is_active.is_(True),
+    )).all()
+    matches = [item for item in accounts if _normalized_text(item.name) == normalized]
+    if len(matches) != 1:
+        return decision
+    corrected = {
+        "action": "tool", "tool": "preparar_receita",
+        "arguments": {"account": matches[0].name},
+    }
+    logger.info("agent_decision_corrected reason=pending_income_account original=%s corrected=%s",
+                decision, corrected)
     return corrected
 
 
@@ -278,11 +367,21 @@ def _pending_context(db: Session, user: User) -> str:
 
 
 def _fallback_tool_reply(tool_name: str, result: dict) -> str:
+    if result.get("transaction_updated"):
+        return (
+            f"Lancamento corrigido com sucesso: {result.get('description')} - "
+            f"R$ {result.get('amount')}, data {result.get('transaction_date')}."
+        )
     if result.get("updated"):
         financing = result.get("financing", {})
         return (f"Financiamento {financing.get('description', '')} atualizado com sucesso. "
                 f"Saldo devedor: R$ {financing.get('outstanding_balance', '0.00')}; "
                 f"parcelas restantes: {financing.get('remaining_installments', 0)}.")
+    if result.get("registered") and result.get("transaction_type") == "income":
+        return (
+            f"Receita registrada com sucesso: {result.get('description')} "
+            f"- R$ {result.get('amount')}."
+        )
     if result.get("registered"):
         reply = f"Despesa registrada com sucesso: {result.get('description')} — R$ {result.get('amount')}."
         if result.get("next_expense"):
@@ -298,10 +397,15 @@ def _fallback_tool_reply(tool_name: str, result: dict) -> str:
 def _expense_tool_reply(tool_name: str, result: dict, model_reply: str) -> str:
     expense_tools = {
         "preparar_despesa", "preparar_despesas", "atualizar_despesa",
-        "confirmar_despesa", "cancelar_despesa",
+        "confirmar_despesa", "cancelar_despesa", "sugerir_categoria_despesa",
     }
     if tool_name not in expense_tools:
         return model_reply
+    if tool_name == "sugerir_categoria_despesa" and result.get("recommended") and result.get("summary"):
+        return (
+            f"A categoria que mais se encaixa é **{result.get('category')}** "
+            f"com base em {result.get('recommendation_source')}.\n\n{result['summary']}"
+        )
     next_expense = result.get("next_expense")
     if next_expense:
         action = "registrada" if result.get("registered") else "cancelada"
@@ -345,14 +449,42 @@ Use confianca acima de 0.85 apenas quando o usuario declarou ou confirmou explic
         return
 
 
-def run_financial_agent(db: Session, user: User, text: str) -> str:
+def _ai_category_recommendation(token: str, model: str, result: dict) -> str | None:
+    options = result.get("category_options") or []
+    if not options:
+        return None
+    prompt = """Escolha a categoria mais adequada para o estabelecimento usando exclusivamente uma opção fornecida.
+Não invente categorias. Se não houver base razoável, use category=null.
+Retorne SOMENTE JSON: {"category":"opção exata ou null","confidence":0.0}."""
+    payload = {
+        "description": result.get("description"),
+        "valid_categories": options,
+    }
+    try:
+        choice = _json_from_model(_complete(
+            token, model,
+            [{"role": "system", "content": prompt},
+             {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
+            180, json_mode=True,
+        ))
+        category = choice.get("category")
+        confidence = float(choice.get("confidence") or 0)
+        if category in options and confidence >= 0.65:
+            return category
+    except (AIUnavailableError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return None
+
+
+def run_financial_agent(db: Session, user: User, text: str, reference_date: date | None = None) -> str:
+    reference_date = reference_date or date.today()
     token, model = _settings(db)
     context = build_user_access_context(db, user)
     areas = db.scalars(select(Person.name).where(Person.id.in_(context.allowed_person_ids))).all() if context.allowed_person_ids else []
     pending = _pending_context(db, user)
     memory_context = format_memory_context(relevant_memories(db, user.id, text))
     system = f"""Voce e Vitoria, gestora financeira conversacional do VitoriaFinance.
-Hoje e {date.today().isoformat()}, fuso America/Sao_Paulo. Usuario: {user.full_name}.
+Hoje e {reference_date.isoformat()}, fuso America/Sao_Paulo. Usuario: {user.full_name}.
 Areas que o backend autorizou: {', '.join(areas) or 'nenhuma'}.
 {memory_context}
 {pending}
@@ -363,8 +495,12 @@ Memorias sao pistas pessoais, nunca dados financeiros atuais. Quando marcadas co
 O historico da conversa nao prova que um lancamento ainda existe, pois ele pode ter sido alterado ou excluido pela interface web.
 Nunca afirme que uma despesa ja esta registrada ou que um dado financeiro esta atualizado usando apenas historico ou memoria; use a ferramenta adequada e considere o banco como fonte da verdade.
 Quando houver acao aguardando confirmacao, interprete confirmacao ou cancelamento natural e escolha a ferramenta correta.
-Uma confirmacao de despesa usa confirmar_despesa; amortizacao usa confirmar_acao_pendente.
+Uma confirmacao de despesa usa confirmar_despesa; receita e amortizacao usam confirmar_acao_pendente.
 Quando houver despesa pendente e o usuario corrigir ou complementar categoria, pagamento ou cartao, use atualizar_despesa. Nunca apenas diga que atualizou.
+Quando o usuario pedir para procurar, escolher ou sugerir a categoria de uma despesa pendente, use sugerir_categoria_despesa. Nao devolva apenas uma lista se o backend conseguir recomendar uma categoria.
+Para registrar dinheiro recebido, inclusive PIX, use preparar_receita. Se faltarem dados, chame preparar_receita novamente com a resposta do usuario. Nunca escolha uma conta de destino sem informacao suficiente.
+Se o usuario pedir ajuda para escolher uma categoria de receita, use consultar_categorias_receita. Para PIX, a categoria PIX pode ser inferida automaticamente quando existir; para outras receitas, confirme uma categoria valida antes de registrar.
+Para corrigir um lancamento ja registrado, use preparar_correcao_lancamento. Identifique o registro por descricao, valor, data e area usando a conversa, converta datas relativas e envie os campos new_ correspondentes. A ferramenta consulta o banco, nunca trate o historico como prova de que o registro existe. A correcao usa confirmar_acao_pendente e nunca deve criar outro lancamento.
 Converta datas relativas como hoje, ontem e anteontem para YYYY-MM-DD usando a data atual e envie transaction_date na ferramenta de despesa.
 Em perguntas sobre dinheiro disponivel agora, use consultar_saldo_livre com payment_method cash.
 Em perguntas sobre fechar o mes, salarios futuros ou compra no credito, use consultar_saldo_livre com payment_method credit quando aplicavel. Reaproveite planned_spending mencionado nos turnos recentes.
@@ -377,14 +513,25 @@ Retorne SOMENTE JSON valido em um destes formatos:
 """
     history = _conversation_history(db, user.id)
     has_expense_draft = get_active_draft(db, user.id) is not None
+    pending_action = db.scalar(select(TelegramPendingAction).where(
+        TelegramPendingAction.user_id == user.id,
+        TelegramPendingAction.status.in_(["collecting", "awaiting_confirmation"]),
+    ).order_by(TelegramPendingAction.id.desc()))
     selector_messages = [{"role": "system", "content": system}, *history, {"role": "user", "content": text}]
     undecided = {"action": "undecided"}
     decision = _enforce_pending_confirmation_intent(text, has_expense_draft, undecided)
     if decision is undecided:
+        decision = _enforce_category_recommendation_intent(text, has_expense_draft, undecided)
+    if decision is undecided:
+        decision = _enforce_pending_action_confirmation_intent(text, pending_action, undecided)
+    if decision is undecided:
+        decision = _enforce_pending_income_collection_intent(db, text, pending_action, undecided)
+    if decision is undecided:
         decision = _select_decision(token, model, selector_messages, text)
     decision = _enforce_pending_expense_intent(text, has_expense_draft, decision)
+    decision = _enforce_expense_reference_date(decision, reference_date)
     decision = _enforce_balance_intent(text, history, decision)
-    decision = _enforce_transaction_period_intent(text, decision)
+    decision = _enforce_transaction_period_intent(text, decision, reference_date)
     db.add(TelegramConversationMessage(user_id=user.id, role="user", content=text[:4000]))
     if decision.get("action") == "respond":
         reply = str(decision.get("reply") or "Como posso ajudar com suas financas?")[:4000]
@@ -397,6 +544,16 @@ Retorne SOMENTE JSON valido em um destes formatos:
             result = {"error": str(exc)}
             logger.warning("tool_error user_id=%s tool=%s error=%s", user.id, tool_name, exc)
         logger.debug("tool_result user_id=%s tool=%s result=%s", user.id, tool_name, result)
+        if tool_name == "sugerir_categoria_despesa" and result.get("status") == "recommendation_unavailable":
+            recommended_category = _ai_category_recommendation(token, model, result)
+            if recommended_category:
+                updated = execute_tool(db, context, "atualizar_despesa", {"category": recommended_category})
+                result = {
+                    **updated, "recommended": True, "category": recommended_category,
+                    "recommendation_source": "analise das categorias validas",
+                }
+                logger.info("expense_category_recommended_by_ai user_id=%s category=%s",
+                            user.id, recommended_category)
         if tool_name in WRITE_TOOLS and "error" not in result:
             logger.info("financial_write_tool_executed user_id=%s tool=%s", user.id, tool_name)
         synthesis_system = """Responda em portugues brasileiro como Vitoria, de forma natural e objetiva.

@@ -1,4 +1,6 @@
 import re
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -37,7 +39,15 @@ def handle_message(db: Session, message: dict) -> str:
     if not user or not user.is_active or (user.system_account and not user.system_account.is_active):
         return "Seu Telegram ainda nao esta associado. Gere um codigo em Meu perfil e envie /start CODIGO."
     try:
-        return run_financial_agent(db, user, text)
+        message_date = None
+        if message.get("date") is not None:
+            try:
+                message_date = datetime.fromtimestamp(
+                    int(message["date"]), tz=ZoneInfo("America/Sao_Paulo")
+                ).date()
+            except (TypeError, ValueError, OSError):
+                logger.warning("telegram_message_invalid_date user_id=%s date=%r", user.id, message.get("date"))
+        return run_financial_agent(db, user, text, reference_date=message_date)
     except (AIResponseFormatError, AIToolSelectionError) as exc:
         logger.error("agent_structured_response_failed user_id=%s error=%s", user.id, exc)
         return "Não consegui organizar essa consulta com segurança agora. Nenhum lançamento foi feito; tente novamente em instantes."

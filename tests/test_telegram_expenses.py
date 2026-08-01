@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 
 from sqlalchemy import func, select
@@ -121,6 +121,62 @@ def test_pharmacy_alias_resolves_to_health_medication_category():
         assert "Categoria: Saude > Medicamentos" in result["summary"]
 
 
+def test_category_is_inferred_from_confirmed_transactions_including_web_changes():
+    with SessionLocal() as db:
+        user = setup_linked_user(db); context = build_user_access_context(db, user)
+        person = db.get(Person, user.default_person_id)
+        category = db.scalar(select(Category).where(Category.name == "Mercado"))
+        db.add(Transaction(
+            workspace_id=person.workspace_id, person_id=person.id,
+            transaction_type=TransactionType.expense, description="Hiperideal",
+            amount=Decimal("80.00"), transaction_date=date(2026, 7, 20),
+            competence_year=2026, competence_month=7, category_id=category.id,
+            created_by_id=user.id, source="web",
+        ))
+        db.commit()
+
+        result = execute_tool(db, context, "preparar_despesa", {
+            "amount": 101.40, "description": "Hiperideal", "transaction_date": "2026-07-31",
+        })
+        assert result["status"] == "awaiting_confirmation"
+        assert "Categoria: Alimentacao > Mercado" in result["summary"]
+
+
+def test_category_recommendation_chooses_valid_merchant_category():
+    with SessionLocal() as db:
+        user = setup_linked_user(db); context = build_user_access_context(db, user)
+        person = db.get(Person, user.default_person_id)
+        db.add(Category(
+            workspace_id=person.workspace_id, name="Barbearia",
+            parent_name="Cuidados Pessoais", kind=TransactionType.expense,
+        ))
+        db.commit()
+        execute_tool(db, context, "preparar_despesa", {
+            "amount": 35, "description": "Barbeiro", "transaction_date": "2026-07-31",
+        })
+        result = execute_tool(db, context, "sugerir_categoria_despesa", {})
+        assert result["recommended"] is True
+        assert result["category"] == "Cuidados Pessoais > Barbearia"
+        assert "Categoria: Cuidados Pessoais > Barbearia" in result["summary"]
+
+
+def test_telegram_message_timestamp_is_used_as_agent_reference_date(monkeypatch):
+    captured = {}
+
+    def agent(db, user, text, reference_date=None):
+        captured["reference_date"] = reference_date
+        return "ok"
+
+    monkeypatch.setattr("app.automation.telegram_bot.run_financial_agent", agent)
+    with SessionLocal() as db:
+        setup_linked_user(db)
+        timestamp = int(datetime(2026, 7, 31, 19, 18).timestamp())
+        payload = message("gastei 10 no mercado")
+        payload["date"] = timestamp
+        assert handle_message(db, payload) == "ok"
+        assert captured["reference_date"] == date(2026, 7, 31)
+
+
 def test_multiple_expenses_advance_sequentially_after_confirmation():
     with SessionLocal() as db:
         user = setup_linked_user(db); context = build_user_access_context(db, user)
@@ -167,7 +223,7 @@ def test_unlinked_telegram_cannot_use_agent(monkeypatch):
 
 
 def test_ai_failure_does_not_create_transaction(monkeypatch):
-    def unavailable(*args):
+    def unavailable(*args, **kwargs):
         raise AIUnavailableError("offline")
     monkeypatch.setattr("app.automation.telegram_bot.run_financial_agent", unavailable)
     with SessionLocal() as db:
@@ -178,7 +234,7 @@ def test_ai_failure_does_not_create_transaction(monkeypatch):
 
 
 def test_invalid_structured_response_has_specific_message(monkeypatch):
-    def invalid(*args):
+    def invalid(*args, **kwargs):
         raise AIResponseFormatError("json invalido")
     monkeypatch.setattr("app.automation.telegram_bot.run_financial_agent", invalid)
     with SessionLocal() as db:
