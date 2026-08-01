@@ -978,12 +978,12 @@ def family_view(request: Request, year: int | None = None, month: int | None = N
     for rule in recurring_rules:
         created = rule.created_at.date()
         for number in range(1, 13):
-            if (selected_year, number) < (created.year, created.month):
+            partial = occurrence_by_key.get((rule.id, number))
+            if (selected_year, number) < (created.year, created.month) and not partial:
                 continue
             if (rule.id, number) in resolved:
                 continue
             display_rule = rule
-            partial = occurrence_by_key.get((rule.id, number))
             if partial and partial.status == "partial":
                 display_rule = copy(rule)
                 display_rule.amount = Decimal(partial.remaining_amount or 0)
@@ -1147,12 +1147,15 @@ def transaction_confirm(item_id: int, request: Request, db: Session = Depends(ge
 
 
 @router.get("/transactions/new", response_class=HTMLResponse)
-def transaction_form(request: Request, kind: str = "expense", db: Session = Depends(get_db), user: User = Depends(current_user)):
+def transaction_form(request: Request, kind: str = "expense", return_to: str | None = None,
+        return_year: int | None = None, return_month: int | None = None,
+        db: Session = Depends(get_db), user: User = Depends(current_user)):
     wid = current_workspace_id(request, user, db)
     return render(request, "transactions/form.html", user=user, kind=kind, today=date.today(),
         accounts=visible_accounts(user, wid, db),
         cards=db.scalars(select(Card).where(Card.workspace_id == wid, Card.is_active)).all(),
-        people=visible_people(user, wid, db),
+        people=visible_people(user, wid, db), return_to=return_to,
+        return_year=return_year, return_month=return_month,
         categories=db.scalars(select(Category).where(Category.workspace_id == wid).order_by(Category.parent_name, Category.name)).all())
 
 
@@ -1161,6 +1164,8 @@ def transaction_create(request: Request, transaction_type: TransactionType = For
         transaction_date: date = Form(), status: TransactionStatus = Form(), account_id: str | None = Form(None),
         destination_account_id: str | None = Form(None), card_id: str | None = Form(None), person_id: str | None = Form(None),
         category_id: str | None = Form(None), payment_method: str | None = Form(None), notes: str | None = Form(None),
+        return_to: str | None = Form(None), return_year: int | None = Form(None),
+        return_month: int | None = Form(None),
         db: Session = Depends(get_db), user: User = Depends(current_user)):
     wid = current_workspace_id(request, user, db)
     account_id = optional_int(account_id)
@@ -1200,6 +1205,10 @@ def transaction_create(request: Request, transaction_type: TransactionType = For
     ))
     db.commit()
     flash(request, "Lançamento registrado.")
+    if return_to == "month":
+        target_year = return_year or competence_year
+        target_month = return_month if return_month and 1 <= return_month <= 12 else competence_month
+        return redirect(f"/month?year={target_year}&month={target_month}")
     return redirect("/transactions")
 
 

@@ -25,11 +25,52 @@ def test_health(client): assert client.get("/health").json()["status"] == "ok"
 
 def test_login_dashboard_and_change_password(client):
     seed_test()
+    invalid = client.post("/login", data={"username": "vh", "password": "incorreta"})
+    assert "Usuário ou senha inválidos" in invalid.text
+    assert 'class="auth-alert ' in invalid.text
     response = client.post("/login", data={"username": "vh", "password": "123456"}, follow_redirects=False)
     assert response.status_code == 303
     assert client.get("/").status_code == 200
     response = client.post("/profile/password", data={"current_password":"123456", "new_password":"novasenha8", "confirm_password":"novasenha8"}, follow_redirects=False)
     assert response.status_code == 303
+
+
+def test_month_income_form_is_simplified_and_returns_to_selected_month(client):
+    area_id = seed_test()
+    client.post("/login", data={"username": "vh", "password": "123456"})
+    with SessionLocal() as db:
+        workspace_id = db.scalar(select(Workspace.id))
+        user = db.scalar(select(User).where(User.username == "vh"))
+        user.default_person_id = area_id
+        account = Account(
+            workspace_id=workspace_id, person_id=area_id, name="C6",
+            account_type=AccountType.checking,
+        )
+        category = Category(
+            workspace_id=workspace_id, kind=TransactionType.income,
+            parent_name="Receitas", name="PIX",
+        )
+        db.add_all([account, category]); db.commit()
+        account_id, category_id = account.id, category.id
+
+    page = client.get(
+        "/transactions/new?kind=income&return_to=month&return_year=2026&return_month=7"
+    )
+    assert page.status_code == 200
+    assert 'name="person_id"' in page.text
+    assert f'value="{area_id}" selected' in page.text
+    assert 'name="card_id"' not in page.text
+    assert 'name="payment_method"' not in page.text
+
+    response = client.post("/transactions/new", data={
+        "transaction_type": "income", "description": "Central VT", "amount": "260.00",
+        "transaction_date": "2026-07-29", "status": "paid",
+        "account_id": str(account_id), "person_id": str(area_id),
+        "category_id": str(category_id), "return_to": "month",
+        "return_year": "2026", "return_month": "7",
+    }, follow_redirects=False)
+    assert response.status_code == 303
+    assert response.headers["location"] == "/month?year=2026&month=7"
 
 
 def test_recurring_income_monthly_confirmation_skip_and_delete(client):

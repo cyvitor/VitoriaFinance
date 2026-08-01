@@ -14,3 +14,4 @@ html{color-scheme:dark}body{--ink:#f1f3f9;--muted:#9ba4b7;--line:#2b3140;--bg:#1
 
 @media(max-width:760px){.sidebar{width:min(280px,88vw);max-width:100vw}.sidebar nav{padding-bottom:8px}.sidebar.open{overflow:hidden}}
 @media(max-height:680px){.sidebar{padding-top:14px;padding-bottom:12px}.sidebar .brand{padding-bottom:14px}.sidebar nav a,.sidebar-bottom a,.sidebar-bottom button{padding-top:9px;padding-bottom:9px}}
+.auth-alert{z-index:1090;width:min(520px,calc(100vw - 32px));box-shadow:0 12px 35px #0008}
