@@ -362,6 +362,15 @@ def test_credit_and_debit_card_expenses_are_grouped_and_detailed(client):
         assert all(item.category_id == category_id for item in parcels)
         assert [(item.competence_year, item.competence_month) for item in parcels] == [(2026, 7), (2026, 8), (2026, 9)]
         first_parcel_id = parcels[0].id
+    open_invoice = client.post("/card-expenses/new", data={
+        "card_id": str(card_id), "description": "Compra antes do fechamento", "amount": "20.00",
+        "payment_method": "Crédito", "purchase_type": "cash", "installments": "1",
+        "category_id": str(category_id), "purchase_date": "2026-08-02",
+    }, follow_redirects=False)
+    assert "year=2026&month=7" in open_invoice.headers["location"]
+    with SessionLocal() as db:
+        before_close = db.scalar(select(Transaction).where(Transaction.description == "Compra antes do fechamento"))
+        assert (before_close.competence_year, before_close.competence_month) == (2026, 7)
     close_response = client.post(f"/cards/{card_id}/confirm", data={"year": "2026", "month": "7"}, follow_redirects=False)
     assert close_response.status_code == 303
     closed_page = client.get(f"/cards/{card_id}?year=2026&month=7")
