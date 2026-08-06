@@ -38,7 +38,7 @@ Ferramentas permitidas e argumentos:
 - consultar_saldo_livre: {"area":texto opcional,"planned_spending":numero opcional,"payment_method":"cash|credit" opcional,"card":texto opcional}
 - consultar_financiamentos: {"area":texto opcional,"include_paid":booleano opcional}
 - preparar_receita: {"amount":numero opcional,"description":texto opcional,"transaction_date":"YYYY-MM-DD" opcional,"area":texto opcional,"account":texto opcional,"category":texto opcional,"payment_method":texto opcional}
-- preparar_correcao_lancamento: {"target_description":texto opcional,"target_amount":numero opcional,"target_transaction_date":"YYYY-MM-DD" opcional,"area":texto opcional,"new_description":texto opcional,"new_amount":numero opcional,"new_transaction_date":"YYYY-MM-DD" opcional,"new_category":texto opcional}
+- preparar_correcao_lancamento: {"target_description":texto opcional,"target_amount":numero opcional,"target_transaction_date":"YYYY-MM-DD" opcional,"area":texto opcional,"new_description":texto opcional,"new_amount":numero opcional,"new_transaction_date":"YYYY-MM-DD" opcional,"new_category":texto opcional,"new_invoice_month":"YYYY-MM" opcional}
 - preparar_amortizacao_financiamento: {"financing":texto opcional,"new_outstanding_balance":numero opcional,"remaining_installments":inteiro opcional,"new_installment_amount":numero opcional,"amortized_amount":numero opcional,"strategy":"reduce_term|reduce_installment|reduce_both" opcional,"amortization_date":"YYYY-MM-DD" opcional,"notes":texto opcional}
 - confirmar_acao_pendente: {}
 - cancelar_acao_pendente: {}
@@ -368,9 +368,10 @@ def _pending_context(db: Session, user: User) -> str:
 
 def _fallback_tool_reply(tool_name: str, result: dict) -> str:
     if result.get("transaction_updated"):
+        invoice = f", fatura {result['invoice_month']}" if result.get("invoice_month") else ""
         return (
             f"Lancamento corrigido com sucesso: {result.get('description')} - "
-            f"R$ {result.get('amount')}, data {result.get('transaction_date')}."
+            f"R$ {result.get('amount')}, data {result.get('transaction_date')}{invoice}."
         )
     if result.get("updated"):
         financing = result.get("financing", {})
@@ -500,7 +501,7 @@ Quando houver despesa pendente e o usuario corrigir ou complementar categoria, p
 Quando o usuario pedir para procurar, escolher ou sugerir a categoria de uma despesa pendente, use sugerir_categoria_despesa. Nao devolva apenas uma lista se o backend conseguir recomendar uma categoria.
 Para registrar dinheiro recebido, inclusive PIX, use preparar_receita. Se faltarem dados, chame preparar_receita novamente com a resposta do usuario. Nunca escolha uma conta de destino sem informacao suficiente.
 Se o usuario pedir ajuda para escolher uma categoria de receita, use consultar_categorias_receita. Para PIX, a categoria PIX pode ser inferida automaticamente quando existir; para outras receitas, confirme uma categoria valida antes de registrar.
-Para corrigir um lancamento ja registrado, use preparar_correcao_lancamento. Identifique o registro por descricao, valor, data e area usando a conversa, converta datas relativas e envie os campos new_ correspondentes. A ferramenta consulta o banco, nunca trate o historico como prova de que o registro existe. A correcao usa confirmar_acao_pendente e nunca deve criar outro lancamento.
+Para corrigir um lancamento ja registrado, use preparar_correcao_lancamento. Identifique o registro por descricao, valor, data e area usando a conversa, converta datas relativas e envie os campos new_ correspondentes. Para mover um gasto de credito entre faturas sem mudar a data da compra, envie new_invoice_month em YYYY-MM. A ferramenta consulta o banco, nunca trate o historico como prova de que o registro existe. A correcao usa confirmar_acao_pendente e nunca deve criar outro lancamento.
 Converta datas relativas como hoje, ontem e anteontem para YYYY-MM-DD usando a data atual e envie transaction_date na ferramenta de despesa.
 Em perguntas sobre dinheiro disponivel agora, use consultar_saldo_livre com payment_method cash.
 Em perguntas sobre fechar o mes, salarios futuros ou compra no credito, use consultar_saldo_livre com payment_method credit quando aplicavel. Reaproveite planned_spending mencionado nos turnos recentes.

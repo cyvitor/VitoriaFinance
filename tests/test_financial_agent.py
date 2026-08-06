@@ -157,12 +157,20 @@ def test_registered_transaction_is_corrected_only_after_confirmation():
             workspace_id=vitor.workspace_id, parent_name="Lazer", name="Cinema",
             kind=TransactionType.expense,
         )
-        db.add(category); db.flush()
+        account = Account(workspace_id=vitor.workspace_id, person_id=vitor.id, name="C6 Conta",
+                          account_type=AccountType.checking)
+        db.add_all([category, account]); db.flush()
+        card = Card(workspace_id=vitor.workspace_id, account_id=account.id, name="C6",
+                    closing_day=5, due_day=10)
+        db.add(card); db.flush()
+        db.add(CardBillingPeriod(workspace_id=vitor.workspace_id, card_id=card.id,
+                                 year=2026, month=7, is_closed=True))
         expense = Transaction(
             workspace_id=vitor.workspace_id, transaction_type=TransactionType.expense,
             description="Pipoca no cinema", amount=Decimal("61.00"),
             transaction_date=date(2026, 7, 30), competence_year=2026, competence_month=7,
-            status=TransactionStatus.paid, person_id=vitor.id, category_id=category.id,
+            status=TransactionStatus.paid, person_id=vitor.id, account_id=account.id,
+            card_id=card.id, category_id=category.id,
             payment_method="Crédito", created_by_id=user.id, source="telegram",
         )
         db.add(expense); db.commit()
@@ -170,11 +178,13 @@ def test_registered_transaction_is_corrected_only_after_confirmation():
 
         prepared = execute_tool(db, context, "preparar_correcao_lancamento", {
             "target_description": "Pipoca no cinema", "target_amount": 61,
-            "new_transaction_date": "2026-07-29",
+            "new_transaction_date": "2026-07-29", "new_invoice_month": "2026-08",
         })
         assert prepared["status"] == "awaiting_confirmation"
         assert prepared["before"]["transaction_date"] == "2026-07-30"
         assert prepared["after"]["transaction_date"] == "2026-07-29"
+        assert prepared["before"]["invoice_month"] == "2026-07"
+        assert prepared["after"]["invoice_month"] == "2026-08"
         db.refresh(expense)
         assert expense.transaction_date == date(2026, 7, 30)
 
@@ -182,6 +192,8 @@ def test_registered_transaction_is_corrected_only_after_confirmation():
         db.refresh(expense)
         assert result["transaction_updated"] is True
         assert expense.transaction_date == date(2026, 7, 29)
+        assert (expense.competence_year, expense.competence_month) == (2026, 8)
+        assert expense.status == TransactionStatus.pending
         assert expense.amount == Decimal("61.00")
         assert db.scalar(select(func.count(Transaction.id)).where(
             Transaction.description == "Pipoca no cinema"

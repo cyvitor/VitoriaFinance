@@ -11,6 +11,15 @@ def shift_month(year: int, month: int, offset: int = 1) -> tuple[int, int]:
     return index // 12, index % 12 + 1
 
 
+def card_invoice_is_closed(db: Session, card_id: int, year: int, month: int) -> bool:
+    return bool(db.scalar(select(CardBillingPeriod.id).where(
+        CardBillingPeriod.card_id == card_id,
+        CardBillingPeriod.year == year,
+        CardBillingPeriod.month == month,
+        CardBillingPeriod.is_closed.is_(True),
+    )))
+
+
 def card_purchase_competence(db: Session, card: Card, purchase_date: date) -> tuple[int, int]:
     """Retorna a fatura aberta do cartão ou a primeira posterior disponível."""
     open_invoice = db.execute(
@@ -37,13 +46,7 @@ def card_purchase_competence(db: Session, card: Card, purchase_date: date) -> tu
 
     year, month = purchase_date.year, purchase_date.month
     for _ in range(120):
-        closed = db.scalar(select(CardBillingPeriod.id).where(
-            CardBillingPeriod.card_id == card.id,
-            CardBillingPeriod.year == year,
-            CardBillingPeriod.month == month,
-            CardBillingPeriod.is_closed.is_(True),
-        ))
-        if not closed:
+        if not card_invoice_is_closed(db, card.id, year, month):
             return year, month
         year, month = shift_month(year, month)
     raise ValueError("Não foi possível localizar uma fatura aberta.")

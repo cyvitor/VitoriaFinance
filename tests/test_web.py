@@ -331,6 +331,7 @@ def test_credit_and_debit_card_expenses_are_grouped_and_detailed(client):
     assert "Cartão Débito C6" in month.text
     detail = client.get(f"/cards/{card_id}?year=2026&month=7")
     assert "Compra" in detail.text and "Mercado" in detail.text
+    assert 'name="invoice_month"' in detail.text
     assert "Valor: maior para menor" in detail.text
     assert "Data/hora: recentes" in detail.text
     assert 'data-sort-target="creditExpenses"' in detail.text
@@ -386,7 +387,7 @@ def test_credit_and_debit_card_expenses_are_grouped_and_detailed(client):
         assert (later.competence_year, later.competence_month) == (2026, 8)
     response = client.post(f"/cards/{card_id}/expenses/{first_parcel_id}/edit", data={
         "description": "Notebook ajustado", "amount": "34.00", "category_id": str(category_id),
-        "transaction_date": "2026-08-02",
+        "transaction_date": "2026-08-02", "invoice_month": "2026-09",
     }, follow_redirects=False)
     assert response.status_code == 303
     with SessionLocal() as db:
@@ -394,7 +395,8 @@ def test_credit_and_debit_card_expenses_are_grouped_and_detailed(client):
         assert edited.description == "Notebook ajustado"
         assert edited.amount == Decimal("34.00")
         assert edited.transaction_date.isoformat() == "2026-08-02"
-        assert (edited.competence_year, edited.competence_month) == (2026, 8)
+        assert (edited.competence_year, edited.competence_month) == (2026, 9)
+        assert edited.status == TransactionStatus.pending
 
 
 def test_confirmed_month_transaction_can_be_edited_and_deleted(client):

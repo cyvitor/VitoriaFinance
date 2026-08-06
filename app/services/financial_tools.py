@@ -11,7 +11,7 @@ from app.models import (
     TelegramPendingAction, Transaction, TransactionStatus, TransactionType, User,
 )
 from app.services.access_context import UserAccessContext
-from app.services.card_billing import card_purchase_competence
+from app.services.card_billing import card_invoice_is_closed, card_purchase_competence
 from app.services.telegram_expenses import (
     ExpenseInput, cancel_expense_draft, confirm_expense_draft, create_expense_draft,
     finish_processing_queue_item, format_draft, get_active_draft,
@@ -47,6 +47,18 @@ def _date(value, default: date | None = None) -> date:
         return date.fromisoformat(str(value))
     except ValueError as exc:
         raise ToolError("data invalida") from exc
+
+
+def _invoice_month(value) -> tuple[int, int] | None:
+    if value in (None, ""):
+        return None
+    try:
+        year, month = map(int, str(value).split("-", 1))
+    except (TypeError, ValueError) as exc:
+        raise ToolError("fatura invalida; use YYYY-MM") from exc
+    if not 2000 <= year <= 2100 or not 1 <= month <= 12:
+        raise ToolError("fatura invalida; use YYYY-MM")
+    return year, month
 
 
 def _base_transaction_filters(context: UserAccessContext):
@@ -621,6 +633,17 @@ def prepare_transaction_update(db: Session, context: UserAccessContext, args: di
     new_description = " ".join(str(args.get("new_description") or item.description).split())[:180]
     new_amount = _decimal(args.get("new_amount"), "novo valor") or Decimal(item.amount)
     new_date = _date(args.get("new_transaction_date"), item.transaction_date)
+    requested_invoice = _invoice_month(args.get("new_invoice_month"))
+    is_credit_card = bool(item.card_id and (item.payment_method or "").casefold() in ("credito", "crédito", "credit"))
+    if requested_invoice and not is_credit_card:
+        raise ToolError("A fatura só pode ser alterada em gastos no cartão de crédito")
+    if requested_invoice:
+        updated_year, updated_month = requested_invoice
+    elif is_credit_card and new_date != item.transaction_date:
+        updated_year, updated_month = card_purchase_competence(db, item.card, new_date)
+    else:
+        updated_year = item.competence_year or item.transaction_date.year
+        updated_month = item.competence_month or item.transaction_date.month
     category = item.category
     if args.get("new_category"):
         categories = db.scalars(select(Category).where(
@@ -642,6 +665,8 @@ def prepare_transaction_update(db: Session, context: UserAccessContext, args: di
         "original": {
             "description": item.description, "amount": _money(item.amount),
             "transaction_date": item.transaction_date.isoformat(),
+            "invoice_month": f"{item.competence_year:04d}-{item.competence_month:02d}",
+            "competence_year": item.competence_year, "competence_month": item.competence_month,
             "category_id": item.category_id,
             "category": (
                 f"{item.category.parent_name} > {item.category.name}"
@@ -651,6 +676,8 @@ def prepare_transaction_update(db: Session, context: UserAccessContext, args: di
         "updated": {
             "description": new_description, "amount": _money(new_amount),
             "transaction_date": new_date.isoformat(),
+            "invoice_month": f"{updated_year:04d}-{updated_month:02d}",
+            "competence_year": updated_year, "competence_month": updated_month,
             "category_id": category.id if category else None,
             "category": (
                 f"{category.parent_name} > {category.name}"
@@ -754,6 +781,8 @@ def confirm_pending_action(db: Session, context: UserAccessContext, args: dict) 
             item.description != original["description"],
             _money(item.amount) != original["amount"],
             item.transaction_date.isoformat() != original["transaction_date"],
+            item.competence_year != original["competence_year"],
+            item.competence_month != original["competence_month"],
             item.category_id != original["category_id"],
         )):
             action.status = "cancelled"; action.resolved_at = datetime.utcnow(); db.commit()
@@ -763,16 +792,21 @@ def confirm_pending_action(db: Session, context: UserAccessContext, args: dict) 
         item.amount = _decimal(updated["amount"], "valor")
         item.transaction_date = _date(updated["transaction_date"])
         item.category_id = updated["category_id"]
+        item.competence_year = updated["competence_year"]
+        item.competence_month = updated["competence_month"]
         if item.card and (item.payment_method or "").casefold() in ("credito", "crédito", "credit"):
-            item.competence_year, item.competence_month = card_purchase_competence(db, item.card, item.transaction_date)
-        else:
-            item.competence_year, item.competence_month = item.transaction_date.year, item.transaction_date.month
+            item.status = (
+                TransactionStatus.paid
+                if card_invoice_is_closed(db, item.card_id, item.competence_year, item.competence_month)
+                else TransactionStatus.pending
+            )
         action.status = "confirmed"; action.resolved_at = datetime.utcnow()
         db.commit()
         return {
             "updated": True, "transaction_updated": True,
             "description": item.description, "amount": _money(item.amount),
             "transaction_date": item.transaction_date.isoformat(),
+            "invoice_month": updated["invoice_month"],
             "category": updated["category"],
         }
     if action.action_type == "income_registration":

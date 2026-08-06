@@ -23,7 +23,9 @@ from app.models import (
     MemberRole, UserMemory, Workspace,
 )
 from app.security import hash_password, verify_password
-from app.services.card_billing import card_purchase_competence, shift_month as shift_competence_month
+from app.services.card_billing import (
+    card_invoice_is_closed, card_purchase_competence, shift_month as shift_competence_month,
+)
 from app.services.telegram_auth import PAIRING_TTL_MINUTES, create_pairing_code, unlink_telegram
 from scripts.seed import seed_categories
 
@@ -1361,7 +1363,7 @@ def card_detail(card_id: int, request: Request, year: int | None = None, month: 
 @router.post("/cards/{card_id}/expenses/{transaction_id}/edit")
 def card_expense_edit(card_id: int, transaction_id: int, request: Request,
                       description: str = Form(), amount: Decimal = Form(), category_id: int = Form(),
-                      transaction_date: date = Form(),
+                      transaction_date: date = Form(), invoice_month: str | None = Form(None),
                       db: Session = Depends(get_db), user: User = Depends(current_user)):
     wid = current_workspace_id(request, user, db)
     card = db.scalar(select(Card).where(Card.id == card_id, Card.workspace_id == wid))
@@ -1385,12 +1387,26 @@ def card_expense_edit(card_id: int, transaction_id: int, request: Request,
     item.category_id = category.id
     item.transaction_date = transaction_date
     is_credit = (item.payment_method or "").lower() in ("crédito", "credito")
-    target_year, target_month = (
-        card_purchase_competence(db, card, transaction_date) if is_credit
-        else (transaction_date.year, transaction_date.month)
-    )
+    if is_credit and invoice_month:
+        try:
+            target_year, target_month = map(int, invoice_month.split("-", 1))
+            if not 1 <= target_month <= 12 or not 2000 <= target_year <= 2100:
+                raise ValueError
+        except (TypeError, ValueError):
+            flash(request, "Informe uma fatura válida.", "danger")
+            return redirect(f"/cards/{card.id}?year={year}&month={month}&view=detailed")
+    else:
+        target_year, target_month = (
+            card_purchase_competence(db, card, transaction_date) if is_credit
+            else (transaction_date.year, transaction_date.month)
+        )
     item.competence_year = target_year
     item.competence_month = target_month
+    if is_credit:
+        item.status = (
+            TransactionStatus.paid if card_invoice_is_closed(db, card.id, target_year, target_month)
+            else TransactionStatus.pending
+        )
     db.commit()
     flash(request, "Gasto do cartão atualizado.")
     return redirect(f"/cards/{card.id}?year={target_year}&month={target_month}&view=detailed")
