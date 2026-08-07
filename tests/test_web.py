@@ -407,32 +407,45 @@ def test_confirmed_month_transaction_can_be_edited_and_deleted(client):
         user_id = db.scalar(select(User.id).where(User.username == "vh"))
         category = Category(workspace_id=workspace_id, kind=TransactionType.expense,
                             parent_name="Moradia", name="Energia", color="#fdcb6e")
+        source = Account(workspace_id=workspace_id, person_id=area_id, name="Caixa",
+                         account_type=AccountType.checking)
+        new_source = Account(workspace_id=workspace_id, person_id=area_id, name="NU",
+                             account_type=AccountType.checking)
         rule = RecurrenceRule(workspace_id=workspace_id, transaction_type=TransactionType.expense,
                               frequency="monthly", description="Energia", amount=Decimal("120.00"),
                               person_id=area_id, created_by_id=user_id, is_active=True)
-        db.add_all([category, rule]); db.flush()
+        db.add_all([category, source, new_source, rule]); db.flush()
         tx = Transaction(workspace_id=workspace_id, transaction_type=TransactionType.expense,
-                         description="Energia", amount=Decimal("120.00"), transaction_date=date(2026, 7, 10),
+                         description="Energia", amount=Decimal("120.00"), transaction_date=date(2026, 8, 7),
                          competence_year=2026, competence_month=7, status=TransactionStatus.paid,
-                         person_id=area_id, category_id=category.id, recurrence_rule_id=rule.id,
+                         person_id=area_id, account_id=source.id, category_id=category.id,
+                         recurrence_rule_id=rule.id,
                          created_by_id=user_id)
         db.add(tx); db.flush()
         occurrence = RecurrenceOccurrence(recurrence_rule_id=rule.id, year=2026, month=7,
                                           status="confirmed", transaction_id=tx.id)
         db.add(occurrence); db.commit(); tx_id = tx.id; category_id = category.id; rule_id = rule.id
+        new_source_id = new_source.id
     page = client.get("/month?year=2026&month=7")
     assert f'data-bs-target="#manageTransaction{tx_id}"' in page.text
+    assert 'name="competence_month" value="2026-07"' in page.text
+    assert 'name="account_id"' in page.text
     assert "Editar lançamento" in page.text
     response = client.post(f"/transactions/{tx_id}/edit", data={
-        "description": "Energia ajustada", "amount": "127.45", "transaction_date": "2026-07-12",
+        "description": "Energia ajustada", "amount": "127.45", "transaction_date": "2026-08-08",
+        "competence_month": "2026-07", "account_id": str(new_source_id),
         "category_id": str(category_id), "notes": "Leitura corrigida", "return_year": "2026",
         "return_month": "7",
     }, follow_redirects=False)
     assert response.status_code == 303
+    assert response.headers["location"] == "/month?year=2026&month=7"
     with SessionLocal() as db:
         edited = db.get(Transaction, tx_id)
         assert edited.description == "Energia ajustada" and edited.amount == Decimal("127.45")
         assert edited.notes == "Leitura corrigida"
+        assert edited.transaction_date == date(2026, 8, 8)
+        assert (edited.competence_year, edited.competence_month) == (2026, 7)
+        assert edited.account_id == new_source_id
     response = client.post(f"/transactions/{tx_id}/delete", data={
         "return_year": "2026", "return_month": "7",
     }, follow_redirects=False)

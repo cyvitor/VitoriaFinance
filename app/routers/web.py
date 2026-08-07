@@ -1244,6 +1244,7 @@ def transaction_delete(item_id: int, request: Request, return_year: int | None =
 @router.post("/transactions/{item_id}/edit")
 def transaction_edit(item_id: int, request: Request, description: str = Form(), amount: Decimal = Form(),
                      transaction_date: date = Form(), category_id: str | None = Form(None),
+                     account_id: str | None = Form(None), competence_month: str | None = Form(None),
                      notes: str | None = Form(None), return_year: int | None = Form(None),
                      return_month: int | None = Form(None), db: Session = Depends(get_db),
                      user: User = Depends(current_user)):
@@ -1255,7 +1256,25 @@ def transaction_edit(item_id: int, request: Request, description: str = Form(), 
     if not item: raise HTTPException(404)
     if item.person_id:
         ensure_area_access(item.person_id, user, wid, db)
-    category_value = optional_int(category_id)
+    category_value, account_value = optional_int(category_id), optional_int(account_id)
+    if account_value:
+        account = db.scalar(select(Account).where(
+            Account.id == account_value, Account.workspace_id == wid, Account.is_active.is_(True),
+        ))
+        if not account or (item.person_id and account.person_id != item.person_id):
+            flash(request, "Selecione uma fonte pagadora da mesma área financeira.", "danger")
+            return redirect(f"/month?year={return_year or item.competence_year}&month={return_month or item.competence_month}")
+        ensure_account_access(account_value, user, wid, db)
+    target_year = item.competence_year or item.transaction_date.year
+    target_month = item.competence_month or item.transaction_date.month
+    if competence_month:
+        try:
+            target_year, target_month = map(int, competence_month.split("-", 1))
+            if not 2000 <= target_year <= 2100 or not 1 <= target_month <= 12:
+                raise ValueError
+        except (TypeError, ValueError):
+            flash(request, "Informe um mês de competência válido.", "danger")
+            return redirect(f"/month?year={return_year or item.competence_year}&month={return_month or item.competence_month}")
     if category_value and not db.scalar(select(Category.id).where(
         Category.id == category_value, Category.workspace_id == wid,
         Category.kind == item.transaction_type,
@@ -1268,8 +1287,9 @@ def transaction_edit(item_id: int, request: Request, description: str = Form(), 
     item.description = description.strip()
     item.amount = amount
     item.transaction_date = transaction_date
-    item.competence_year = transaction_date.year
-    item.competence_month = transaction_date.month
+    item.competence_year = target_year
+    item.competence_month = target_month
+    item.account_id = account_value
     item.category_id = category_value
     item.notes = (notes or "").strip() or None
     db.commit()
