@@ -340,6 +340,26 @@ def test_credit_spending_and_month_close_are_forced_to_projection():
 
 def test_expense_typo_with_financial_context_still_requires_tool():
     assert _requires_financial_tool("gatei 5 no credito c6 na doce pão") is True
+    assert _requires_financial_tool(
+        "grave na sua memória que se eu não disser a data do gasto, considere o dia corrente"
+    ) is False
+
+
+def test_explicit_default_date_preference_is_stored_without_deepinfra():
+    with SessionLocal() as db:
+        user, financing, hidden, rule = setup_financings(db)
+        reply = run_financial_agent(
+            db, user,
+            "Grave na sua memória q se eu n disse q data do gasto, considerar sempre o dia corrente",
+            reference_date=date(2026, 8, 6),
+        )
+        assert "guardei essa preferência" in reply
+        memory = db.scalar(select(UserMemory).where(
+            UserMemory.user_id == user.id,
+            UserMemory.subject == "data_padrao_dos_gastos",
+        ))
+        assert memory is not None
+        assert json.loads(memory.value_json)["default"] == "telegram_message_date"
 
 
 def test_category_reply_updates_existing_expense_instead_of_recreating_it():

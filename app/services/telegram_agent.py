@@ -95,6 +95,8 @@ def _complete(token: str, model: str, messages: list[dict], max_tokens: int = 50
 
 def _requires_financial_tool(text: str) -> bool:
     normalized = text.casefold()
+    if any(term in normalized for term in ("grave na sua memória", "grave na sua memoria", "memorize", "lembre que")):
+        return False
     terms = (
         "saldo", "quanto", "gastei", "gastar", "gasto", "despesa", "receita", "conta",
         "cartão", "cartao", "fatura", "limite", "financiamento", "amortiz", "parcela",
@@ -108,6 +110,35 @@ def _normalized_text(text: str) -> str:
     return "".join(
         char for char in unicodedata.normalize("NFKD", text.casefold())
         if not unicodedata.combining(char)
+    )
+
+
+def _store_explicit_preference(db: Session, user: User, text: str) -> str | None:
+    normalized = _normalized_text(text)
+    asks_memory = any(term in normalized for term in (
+        "grave na sua memoria", "grave na memoria", "memorize", "lembre que",
+    ))
+    defaults_to_current_date = (
+        asks_memory
+        and "data" in normalized
+        and any(term in normalized for term in (
+            "nao disser", "nao disse", "n disser", "n disse",
+            "nao informar", "sem informar", "nao falar", "n falar",
+        ))
+        and any(term in normalized for term in ("dia corrente", "data atual", "hoje"))
+    )
+    if not defaults_to_current_date:
+        return None
+    store_candidates(db, user.id, [{
+        "type": "user_preference",
+        "subject": "data_padrao_dos_gastos",
+        "value": {"default": "telegram_message_date", "timezone": "America/Sao_Paulo"},
+        "summary": "Quando nenhuma data for informada, usar a data corrente da mensagem do Telegram.",
+        "confidence": 1.0,
+    }])
+    return (
+        "Combinado, guardei essa preferência. Quando você não informar a data do gasto, "
+        "vou considerar o dia corrente da mensagem no fuso de São Paulo."
     )
 
 
@@ -479,6 +510,17 @@ Retorne SOMENTE JSON: {"category":"opção exata ou null","confidence":0.0}."""
 
 def run_financial_agent(db: Session, user: User, text: str, reference_date: date | None = None) -> str:
     reference_date = reference_date or date.today()
+    explicit_preference_reply = _store_explicit_preference(db, user, text)
+    if explicit_preference_reply:
+        db.add_all([
+            TelegramConversationMessage(user_id=user.id, role="user", content=text[:4000]),
+            TelegramConversationMessage(
+                user_id=user.id, role="assistant", content=explicit_preference_reply,
+            ),
+        ])
+        db.commit()
+        logger.info("explicit_user_preference_stored user_id=%s subject=data_padrao_dos_gastos", user.id)
+        return explicit_preference_reply
     token, model = _settings(db)
     context = build_user_access_context(db, user)
     areas = db.scalars(select(Person.name).where(Person.id.in_(context.allowed_person_ids))).all() if context.allowed_person_ids else []
