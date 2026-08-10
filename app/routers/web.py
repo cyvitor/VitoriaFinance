@@ -1166,8 +1166,8 @@ def transaction_create(request: Request, transaction_type: TransactionType = For
         transaction_date: date = Form(), status: TransactionStatus = Form(), account_id: str | None = Form(None),
         destination_account_id: str | None = Form(None), card_id: str | None = Form(None), person_id: str | None = Form(None),
         category_id: str | None = Form(None), payment_method: str | None = Form(None), notes: str | None = Form(None),
-        return_to: str | None = Form(None), return_year: int | None = Form(None),
-        return_month: int | None = Form(None),
+        return_to: str | None = Form(None), return_year: str | None = Form(None),
+        return_month: str | None = Form(None),
         db: Session = Depends(get_db), user: User = Depends(current_user)):
     wid = current_workspace_id(request, user, db)
     account_id = optional_int(account_id)
@@ -1175,7 +1175,20 @@ def transaction_create(request: Request, transaction_type: TransactionType = For
     card_id = optional_int(card_id)
     person_id = optional_int(person_id)
     category_id = optional_int(category_id)
+    return_year = optional_int(return_year)
+    return_month = optional_int(return_month)
     competence_year, competence_month = transaction_date.year, transaction_date.month
+    if return_to == "month" and return_year and return_month and 1 <= return_month <= 12:
+        competence_year, competence_month = return_year, return_month
+        while db.scalar(select(AccountingPeriod.id).where(
+            AccountingPeriod.workspace_id == wid,
+            AccountingPeriod.year == competence_year,
+            AccountingPeriod.month == competence_month,
+            AccountingPeriod.is_closed.is_(True),
+        )):
+            competence_month += 1
+            if competence_month == 13:
+                competence_month, competence_year = 1, competence_year + 1
     if transaction_type != TransactionType.transfer and not person_id:
         flash(request, "Selecione uma área financeira.", "danger")
         return redirect(f"/transactions/new?kind={transaction_type.value}")
@@ -1208,9 +1221,7 @@ def transaction_create(request: Request, transaction_type: TransactionType = For
     db.commit()
     flash(request, "Lançamento registrado.")
     if return_to == "month":
-        target_year = return_year or competence_year
-        target_month = return_month if return_month and 1 <= return_month <= 12 else competence_month
-        return redirect(f"/month?year={target_year}&month={target_month}")
+        return redirect(f"/month?year={competence_year}&month={competence_month}")
     return redirect("/transactions")
 
 

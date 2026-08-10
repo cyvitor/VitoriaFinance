@@ -71,6 +71,30 @@ def test_month_income_form_is_simplified_and_returns_to_selected_month(client):
     }, follow_redirects=False)
     assert response.status_code == 303
     assert response.headers["location"] == "/month?year=2026&month=7"
+    month_page = client.get("/month?year=2026&month=7")
+    assert "/transactions/new?kind=expense&return_to=month&return_year=2026&return_month=7" in month_page.text
+
+    selected_month = client.post("/transactions/new", data={
+        "transaction_type": "expense", "description": "Reserva de emergência", "amount": "600.00",
+        "transaction_date": "2026-08-09", "status": "paid", "account_id": str(account_id),
+        "person_id": str(area_id), "category_id": "", "card_id": "", "return_to": "month",
+        "return_year": "2026", "return_month": "7",
+    }, follow_redirects=False)
+    assert selected_month.status_code == 303
+    assert selected_month.headers["location"] == "/month?year=2026&month=7"
+    with SessionLocal() as db:
+        reserve = db.scalar(select(Transaction).where(Transaction.description == "Reserva de emergência"))
+        assert reserve.transaction_date == date(2026, 8, 9)
+        assert (reserve.competence_year, reserve.competence_month) == (2026, 7)
+
+    blank_return = client.post("/transactions/new", data={
+        "transaction_type": "expense", "description": "Despesa avulsa", "amount": "10.00",
+        "transaction_date": "2026-08-09", "status": "paid", "account_id": str(account_id),
+        "person_id": str(area_id), "category_id": "", "card_id": "", "return_to": "",
+        "return_year": "", "return_month": "",
+    }, follow_redirects=False)
+    assert blank_return.status_code == 303
+    assert blank_return.headers["location"] == "/transactions"
 
 
 def test_recurring_income_monthly_confirmation_skip_and_delete(client):
