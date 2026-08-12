@@ -296,6 +296,24 @@ class Category(Base):
     color: Mapped[str] = mapped_column(String(7), default="#64748b")
 
 
+class MonthlyBudget(Base):
+    __tablename__ = "monthly_budgets"
+    __table_args__ = (UniqueConstraint("workspace_id", "person_id", "category_id"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    workspace_id: Mapped[int] = mapped_column(ForeignKey("workspaces.id", ondelete="CASCADE"), index=True)
+    person_id: Mapped[int] = mapped_column(ForeignKey("people.id", ondelete="CASCADE"), index=True)
+    category_id: Mapped[int] = mapped_column(ForeignKey("categories.id", ondelete="CASCADE"), index=True)
+    amount: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+    start_year: Mapped[int] = mapped_column()
+    start_month: Mapped[int] = mapped_column()
+    include_in_projection: Mapped[bool] = mapped_column(Boolean, default=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    created_by_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    person: Mapped[Person] = relationship()
+    category: Mapped[Category] = relationship()
+
+
 class RecurrenceRule(Base):
     __tablename__ = "recurrence_rules"
     id: Mapped[int] = mapped_column(primary_key=True)

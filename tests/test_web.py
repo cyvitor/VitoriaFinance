@@ -3,7 +3,7 @@ from decimal import Decimal
 
 from app.database import SessionLocal
 from sqlalchemy import func, select
-from app.models import Account, AccountRole, AccountType, Card, Category, Financing, FinancingAmortization, Person, PersonType, SystemAccount, SystemSetting, User, Workspace, WorkspaceMember, MemberRole, RecurrenceRule, RecurrenceOccurrence, Transaction, TransactionStatus, TransactionType
+from app.models import Account, AccountRole, AccountType, Card, Category, Financing, FinancingAmortization, MonthlyBudget, Person, PersonType, SystemAccount, SystemSetting, User, Workspace, WorkspaceMember, MemberRole, RecurrenceRule, RecurrenceOccurrence, Transaction, TransactionStatus, TransactionType
 from app.security import hash_password
 
 
@@ -95,6 +95,83 @@ def test_month_income_form_is_simplified_and_returns_to_selected_month(client):
     }, follow_redirects=False)
     assert blank_return.status_code == 303
     assert blank_return.headers["location"] == "/transactions"
+
+
+def test_monthly_budget_is_consumed_by_paid_and_pending_expenses(client):
+    area_id = seed_test()
+    client.post("/login", data={"username": "vh", "password": "123456"})
+    with SessionLocal() as db:
+        workspace_id = db.scalar(select(Workspace.id))
+        user_id = db.scalar(select(User.id).where(User.username == "vh"))
+        category = Category(workspace_id=workspace_id, kind=TransactionType.expense,
+                            parent_name="Alimentação", name="Padaria", color="#fdcb6e")
+        db.add(category); db.flush(); category_id = category.id
+        db.add_all([
+            Transaction(workspace_id=workspace_id, transaction_type=TransactionType.expense,
+                        description="Pão", amount=Decimal("30.00"), transaction_date=date(2026, 7, 5),
+                        competence_year=2026, competence_month=7, status=TransactionStatus.paid,
+                        person_id=area_id, category_id=category_id, created_by_id=user_id),
+            Transaction(workspace_id=workspace_id, transaction_type=TransactionType.expense,
+                        description="Café no crédito", amount=Decimal("15.00"), transaction_date=date(2026, 7, 8),
+                        competence_year=2026, competence_month=7, status=TransactionStatus.pending,
+                        person_id=area_id, category_id=category_id, payment_method="Crédito",
+                        created_by_id=user_id),
+        ])
+        db.commit()
+    response = client.post("/budgets", data={
+        "person_id": str(area_id), "category_id": str(category_id),
+        "amount": "100.00", "start_month": "2026-07", "include_in_projection": "true",
+    }, follow_redirects=False)
+    assert response.status_code == 303
+    with SessionLocal() as db:
+        budget = db.scalar(select(MonthlyBudget))
+        assert budget.amount == Decimal("100.00")
+        assert budget.include_in_projection is True
+        budget_id = budget.id
+    page = client.get("/month?year=2026&month=7")
+    assert "ORÇAMENTO POR CATEGORIA" in page.text
+    assert "Alimentação · Padaria" in page.text
+    assert "R$ 55,00" in page.text
+    assert "R$ 30,00" in page.text
+    assert "R$ 15,00" in page.text
+    assert "reserva orçamentária: R$ 55,00" in page.text
+    # The month tab and the macro KPI use the same accumulated projected balance.
+    assert page.text.count("R$ -100,00") >= 2
+    client.post(f"/budgets/{budget_id}/edit", data={
+        "amount": "120.00", "start_month": "2026-07", "include_in_projection": "true",
+    })
+    with SessionLocal() as db:
+        assert db.get(MonthlyBudget, budget_id).amount == Decimal("120.00")
+    client.post(f"/budgets/{budget_id}/delete")
+    with SessionLocal() as db:
+        assert db.get(MonthlyBudget, budget_id).is_active is False
+
+
+def test_future_month_starts_with_previous_month_projected_balance(client):
+    area_id = seed_test()
+    client.post("/login", data={"username": "vh", "password": "123456"})
+    with SessionLocal() as db:
+        workspace_id = db.scalar(select(Workspace.id))
+        user_id = db.scalar(select(User.id).where(User.username == "vh"))
+        db.add_all([
+            Transaction(workspace_id=workspace_id, transaction_type=TransactionType.income,
+                        description="Saldo de agosto", amount=Decimal("100.00"),
+                        transaction_date=date(2026, 8, 1), competence_year=2026, competence_month=8,
+                        status=TransactionStatus.paid, person_id=area_id, created_by_id=user_id),
+            Transaction(workspace_id=workspace_id, transaction_type=TransactionType.income,
+                        description="Previsão de agosto", amount=Decimal("50.00"),
+                        transaction_date=date(2026, 8, 2), competence_year=2026, competence_month=8,
+                        status=TransactionStatus.pending, person_id=area_id, created_by_id=user_id),
+            Transaction(workspace_id=workspace_id, transaction_type=TransactionType.income,
+                        description="Previsão de setembro", amount=Decimal("25.00"),
+                        transaction_date=date(2026, 9, 1), competence_year=2026, competence_month=9,
+                        status=TransactionStatus.pending, person_id=area_id, created_by_id=user_id),
+        ])
+        db.commit()
+    page = client.get("/month?year=2026&month=9")
+    assert "Saldo inicial" in page.text
+    assert "R$ 150,00" in page.text
+    assert "R$ 175,00" in page.text
 
 
 def test_recurring_income_monthly_confirmation_skip_and_delete(client):
@@ -329,6 +406,24 @@ def test_new_area_becomes_default_and_can_be_changed(client):
         assert db.scalar(select(User.default_person_id).where(User.username == "vh")) == first_area_id
 
 
+def test_financial_analysis_groups_confirmed_items_by_competence(client):
+    area_id = seed_test()
+    client.post("/login", data={"username": "vh", "password": "123456"})
+    with SessionLocal() as db:
+        workspace_id = db.scalar(select(Workspace.id))
+        user_id = db.scalar(select(User.id).where(User.username == "vh"))
+        db.add(Transaction(
+            workspace_id=workspace_id, transaction_type=TransactionType.income,
+            description="Salário de julho confirmado em agosto", amount=Decimal("4267.00"),
+            transaction_date=date(2026, 8, 6), competence_year=2026, competence_month=7,
+            status=TransactionStatus.paid, person_id=area_id, created_by_id=user_id,
+        ))
+        db.commit()
+    page = client.get("/analysis?history=3")
+    assert page.status_code == 200
+    assert "data:[0.0,4267.0,0.0]" in page.text.replace(" ", "")
+
+
 def test_credit_and_debit_card_expenses_are_grouped_and_detailed(client):
     area_id = seed_test()
     client.post("/login", data={"username": "vh", "password": "123456"})
@@ -366,12 +461,16 @@ def test_credit_and_debit_card_expenses_are_grouped_and_detailed(client):
     assert "Análise financeira" in analysis.text
     assert "Gastos no crédito" in analysis.text
     assert "Projeção de saldo" in analysis.text
+    empty_area_analysis = client.get("/analysis?history=3&horizon=60&area_id=")
+    assert empty_area_analysis.status_code == 200
+    assert "Análise financeira" in empty_area_analysis.text
     assert "Gasto no cartão" in client.get("/").text
     monthly_analysis = client.get("/monthly-analysis?year=2026&month=7")
     assert monthly_analysis.status_code == 200
     assert "Análise mensal" in monthly_analysis.text
     assert "Comprometimento da renda" in monthly_analysis.text
     assert "Sem categoria" in monthly_analysis.text
+    assert client.get("/monthly-analysis?year=2026&month=7&area_id=").status_code == 200
     response = client.post("/card-expenses/new", data={
         "card_id": str(card_id), "description": "Notebook", "amount": "100.00",
         "payment_method": "Crédito", "purchase_type": "installments", "installments": "3",
