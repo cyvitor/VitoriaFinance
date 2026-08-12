@@ -12,6 +12,7 @@ from app.models import (
 )
 from app.services.access_context import UserAccessContext
 from app.services.card_billing import card_invoice_is_closed, card_purchase_competence
+from app.services.monthly_projection import monthly_budget_positions, projection_budget_remaining
 from app.services.telegram_expenses import (
     ExpenseInput, cancel_expense_draft, confirm_expense_draft, create_expense_draft,
     finish_processing_queue_item, format_draft, get_active_draft,
@@ -177,6 +178,29 @@ def list_income_categories(db: Session, context: UserAccessContext, args: dict) 
     return {"categories": labels}
 
 
+def _resolve_category(db: Session, context: UserAccessContext, value: str | None,
+                      kind: TransactionType) -> Category:
+    if not value or not str(value).strip():
+        raise ToolError("Informe a categoria")
+    normalized = " ".join(str(value).casefold().replace(">", " ").split())
+    categories = db.scalars(select(Category).where(
+        Category.workspace_id.in_(context.workspace_ids), Category.kind == kind,
+    )).all()
+    exact = [item for item in categories if normalized in {
+        item.name.casefold(),
+        " ".join(f"{item.parent_name or ''} {item.name}".casefold().split()),
+    }]
+    if len(exact) == 1:
+        return exact[0]
+    partial = [item for item in categories if normalized in
+               " ".join(f"{item.parent_name or ''} {item.name}".casefold().split())]
+    if len(partial) == 1:
+        return partial[0]
+    if not partial:
+        raise ToolError(f"Categoria '{value}' nao encontrada")
+    raise ToolError("Categoria ambigua: " + ", ".join(item.name for item in partial))
+
+
 def query_transactions(db: Session, context: UserAccessContext, args: dict, kind: TransactionType) -> dict:
     start, end = _period(args)
     person = _resolve_person(db, context, args.get("area")) if args.get("area") else None
@@ -289,6 +313,59 @@ def monthly_summary(db: Session, context: UserAccessContext, args: dict) -> dict
             "definition": "receitas menos despesas registradas no periodo"}
 
 
+def query_budgets(db: Session, context: UserAccessContext, args: dict) -> dict:
+    person = _resolve_person(db, context, args.get("area")) if args.get("area") else None
+    person_ids = (person.id,) if person else context.allowed_person_ids
+    reference = _date(args.get("reference_date"), date.today())
+    positions = monthly_budget_positions(
+        db, workspace_ids=context.workspace_ids, person_ids=person_ids,
+        year=reference.year, month=reference.month,
+    )
+    items = []
+    for position in positions:
+        impact = position.impact()
+        items.append({
+            "area": position.budget.person.name,
+            "category": (f"{position.budget.category.parent_name} > {position.budget.category.name}"
+                         if position.budget.category.parent_name else position.budget.category.name),
+            **impact,
+        })
+    return {
+        "competence": f"{reference.year:04d}-{reference.month:02d}",
+        "area": person.name if person else "todas as areas permitidas",
+        "budgets": items,
+        "total_planned": _money(sum((Decimal(item["planned"]) for item in items), Decimal(0))),
+        "total_spent": _money(sum((Decimal(item["spent"]) for item in items), Decimal(0))),
+        "total_remaining": _money(sum((Decimal(item["remaining"]) for item in items), Decimal(0))),
+        "projection_reserve": _money(projection_budget_remaining(positions)),
+    }
+
+
+def query_category_budget(db: Session, context: UserAccessContext, args: dict) -> dict:
+    person = _resolve_person(db, context, args.get("area"))
+    if not person:
+        raise ToolError("Informe a area financeira para consultar o orcamento da categoria")
+    category = _resolve_category(db, context, args.get("category"), TransactionType.expense)
+    reference = _date(args.get("reference_date"), date.today())
+    planned_spending = _decimal(args.get("planned_spending"), "gasto planejado") or Decimal(0)
+    positions = monthly_budget_positions(
+        db, workspace_ids=context.workspace_ids, person_ids=(person.id,),
+        year=reference.year, month=reference.month, category_id=category.id,
+    )
+    if not positions:
+        return {"found": False, "area": person.name,
+                "category": f"{category.parent_name} > {category.name}" if category.parent_name else category.name,
+                "competence": f"{reference.year:04d}-{reference.month:02d}",
+                "message": "Nenhum orcamento ativo para esta categoria"}
+    position = positions[0]
+    return {
+        "found": True, "area": person.name,
+        "category": f"{category.parent_name} > {category.name}" if category.parent_name else category.name,
+        "competence": f"{reference.year:04d}-{reference.month:02d}",
+        **position.impact(planned_spending),
+    }
+
+
 def calculate_free_balance(db: Session, context: UserAccessContext, args: dict) -> dict:
     today = date.today()
     person = _resolve_person(db, context, args.get("area")) if args.get("area") else None
@@ -349,7 +426,12 @@ def calculate_free_balance(db: Session, context: UserAccessContext, args: dict) 
     projected_expense = month_totals.get(TransactionType.expense, Decimal(0)) + recurring_commitments
     projected_month_result = projected_income - projected_expense
     current_balance = initial_balance + paid_flow
-    free_balance = current_balance - pending_transactions - recurring_commitments
+    budget_positions = monthly_budget_positions(
+        db, workspace_ids=context.workspace_ids, person_ids=person_ids,
+        year=today.year, month=today.month,
+    )
+    budget_remaining = projection_budget_remaining(budget_positions)
+    free_balance = current_balance - pending_transactions - recurring_commitments - budget_remaining
     after_planned_spending = free_balance - planned_spending
     payment_method = str(args.get("payment_method") or "cash").casefold()
     is_credit = payment_method in ("credit", "credito", "crédito", "cartao", "cartão")
@@ -390,6 +472,7 @@ def calculate_free_balance(db: Session, context: UserAccessContext, args: dict) 
         "current_balance": _money(current_balance),
         "pending_transactions": _money(pending_transactions),
         "unresolved_recurring_commitments": _money(recurring_commitments),
+        "budget_remaining": _money(budget_remaining),
         "free_balance": _money(free_balance), "planned_spending": _money(planned_spending),
         "free_balance_after_planned_spending": _money(after_planned_spending),
         "can_afford": after_planned_spending >= 0,
@@ -401,7 +484,7 @@ def calculate_free_balance(db: Session, context: UserAccessContext, args: dict) 
         "can_close_month": projected_after_planned >= 0,
         "card_context": card_context,
         "definition": {
-            "cash": "saldo em conta agora menos despesas pendentes e recorrencias ainda nao resolvidas",
+            "cash": "saldo em conta agora menos despesas pendentes, recorrencias ainda nao resolvidas e reserva orcamentaria",
             "month_projection": "receitas confirmadas e previstas menos despesas confirmadas e previstas da competencia",
         },
         "warning": "Nao inclui transacoes ainda nao cadastradas nem compromissos fora do VitoriaFinance.",
@@ -906,6 +989,28 @@ def cancel_pending_action(db: Session, context: UserAccessContext, args: dict) -
     return {"cancelled": True}
 
 
+def _draft_budget_impact(db: Session, context: UserAccessContext, draft) -> dict | None:
+    if not draft or not draft.category_id:
+        return None
+    year, month = draft.transaction_date.year, draft.transaction_date.month
+    if draft.payment_method == "Crédito" and draft.card_id:
+        year, month = card_purchase_competence(db, draft.card, draft.transaction_date)
+    positions = monthly_budget_positions(
+        db, workspace_ids=context.workspace_ids, person_ids=(draft.person_id,),
+        year=year, month=month, category_id=draft.category_id,
+    )
+    if not positions:
+        return None
+    position = positions[0]
+    return {
+        "area": draft.person.name,
+        "category": (f"{draft.category.parent_name} > {draft.category.name}"
+                     if draft.category.parent_name else draft.category.name),
+        "competence": f"{year:04d}-{month:02d}",
+        **position.impact(Decimal(draft.amount)),
+    }
+
+
 def prepare_expense(db: Session, context: UserAccessContext, args: dict) -> dict:
     if not context.can_write:
         raise ToolError("Usuario sem permissao para registrar despesas")
@@ -933,7 +1038,7 @@ def prepare_expense(db: Session, context: UserAccessContext, args: dict) -> dict
         )
     return {"status": "missing_information" if missing else "awaiting_confirmation",
             "missing_fields": missing, "category_options": category_options,
-            "summary": format_draft(draft)}
+            "summary": format_draft(draft), "budget_impact": _draft_budget_impact(db, context, draft)}
 
 
 def prepare_expenses(db: Session, context: UserAccessContext, args: dict) -> dict:
@@ -996,7 +1101,7 @@ def update_expense(db: Session, context: UserAccessContext, args: dict) -> dict:
         raise ToolError("Nao ha despesa aguardando confirmacao")
     return {"status": "missing_information" if missing else "awaiting_confirmation",
             "missing_fields": missing, "category_options": category_options,
-            "summary": format_draft(draft)}
+            "summary": format_draft(draft), "budget_impact": _draft_budget_impact(db, context, draft)}
 
 
 def recommend_expense_category(db: Session, context: UserAccessContext, args: dict) -> dict:
@@ -1048,6 +1153,8 @@ TOOLS = {
     "consultar_receitas": lambda db, context, args: query_transactions(db, context, args, TransactionType.income),
     "consultar_despesas": lambda db, context, args: query_transactions(db, context, args, TransactionType.expense),
     "consultar_resumo_mensal": monthly_summary,
+    "consultar_orcamentos": query_budgets,
+    "consultar_orcamento_categoria": query_category_budget,
     "consultar_saldo_livre": calculate_free_balance,
     "consultar_financiamentos": list_financings,
     "preparar_receita": prepare_income,

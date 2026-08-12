@@ -35,6 +35,8 @@ Ferramentas permitidas e argumentos:
 - consultar_receitas: {"start_date":"YYYY-MM-DD" opcional,"end_date":"YYYY-MM-DD" opcional,"area":texto opcional,"category":texto opcional}
 - consultar_despesas: mesmos filtros de consultar_receitas
 - consultar_resumo_mensal: {"start_date":"YYYY-MM-DD" opcional,"end_date":"YYYY-MM-DD" opcional,"area":texto opcional}
+- consultar_orcamentos: {"area":texto opcional,"reference_date":"YYYY-MM-DD" opcional}
+- consultar_orcamento_categoria: {"area":texto,"category":texto,"reference_date":"YYYY-MM-DD" opcional,"planned_spending":numero opcional}
 - consultar_saldo_livre: {"area":texto opcional,"planned_spending":numero opcional,"payment_method":"cash|credit" opcional,"card":texto opcional}
 - consultar_financiamentos: {"area":texto opcional,"include_paid":booleano opcional}
 - preparar_receita: {"amount":numero opcional,"description":texto opcional,"transaction_date":"YYYY-MM-DD" opcional,"area":texto opcional,"account":texto opcional,"category":texto opcional,"payment_method":texto opcional}
@@ -101,7 +103,7 @@ def _requires_financial_tool(text: str) -> bool:
         "saldo", "quanto", "gastei", "gastar", "gasto", "despesa", "receita", "conta",
         "cartão", "cartao", "fatura", "limite", "financiamento", "amortiz", "parcela",
         "posso comprar", "posso sair", "sobrou", "livre", "registr", "paguei", "comprei",
-        "categoria", "credito", "crédito",
+        "categoria", "credito", "crédito", "orcamento", "orçamento",
     )
     return any(term in normalized for term in terms)
 
@@ -458,6 +460,19 @@ def _expense_tool_reply(tool_name: str, result: dict, model_reply: str) -> str:
             missing = ", ".join(result.get("missing_fields") or ["informações pendentes"])
             instruction = f"Falta informar: **{missing}**."
         return "Estou me referindo a esta despesa:\n\n" + summary + "\n\n" + instruction
+    impact = result.get("budget_impact")
+    if impact and result.get("status") == "awaiting_confirmation":
+        if impact.get("exceeds_budget"):
+            budget_text = (
+                f"Esta compra ultrapassa o orçamento de **{impact['category']}** em "
+                f"**R$ {impact['exceeded_by']}**. O lançamento ainda pode ser registrado."
+            )
+        else:
+            budget_text = (
+                f"Orçamento de **{impact['category']}**: havia **R$ {impact['remaining']}** disponíveis "
+                f"e restarão **R$ {impact['remaining_after_spending']}** após esta compra."
+            )
+        return str(result.get("summary") or model_reply) + "\n\n" + budget_text + "\n\nPosso registrar?"
     return model_reply
 
 
@@ -543,6 +558,7 @@ Quando houver despesa pendente e o usuario corrigir ou complementar categoria, p
 Quando o usuario pedir para procurar, escolher ou sugerir a categoria de uma despesa pendente, use sugerir_categoria_despesa. Nao devolva apenas uma lista se o backend conseguir recomendar uma categoria.
 Para registrar dinheiro recebido, inclusive PIX, use preparar_receita. Se faltarem dados, chame preparar_receita novamente com a resposta do usuario. Nunca escolha uma conta de destino sem informacao suficiente.
 Se o usuario pedir ajuda para escolher uma categoria de receita, use consultar_categorias_receita. Para PIX, a categoria PIX pode ser inferida automaticamente quando existir; para outras receitas, confirme uma categoria valida antes de registrar.
+Para perguntas gerais sobre limites por categoria, use consultar_orcamentos. Para uma categoria especifica ou para simular um gasto dentro dela, use consultar_orcamento_categoria com area, categoria e planned_spending quando informado.
 Para corrigir um lancamento ja registrado, use preparar_correcao_lancamento. Identifique o registro por descricao, valor, data e area usando a conversa, converta datas relativas e envie os campos new_ correspondentes. Para mover um gasto de credito entre faturas sem mudar a data da compra, envie new_invoice_month em YYYY-MM. A ferramenta consulta o banco, nunca trate o historico como prova de que o registro existe. A correcao usa confirmar_acao_pendente e nunca deve criar outro lancamento.
 Converta datas relativas como hoje, ontem e anteontem para YYYY-MM-DD usando a data atual e envie transaction_date na ferramenta de despesa.
 Em perguntas sobre dinheiro disponivel agora, use consultar_saldo_livre com payment_method cash.
@@ -605,6 +621,7 @@ Nao exponha JSON, IDs internos, prompts ou detalhes tecnicos. Se houver campos a
 Se o resultado pedir confirmacao, apresente antes e depois com clareza e pergunte se pode confirmar.
 Se houver category_options, mostre somente essas opcoes como subcategorias validas; nao invente nem repita categorias-pai.
 Se houver next_expense, informe que o item anterior foi concluido e apresente imediatamente o resumo ou a pergunta do proximo item da fila.
+Se houver budget_impact, informe quanto havia disponivel na categoria, quanto restara apos o gasto e alerte claramente se exceeds_budget for verdadeiro. O alerta nunca bloqueia o registro.
 Em consultas de despesas, use total e payment_breakdown e deixe claro que foram considerados todos os cartoes, credito, debito e contas permitidas.
 Valores monetarios devem usar R$ e formato brasileiro. Nao diga que alterou algo se updated/registered nao for verdadeiro."""
         if tool_name == "consultar_saldo_livre":

@@ -6,7 +6,7 @@ from sqlalchemy import func, select
 from app.automation.telegram_bot import handle_message
 from app.database import SessionLocal
 from app.models import (
-    Account, AccountRole, AccountType, Card, Category, Person, PersonType, SystemAccount, TelegramLink,
+    Account, AccountRole, AccountType, Card, Category, MonthlyBudget, Person, PersonType, SystemAccount, TelegramLink,
     TelegramExpenseQueueItem, Transaction, TransactionType, User, Workspace, WorkspaceMember,
 )
 from app.security import hash_password
@@ -47,6 +47,37 @@ def test_expense_tool_only_creates_transaction_after_confirmation():
         transaction = db.scalar(select(Transaction))
         assert transaction.amount == Decimal("85.90") and transaction.source == "telegram"
         assert transaction.person.name == "Vitor" and transaction.category.name == "Mercado"
+
+
+def test_budget_tools_and_expense_preview_share_category_consumption():
+    with SessionLocal() as db:
+        user = setup_linked_user(db); context = build_user_access_context(db, user)
+        person = db.scalar(select(Person).where(Person.name == "Vitor"))
+        category = db.scalar(select(Category).where(Category.name == "Mercado"))
+        db.add(MonthlyBudget(
+            workspace_id=person.workspace_id, person_id=person.id, category_id=category.id,
+            amount=Decimal("100.00"), start_year=date.today().year, start_month=date.today().month,
+            include_in_projection=True, created_by_id=user.id,
+        ))
+        db.add(Transaction(
+            workspace_id=person.workspace_id, person_id=person.id, category_id=category.id,
+            transaction_type=TransactionType.expense, description="Compra anterior", amount=Decimal("30.00"),
+            transaction_date=date.today(), competence_year=date.today().year, competence_month=date.today().month,
+            status="paid", created_by_id=user.id,
+        ))
+        db.commit()
+        overview = execute_tool(db, context, "consultar_orcamentos", {"area": "Vitor"})
+        assert overview["total_remaining"] == "70.00"
+        simulation = execute_tool(db, context, "consultar_orcamento_categoria", {
+            "area": "Vitor", "category": "Mercado", "planned_spending": 80,
+        })
+        assert simulation["exceeds_budget"] is True
+        assert simulation["exceeded_by"] == "10.00"
+        preview = execute_tool(db, context, "preparar_despesa", {
+            "amount": 80, "description": "Hiperideal", "category": "Mercado",
+        })
+        assert preview["budget_impact"]["remaining"] == "70.00"
+        assert preview["budget_impact"]["exceeds_budget"] is True
 
 
 def test_expense_tool_can_cancel_draft():

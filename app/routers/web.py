@@ -26,6 +26,7 @@ from app.security import hash_password, verify_password
 from app.services.card_billing import (
     card_invoice_is_closed, card_purchase_competence, shift_month as shift_competence_month,
 )
+from app.services.monthly_projection import monthly_budget_positions, projection_budget_remaining
 from app.services.telegram_auth import PAIRING_TTL_MINUTES, create_pairing_code, unlink_telegram
 from scripts.seed import seed_categories
 
@@ -245,28 +246,15 @@ def dashboard(request: Request, area_id: str | None = None,
         (Transaction.transaction_type == TransactionType.expense, -Transaction.amount), else_=0,
     )), 0)).where(Transaction.workspace_id == wid, area_condition, Transaction.status == TransactionStatus.paid))
     balance = Decimal(account_initial) + Decimal(paid_flow)
-    budget_query = select(MonthlyBudget).where(
-        MonthlyBudget.workspace_id == wid, MonthlyBudget.is_active.is_(True),
-        (MonthlyBudget.start_year < today.year) | (
-            (MonthlyBudget.start_year == today.year) & (MonthlyBudget.start_month <= today.month)
-        ),
+    budget_person_ids = (area_id,) if area_id else tuple(allowed_ids)
+    budget_positions = monthly_budget_positions(
+        db, workspace_ids=(wid,), person_ids=budget_person_ids,
+        year=today.year, month=today.month,
     )
-    if area_id:
-        budget_query = budget_query.where(MonthlyBudget.person_id == area_id)
-    elif allowed is not None:
-        budget_query = budget_query.where(MonthlyBudget.person_id.in_(allowed_ids))
-    budgets = db.scalars(budget_query).all()
-    budget_total = sum((Decimal(budget.amount) for budget in budgets), Decimal(0))
-    budget_spent = Decimal(0)
-    budget_remaining = Decimal(0)
-    for budget in budgets:
-        spent = sum((Decimal(item.amount) for item in month_items if (
-            item.transaction_type == TransactionType.expense
-            and item.person_id == budget.person_id and item.category_id == budget.category_id
-        )), Decimal(0))
-        budget_spent += min(spent, Decimal(budget.amount))
-        if budget.include_in_projection:
-            budget_remaining += max(Decimal(budget.amount) - spent, Decimal(0))
+    budget_total = sum((Decimal(position.budget.amount) for position in budget_positions), Decimal(0))
+    budget_spent = sum((min(position.spent, Decimal(position.budget.amount))
+                        for position in budget_positions), Decimal(0))
+    budget_remaining = projection_budget_remaining(budget_positions)
     projected_balance = balance + income_pending - expense_pending - budget_remaining
     recent = db.scalars(select(Transaction).where(
         Transaction.workspace_id == wid, area_condition, Transaction.status != TransactionStatus.cancelled,
@@ -1179,15 +1167,9 @@ def family_view(request: Request, year: int | None = None, month: int | None = N
         (Decimal(item.amount) if item.transaction_type == TransactionType.income else -Decimal(item.amount)
          if item.transaction_type == TransactionType.expense else Decimal(0)) for item in before_year_items
     )
-    budget_query = select(MonthlyBudget).where(
-        MonthlyBudget.workspace_id == wid, MonthlyBudget.is_active.is_(True),
-        (MonthlyBudget.start_year < selected_year) | (
-            (MonthlyBudget.start_year == selected_year) & (MonthlyBudget.start_month <= 12)
-        ),
-    )
-    if allowed is not None:
-        budget_query = budget_query.where(MonthlyBudget.person_id.in_(allowed))
-    yearly_budgets = db.scalars(budget_query.order_by(MonthlyBudget.person_id, MonthlyBudget.category_id)).all()
+    budget_person_ids = tuple(allowed) if allowed is not None else tuple(db.scalars(
+        select(Person.id).where(Person.workspace_id == wid, Person.is_active.is_(True))
+    ).all())
     projected_opening_balance = year_opening_balance
     for summary in months:
         summary["realized"] = summary["income_paid"] - summary["expense_paid"]
@@ -1196,18 +1178,11 @@ def family_view(request: Request, year: int | None = None, month: int | None = N
             - summary["expense_paid"] - summary["expense_pending"]
         )
         summary["opening_balance"] = projected_opening_balance
-        eligible_budgets = [budget for budget in yearly_budgets if
-                            (budget.start_year, budget.start_month) <= (selected_year, summary["number"])]
-        budget_projection_remaining = Decimal(0)
-        for budget in eligible_budgets:
-            spent = sum((Decimal(item.amount) for item in items if (
-                (item.competence_month or item.transaction_date.month) == summary["number"]
-                and item.transaction_type == TransactionType.expense
-                and item.status in (TransactionStatus.paid, TransactionStatus.pending)
-                and item.person_id == budget.person_id and item.category_id == budget.category_id
-            )), Decimal(0))
-            if budget.include_in_projection:
-                budget_projection_remaining += max(Decimal(budget.amount) - spent, Decimal(0))
+        positions = monthly_budget_positions(
+            db, workspace_ids=(wid,), person_ids=budget_person_ids,
+            year=selected_year, month=summary["number"],
+        )
+        budget_projection_remaining = projection_budget_remaining(positions)
         summary["budget_projection_remaining"] = budget_projection_remaining
         summary["projected_balance"] = (
             projected_opening_balance + summary["projected"] - budget_projection_remaining
@@ -1233,11 +1208,13 @@ def family_view(request: Request, year: int | None = None, month: int | None = N
     selected_summary["closing_balance"] = opening_balance + selected_summary["realized"]
     income_items = [item for item in selected_items if item.transaction_type == TransactionType.income]
     expense_items = [item for item in selected_items if item.transaction_type == TransactionType.expense and not item.card_id]
-    monthly_budgets = [budget for budget in yearly_budgets if
-                       (budget.start_year, budget.start_month) <= (selected_year, selected_month)]
+    selected_budget_positions = monthly_budget_positions(
+        db, workspace_ids=(wid,), person_ids=budget_person_ids,
+        year=selected_year, month=selected_month,
+    )
     budget_rows = []
-    budget_projection_remaining = Decimal(0)
-    for budget in monthly_budgets:
+    for position in selected_budget_positions:
+        budget = position.budget
         related = [item for item in selected_items if (
             item.transaction_type == TransactionType.expense
             and item.person_id == budget.person_id
@@ -1245,7 +1222,7 @@ def family_view(request: Request, year: int | None = None, month: int | None = N
         )]
         paid = sum((Decimal(item.amount) for item in related if item.status == TransactionStatus.paid), Decimal(0))
         pending = sum((Decimal(item.amount) for item in related if item.status == TransactionStatus.pending), Decimal(0))
-        spent = paid + pending
+        spent = position.spent
         amount = Decimal(budget.amount)
         budget_rows.append({
             "budget": budget, "planned": amount, "paid": paid, "pending": pending,
@@ -1253,9 +1230,7 @@ def family_view(request: Request, year: int | None = None, month: int | None = N
             "percent": min(100, int((spent / amount) * 100)) if amount else 0,
             "exceeded": spent > amount,
         })
-        if budget.include_in_projection:
-            budget_projection_remaining += max(amount - spent, Decimal(0))
-    selected_summary["budget_projection_remaining"] = budget_projection_remaining
+    selected_summary["budget_projection_remaining"] = projection_budget_remaining(selected_budget_positions)
     card_groups_map = {}
     for item in selected_items:
         if item.transaction_type != TransactionType.expense or not item.card:
