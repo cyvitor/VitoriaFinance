@@ -111,6 +111,28 @@ def test_expense_draft_persists_category_and_credit_card_before_confirmation():
         assert transaction.account_id == account.id and str(transaction.status) == "TransactionStatus.pending"
 
 
+def test_pending_expense_description_and_category_are_updated_together():
+    with SessionLocal() as db:
+        user = setup_linked_user(db); context = build_user_access_context(db, user)
+        person = db.get(Person, user.default_person_id)
+        uber = Category(workspace_id=person.workspace_id, name="Uber", parent_name="Transporte",
+                        kind=TransactionType.expense)
+        db.add(uber); db.commit()
+        execute_tool(db, context, "preparar_despesa", {
+            "amount": 12.94, "description": "Ubee", "transaction_date": "2026-08-21",
+        })
+        updated = execute_tool(db, context, "atualizar_despesa", {
+            "description": "uber tia", "category": "Uber",
+        })
+        assert updated["status"] == "awaiting_confirmation"
+        assert "Descricao: uber tia" in updated["summary"]
+        assert "Categoria: Transporte > Uber" in updated["summary"]
+        execute_tool(db, context, "confirmar_despesa", {})
+        transaction = db.scalar(select(Transaction))
+        assert transaction.description == "uber tia"
+        assert transaction.category.name == "Uber"
+
+
 def test_parent_category_returns_real_subcategories_and_preserves_relative_date():
     with SessionLocal() as db:
         user = setup_linked_user(db); context = build_user_access_context(db, user)

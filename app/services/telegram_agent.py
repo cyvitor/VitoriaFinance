@@ -46,7 +46,7 @@ Ferramentas permitidas e argumentos:
 - cancelar_acao_pendente: {}
 - preparar_despesa: {"amount":numero,"description":texto,"transaction_date":"YYYY-MM-DD" opcional,"category":texto opcional,"payment_method":"cash|credit" opcional,"card":texto opcional}
 - preparar_despesas: {"expenses":[objetos com os mesmos campos de preparar_despesa, um para cada gasto]}
-- atualizar_despesa: {"transaction_date":"YYYY-MM-DD" opcional,"category":texto opcional,"payment_method":"cash|credit" opcional,"card":texto opcional}
+- atualizar_despesa: {"description":texto opcional,"transaction_date":"YYYY-MM-DD" opcional,"category":texto opcional,"payment_method":"cash|credit" opcional,"card":texto opcional}
 - sugerir_categoria_despesa: {}
 - confirmar_despesa: {}
 - cancelar_despesa: {}
@@ -201,6 +201,35 @@ def _enforce_balance_intent(text: str, history: list[dict], decision: dict) -> d
     return corrected
 
 
+def _asks_spending_feasibility(text: str) -> bool:
+    normalized = _normalized_text(text)
+    return any(term in normalized for term in (
+        "posso sair", "da para sair", "da pra sair", "consigo sair",
+        "posso tomar", "da para tomar", "da pra tomar",
+    ))
+
+
+def _enforce_spending_feasibility_intent(text: str, history: list[dict], decision: dict) -> dict:
+    """Usa a projecao completa quando o usuario pergunta se pode fazer um gasto de lazer."""
+    if not _asks_spending_feasibility(text):
+        return decision
+    arguments = dict(decision.get("arguments") or {})
+    # Filtros proprios de outras consultas nao pertencem a consultar_saldo_livre.
+    arguments = {key: value for key, value in arguments.items() if key in ("area", "card")}
+    normalized = _normalized_text(text)
+    if "credito" in normalized or "cartao" in normalized:
+        arguments["payment_method"] = "credit"
+    # "Posso sair?" inicia uma nova simulacao: nao reutilize valores de lancamentos antigos.
+    planned_spending = _planned_spending_from_messages(text, [])
+    if planned_spending is not None:
+        arguments["planned_spending"] = float(planned_spending)
+    corrected = {"action": "tool", "tool": "consultar_saldo_livre", "arguments": arguments}
+    if corrected != decision:
+        logger.info("agent_decision_corrected reason=spending_feasibility original=%s corrected=%s",
+                    decision, corrected)
+    return corrected
+
+
 def _enforce_transaction_period_intent(text: str, decision: dict, reference_date: date | None = None) -> dict:
     if decision.get("action") != "tool" or decision.get("tool") not in (
         "consultar_despesas", "consultar_receitas",
@@ -268,6 +297,33 @@ def _enforce_pending_expense_intent(text: str, has_draft: bool, decision: dict) 
     corrected = {"action": "tool", "tool": "atualizar_despesa",
                  "arguments": dict(decision.get("arguments") or {})}
     logger.info("agent_decision_corrected reason=pending_expense_update original=%s corrected=%s", decision, corrected)
+    return corrected
+
+
+def _enforce_pending_description_intent(text: str, has_draft: bool, decision: dict) -> dict:
+    """Preserva correcoes explicitas de descricao mesmo quando o modelo extrai apenas a categoria."""
+    if not has_draft:
+        return decision
+    normalized = _normalized_text(text)
+    if "descri" not in normalized:
+        return decision
+    match = re.search(
+        r"(?:coloque|colocar|mude|mudar|altere|alterar|corrija|corrigir)\s+"
+        r"(?:(?:a|na)\s+)?descri(?:cao|ção)\s*(?:para|:)?\s*(.+?)"
+        r"(?=\s*[,;]\s*(?:e\s+)?categoria\b|$)",
+        text, re.IGNORECASE,
+    )
+    if not match:
+        return decision
+    description = " ".join(match.group(1).strip(" .,:;-\t").split())
+    if not description:
+        return decision
+    arguments = dict(decision.get("arguments") or {})
+    arguments["description"] = description[:180]
+    corrected = {"action": "tool", "tool": "atualizar_despesa", "arguments": arguments}
+    if corrected != decision:
+        logger.info("agent_decision_corrected reason=pending_expense_description original=%s corrected=%s",
+                    decision, corrected)
     return corrected
 
 
@@ -399,6 +455,31 @@ def _pending_context(db: Session, user: User) -> str:
     return "\n".join(parts) or "Nenhuma acao pendente."
 
 
+def _format_brl(value) -> str:
+    try:
+        formatted = f"{Decimal(str(value)):,.2f}"
+    except (InvalidOperation, TypeError, ValueError):
+        formatted = "0.00"
+    return "R$ " + formatted.replace(",", "_").replace(".", ",").replace("_", ".")
+
+
+def _balance_snapshot_reply(result: dict, *, ask_for_details: bool = False) -> str:
+    current = _format_brl(result.get("current_balance"))
+    free = _format_brl(result.get("free_balance"))
+    projection = _format_brl(result.get("projected_month_result"))
+    reply = (
+        f"Hoje você tem **{current}** nas contas e **{free}** de saldo livre, depois de considerar "
+        "despesas pendentes, compromissos recorrentes e a reserva dos orçamentos. "
+        f"A projeção para fechar o mês está em **{projection}**."
+    )
+    if ask_for_details:
+        reply += (
+            "\n\nPara eu dizer se a saída cabe com segurança, informe aproximadamente quanto pretende "
+            "gastar e se será no crédito ou usando o saldo em conta."
+        )
+    return reply
+
+
 def _fallback_tool_reply(tool_name: str, result: dict) -> str:
     if result.get("transaction_updated"):
         invoice = f", fatura {result['invoice_month']}" if result.get("invoice_month") else ""
@@ -423,6 +504,23 @@ def _fallback_tool_reply(tool_name: str, result: dict) -> str:
                 result["next_expense"].get("summary") or ""
             )
         return reply
+    if tool_name == "consultar_saldo_livre" and "free_balance" in result:
+        planned = Decimal(str(result.get("planned_spending") or 0))
+        if planned == 0:
+            return _balance_snapshot_reply(result, ask_for_details=True)
+        if result.get("payment_method") == "credit":
+            after = _format_brl(result.get("projected_month_result_after_planned_spending"))
+            verdict = "cabe" if result.get("can_close_month") else "não cabe"
+            return f"Considerando o crédito, esse gasto **{verdict}** na projeção do mês, que ficaria em **{after}**."
+        after = _format_brl(result.get("free_balance_after_planned_spending"))
+        verdict = "cabe" if result.get("can_afford") else "não cabe"
+        return f"Usando o saldo em conta, esse gasto **{verdict}**; o saldo livre ficaria em **{after}**."
+    if tool_name == "consultar_resumo_mensal" and "free_result" in result:
+        return (
+            f"No período consultado, as receitas foram **{_format_brl(result.get('income'))}**, "
+            f"as despesas **{_format_brl(result.get('expense'))}** e o resultado foi "
+            f"**{_format_brl(result.get('free_result'))}**."
+        )
     if "error" in result:
         return str(result["error"])
     return "A consulta foi executada, mas nao consegui formatar a resposta agora. Tente novamente em instantes."
@@ -554,7 +652,7 @@ O historico da conversa nao prova que um lancamento ainda existe, pois ele pode 
 Nunca afirme que uma despesa ja esta registrada ou que um dado financeiro esta atualizado usando apenas historico ou memoria; use a ferramenta adequada e considere o banco como fonte da verdade.
 Quando houver acao aguardando confirmacao, interprete confirmacao ou cancelamento natural e escolha a ferramenta correta.
 Uma confirmacao de despesa usa confirmar_despesa; receita e amortizacao usam confirmar_acao_pendente.
-Quando houver despesa pendente e o usuario corrigir ou complementar categoria, pagamento ou cartao, use atualizar_despesa. Nunca apenas diga que atualizou.
+Quando houver despesa pendente e o usuario corrigir ou complementar descricao, categoria, pagamento ou cartao, use atualizar_despesa e envie todos os campos informados. Nunca apenas diga que atualizou.
 Quando o usuario pedir para procurar, escolher ou sugerir a categoria de uma despesa pendente, use sugerir_categoria_despesa. Nao devolva apenas uma lista se o backend conseguir recomendar uma categoria.
 Para registrar dinheiro recebido, inclusive PIX, use preparar_receita. Se faltarem dados, chame preparar_receita novamente com a resposta do usuario. Nunca escolha uma conta de destino sem informacao suficiente.
 Se o usuario pedir ajuda para escolher uma categoria de receita, use consultar_categorias_receita. Para PIX, a categoria PIX pode ser inferida automaticamente quando existir; para outras receitas, confirme uma categoria valida antes de registrar.
@@ -588,8 +686,10 @@ Retorne SOMENTE JSON valido em um destes formatos:
     if decision is undecided:
         decision = _select_decision(token, model, selector_messages, text)
     decision = _enforce_pending_expense_intent(text, has_expense_draft, decision)
+    decision = _enforce_pending_description_intent(text, has_expense_draft, decision)
     decision = _enforce_expense_reference_date(decision, reference_date)
     decision = _enforce_balance_intent(text, history, decision)
+    decision = _enforce_spending_feasibility_intent(text, history, decision)
     decision = _enforce_transaction_period_intent(text, decision, reference_date)
     db.add(TelegramConversationMessage(user_id=user.id, role="user", content=text[:4000]))
     if decision.get("action") == "respond":
@@ -630,13 +730,25 @@ Distinga obrigatoriamente saldo disponivel em conta agora de resultado projetado
 Para pagamento em dinheiro, responda com free_balance e free_balance_after_planned_spending.
 Para credito, avalie projected_month_result_after_planned_spending e explique em qual competencia a compra entra.
 Se card_selection_required for verdadeiro, pergunte qual cartao sera usado antes de concluir."""
-        result_message = json.dumps({"tool": tool_name, "result": result}, ensure_ascii=False)
+        synthesis_system += """
+Responda a todas as partes da pergunta original. Se o usuario perguntou se pode gastar ou sair, dê uma
+orientacao pratica com base nos dados. Sem valor ou forma de pagamento, nao dê uma aprovacao definitiva:
+apresente o saldo livre e a projecao mensal e pergunte o valor aproximado e como pretende pagar."""
+        result_message = json.dumps(
+            {"user_question": text, "tool": tool_name, "result": result}, ensure_ascii=False,
+        )
         try:
             reply = _complete(token, model, [{"role": "system", "content": synthesis_system},
                                              {"role": "user", "content": result_message}], 600).strip()[:4000]
+            if not reply:
+                reply = _fallback_tool_reply(tool_name, result)
         except AIUnavailableError:
             reply = _fallback_tool_reply(tool_name, result)
         reply = _expense_tool_reply(tool_name, result, reply)[:4000]
+        if (tool_name == "consultar_saldo_livre" and "error" not in result
+                and "free_balance" in result and _asks_spending_feasibility(text)
+                and Decimal(str(result.get("planned_spending") or 0)) == 0):
+            reply = _balance_snapshot_reply(result, ask_for_details=True)[:4000]
     else:
         raise AIUnavailableError("O modelo nao selecionou uma acao valida")
     db.add(TelegramConversationMessage(user_id=user.id, role="assistant", content=reply))

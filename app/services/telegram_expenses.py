@@ -161,7 +161,8 @@ def _resolve_category(db: Session, workspace_id: int, value: str) -> tuple[Categ
     return None, [f"{category.parent_name} > {category.name}" for category in matches[:12]]
 
 
-def update_expense_draft(db: Session, user: User, *, category: str | None = None,
+def update_expense_draft(db: Session, user: User, *, description: str | None = None,
+                         category: str | None = None,
                          payment_method: str | None = None, card: str | None = None,
                          transaction_date: date | None = None) -> tuple[TelegramExpenseDraft | None, list[str], list[str]]:
     draft = get_active_draft(db, user.id)
@@ -169,6 +170,12 @@ def update_expense_draft(db: Session, user: User, *, category: str | None = None
         return None, [], []
     missing = []
     category_options = []
+    if description is not None:
+        normalized_description = " ".join(str(description).split())
+        if normalized_description:
+            draft.description = normalized_description[:180]
+        else:
+            missing.append("descricao valida")
     if category:
         resolved_category, category_options = _resolve_category(db, draft.workspace_id, category)
         if not resolved_category:

@@ -16,8 +16,10 @@ from app.services.financial_tools import ToolError, execute_tool
 from app.services.telegram_agent import (
     _ai_category_recommendation, _enforce_balance_intent, _enforce_category_recommendation_intent,
     _enforce_expense_reference_date, _enforce_pending_confirmation_intent,
-    _enforce_pending_expense_intent, _expense_tool_reply, _requires_financial_tool,
-    _enforce_transaction_period_intent, _looks_like_multiple_expenses, run_financial_agent,
+    _enforce_pending_description_intent, _enforce_pending_expense_intent,
+    _expense_tool_reply, _requires_financial_tool,
+    _enforce_spending_feasibility_intent, _enforce_transaction_period_intent,
+    _fallback_tool_reply, _looks_like_multiple_expenses, run_financial_agent,
 )
 from app.services.telegram_ai import AIUnavailableError
 from app.services.user_memory import relevant_memories
@@ -338,6 +340,58 @@ def test_credit_spending_and_month_close_are_forced_to_projection():
     assert card_list["tool"] == "consultar_cartoes"
 
 
+def test_going_out_question_uses_full_financial_projection_without_inventing_amount():
+    decision = _enforce_spending_feasibility_intent(
+        "Como está meu mês financeiro? Sextou amanhã, posso sair pra tomar uma?",
+        [{"role": "user", "content": "Ontem gastei 80 no mercado"}],
+        {"action": "tool", "tool": "consultar_resumo_mensal",
+         "arguments": {"start_date": "2026-08-01", "end_date": "2026-08-31"}},
+    )
+    assert decision == {"action": "tool", "tool": "consultar_saldo_livre", "arguments": {}}
+
+
+def test_balance_fallback_answers_query_instead_of_returning_format_error():
+    reply = _fallback_tool_reply("consultar_saldo_livre", {
+        "current_balance": "500.00", "free_balance": "120.00",
+        "projected_month_result": "739.77", "planned_spending": "0.00",
+    })
+    assert "R$ 120,00" in reply
+    assert "R$ 739,77" in reply
+    assert "quanto pretende gastar" in reply
+
+
+def test_going_out_answer_keeps_practical_question_even_when_model_only_summarizes(monkeypatch):
+    responses = iter([
+        json.dumps({"action": "tool", "tool": "consultar_resumo_mensal", "arguments": {}}),
+        "Receitas e despesas consultadas.",
+    ])
+    called = {}
+
+    def execute(_db, _context, tool, arguments):
+        called.update(tool=tool, arguments=arguments)
+        return {
+            "current_balance": "500.00", "free_balance": "120.00",
+            "projected_month_result": "739.77", "planned_spending": "0.00",
+            "payment_method": "cash",
+        }
+
+    monkeypatch.setattr("app.services.telegram_agent._complete", lambda *args, **kwargs: next(responses))
+    monkeypatch.setattr("app.services.telegram_agent.execute_tool", execute)
+    monkeypatch.setattr("app.services.telegram_agent._extract_memories", lambda *args: None)
+    with SessionLocal() as db:
+        user, financing, hidden, rule = setup_financings(db)
+        db.add_all([SystemSetting(key="deepinfra_api_key", value="secret", is_secret=True),
+                    SystemSetting(key="deepinfra_model", value="deepseek")])
+        db.commit()
+        reply = run_financial_agent(
+            db, user, "Como está meu mês financeiro? Sextou amanhã, posso sair pra tomar uma?",
+            reference_date=date(2026, 8, 20),
+        )
+    assert called == {"tool": "consultar_saldo_livre", "arguments": {}}
+    assert "R$ 120,00" in reply and "R$ 739,77" in reply
+    assert "quanto pretende gastar" in reply
+
+
 def test_expense_typo_with_financial_context_still_requires_tool():
     assert _requires_financial_tool("gatei 5 no credito c6 na doce pão") is True
     assert _requires_financial_tool(
@@ -369,6 +423,17 @@ def test_category_reply_updates_existing_expense_instead_of_recreating_it():
     corrected = _enforce_pending_expense_intent("Jogos", True, decision)
     assert corrected["tool"] == "atualizar_despesa"
     assert corrected["arguments"]["category"] == "Jogos"
+
+
+def test_explicit_pending_description_is_kept_with_category_update():
+    corrected = _enforce_pending_description_intent(
+        "Colocar na descrição: uber tia, categoria uber", True,
+        {"action": "tool", "tool": "atualizar_despesa", "arguments": {"category": "Uber"}},
+    )
+    assert corrected == {
+        "action": "tool", "tool": "atualizar_despesa",
+        "arguments": {"category": "Uber", "description": "uber tia"},
+    }
 
 
 def test_category_help_and_message_date_are_enforced_without_model_guessing():
