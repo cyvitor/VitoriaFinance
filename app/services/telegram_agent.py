@@ -252,18 +252,56 @@ def _enforce_transaction_period_intent(text: str, decision: dict, reference_date
     return {**decision, "arguments": arguments}
 
 
-def _enforce_expense_reference_date(decision: dict, reference_date: date) -> dict:
+def _requested_transaction_date(text: str, reference_date: date) -> tuple[date | None, bool]:
+    """Retorna a data explicitamente pedida e se a mensagem possui intenção de data."""
+    normalized = _normalized_text(text)
+    if re.search(r"\b(anteontem)\b", normalized):
+        return reference_date - timedelta(days=2), True
+    if re.search(r"\b(ontem)\b", normalized):
+        return reference_date - timedelta(days=1), True
+    if re.search(r"\b(hoje|hj)\b", normalized):
+        return reference_date, True
+    iso = re.search(r"\b(20\d{2})-(\d{1,2})-(\d{1,2})\b", normalized)
+    numeric = re.search(r"\b(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?\b", normalized)
+    day_only = re.search(r"\bdia\s+(\d{1,2})\b", normalized)
+    try:
+        if iso:
+            return date(int(iso.group(1)), int(iso.group(2)), int(iso.group(3))), True
+        if numeric:
+            year = int(numeric.group(3)) if numeric.group(3) else reference_date.year
+            if year < 100:
+                year += 2000
+            return date(year, int(numeric.group(2)), int(numeric.group(1))), True
+        if day_only:
+            return date(reference_date.year, reference_date.month, int(day_only.group(1))), True
+    except ValueError:
+        # A ferramenta validará uma data que o modelo eventualmente tenha extraído.
+        return None, True
+    temporal_terms = (
+        "segunda", "terca", "quarta", "quinta", "sexta", "sabado", "domingo",
+        "semana passada", "mes passado",
+    )
+    return None, any(term in normalized for term in temporal_terms)
+
+
+def _enforce_expense_reference_date(decision: dict, reference_date: date, text: str = "") -> dict:
     if decision.get("action") != "tool":
         return decision
     tool_name = decision.get("tool")
     arguments = dict(decision.get("arguments") or {})
+    requested_date, has_explicit_date = _requested_transaction_date(text, reference_date)
     if tool_name in ("preparar_despesa", "preparar_receita"):
-        arguments.setdefault("transaction_date", reference_date.isoformat())
+        if requested_date:
+            arguments["transaction_date"] = requested_date.isoformat()
+        elif not has_explicit_date or not arguments.get("transaction_date"):
+            # Sem data na mensagem, nunca aceite uma data reaproveitada pelo modelo ou pelo histórico.
+            arguments["transaction_date"] = reference_date.isoformat()
     elif tool_name == "preparar_despesas":
         expenses = []
         for item in arguments.get("expenses") or []:
             normalized_item = dict(item)
-            normalized_item.setdefault("transaction_date", reference_date.isoformat())
+            if not has_explicit_date:
+                normalized_item["transaction_date"] = reference_date.isoformat()
             expenses.append(normalized_item)
         arguments["expenses"] = expenses
     else:
@@ -687,7 +725,7 @@ Retorne SOMENTE JSON valido em um destes formatos:
         decision = _select_decision(token, model, selector_messages, text)
     decision = _enforce_pending_expense_intent(text, has_expense_draft, decision)
     decision = _enforce_pending_description_intent(text, has_expense_draft, decision)
-    decision = _enforce_expense_reference_date(decision, reference_date)
+    decision = _enforce_expense_reference_date(decision, reference_date, text)
     decision = _enforce_balance_intent(text, history, decision)
     decision = _enforce_spending_feasibility_intent(text, history, decision)
     decision = _enforce_transaction_period_intent(text, decision, reference_date)

@@ -448,6 +448,43 @@ def test_category_help_and_message_date_are_enforced_without_model_guessing():
     assert dated["arguments"]["transaction_date"] == "2026-07-31"
 
 
+def test_model_cannot_reuse_old_date_when_expense_message_has_no_date():
+    dated = _enforce_expense_reference_date({
+        "action": "tool", "tool": "preparar_despesa",
+        "arguments": {
+            "amount": 105.07, "description": "Openia", "transaction_date": "2026-08-21",
+        },
+    }, date(2026, 8, 26), "105,07 openia")
+    assert dated["arguments"]["transaction_date"] == "2026-08-26"
+
+
+def test_explicit_expense_date_is_resolved_from_current_telegram_message():
+    yesterday = _enforce_expense_reference_date({
+        "action": "tool", "tool": "preparar_despesa",
+        "arguments": {"amount": 64.94, "description": "Hiperideal", "transaction_date": "2026-08-21"},
+    }, date(2026, 8, 27), "64,94 hiperideal ontem")
+    assert yesterday["arguments"]["transaction_date"] == "2026-08-26"
+
+    absolute = _enforce_expense_reference_date({
+        "action": "tool", "tool": "preparar_despesa",
+        "arguments": {"amount": 64.94, "description": "Hiperideal"},
+    }, date(2026, 8, 27), "64,94 hiperideal no dia 24/08")
+    assert absolute["arguments"]["transaction_date"] == "2026-08-24"
+
+
+def test_batch_without_dates_forces_message_date_for_every_expense():
+    dated = _enforce_expense_reference_date({
+        "action": "tool", "tool": "preparar_despesas",
+        "arguments": {"expenses": [
+            {"amount": 10, "description": "Primeiro", "transaction_date": "2026-08-21"},
+            {"amount": 20, "description": "Segundo", "transaction_date": "2026-08-20"},
+        ]},
+    }, date(2026, 8, 27), "10 no primeiro e 20 no segundo")
+    assert [item["transaction_date"] for item in dated["arguments"]["expenses"]] == [
+        "2026-08-27", "2026-08-27",
+    ]
+
+
 def test_ai_category_recommendation_is_restricted_to_valid_options(monkeypatch):
     monkeypatch.setattr("app.services.telegram_agent._complete", lambda *args, **kwargs: json.dumps({
         "category": "Alimentação > Delivery", "confidence": 0.91,
