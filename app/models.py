@@ -314,6 +314,24 @@ class MonthlyBudget(Base):
     category: Mapped[Category] = relationship()
 
 
+class MonthlyBudgetOccurrence(Base):
+    __tablename__ = "monthly_budget_occurrences"
+    __table_args__ = (UniqueConstraint("monthly_budget_id", "year", "month"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    monthly_budget_id: Mapped[int] = mapped_column(
+        ForeignKey("monthly_budgets.id", ondelete="CASCADE"), index=True
+    )
+    year: Mapped[int] = mapped_column(index=True)
+    month: Mapped[int] = mapped_column(index=True)
+    status: Mapped[str] = mapped_column(String(30), default="released")
+    released_amount: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
+    released_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    released_by_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    budget: Mapped[MonthlyBudget] = relationship()
+
+
 class RecurrenceRule(Base):
     __tablename__ = "recurrence_rules"
     id: Mapped[int] = mapped_column(primary_key=True)

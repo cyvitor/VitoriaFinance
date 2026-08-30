@@ -20,6 +20,7 @@ from app.models import (
     Account, AccountRole, AccountType, Card, CardBillingPeriod, Category, Person, PersonType, SystemAccount, SystemSetting,
     Transaction, TransactionStatus, TransactionType, User, UserPersonAccess, WorkspaceMember, TelegramLink,
     RecurrenceRule, RecurrenceOccurrence, AccountingPeriod, Financing, FinancingAmortization, MonthlyBudget,
+    MonthlyBudgetOccurrence,
     MemberRole, UserMemory, Workspace,
 )
 from app.security import hash_password, verify_password
@@ -989,6 +990,58 @@ def budget_delete(budget_id: int, request: Request, db: Session = Depends(get_db
     return redirect("/budgets")
 
 
+@router.post("/budgets/{budget_id}/month-release")
+def budget_month_release(budget_id: int, request: Request, year: int = Form(), month: int = Form(),
+                         db: Session = Depends(get_db), user: User = Depends(current_user)):
+    wid = current_workspace_id(request, user, db)
+    budget = db.scalar(select(MonthlyBudget).where(
+        MonthlyBudget.id == budget_id, MonthlyBudget.workspace_id == wid,
+    ))
+    if not budget or not 1 <= month <= 12:
+        raise HTTPException(404)
+    ensure_area_access(budget.person_id, user, wid, db)
+    positions = monthly_budget_positions(
+        db, workspace_ids=(wid,), person_ids=(budget.person_id,), year=year, month=month,
+        category_id=budget.category_id,
+    )
+    remaining = max(positions[0].remaining, Decimal(0)) if positions else Decimal(0)
+    occurrence = db.scalar(select(MonthlyBudgetOccurrence).where(
+        MonthlyBudgetOccurrence.monthly_budget_id == budget.id,
+        MonthlyBudgetOccurrence.year == year, MonthlyBudgetOccurrence.month == month,
+    ))
+    if not occurrence:
+        occurrence = MonthlyBudgetOccurrence(monthly_budget_id=budget.id, year=year, month=month)
+        db.add(occurrence)
+    occurrence.status = "released"
+    occurrence.released_amount = remaining
+    occurrence.released_at = datetime.utcnow()
+    occurrence.released_by_id = user.id
+    db.commit()
+    flash(request, f"Saldo restante de {budget.category.name} liberado somente neste mês.")
+    return redirect(f"/month?year={year}&month={month}")
+
+
+@router.post("/budgets/{budget_id}/month-reactivate")
+def budget_month_reactivate(budget_id: int, request: Request, year: int = Form(), month: int = Form(),
+                            db: Session = Depends(get_db), user: User = Depends(current_user)):
+    wid = current_workspace_id(request, user, db)
+    budget = db.scalar(select(MonthlyBudget).where(
+        MonthlyBudget.id == budget_id, MonthlyBudget.workspace_id == wid,
+    ))
+    if not budget or not 1 <= month <= 12:
+        raise HTTPException(404)
+    ensure_area_access(budget.person_id, user, wid, db)
+    occurrence = db.scalar(select(MonthlyBudgetOccurrence).where(
+        MonthlyBudgetOccurrence.monthly_budget_id == budget.id,
+        MonthlyBudgetOccurrence.year == year, MonthlyBudgetOccurrence.month == month,
+    ))
+    if occurrence:
+        db.delete(occurrence)
+        db.commit()
+    flash(request, f"Reserva de {budget.category.name} reativada neste mês.")
+    return redirect(f"/month?year={year}&month={month}")
+
+
 @router.post("/recurrences/{rule_id}/confirm")
 def recurring_income_confirm(rule_id: int, request: Request, year: int = Form(), month: int = Form(),
         confirmed_amount: Decimal = Form(), payment_source: str | None = Form(None),
@@ -1228,7 +1281,8 @@ def family_view(request: Request, year: int | None = None, month: int | None = N
             "budget": budget, "planned": amount, "paid": paid, "pending": pending,
             "spent": spent, "remaining": amount - spent,
             "percent": min(100, int((spent / amount) * 100)) if amount else 0,
-            "exceeded": spent > amount,
+            "exceeded": spent > amount, "released": position.is_released,
+            "released_amount": Decimal(position.occurrence.released_amount or 0) if position.occurrence else Decimal(0),
         })
     selected_summary["budget_projection_remaining"] = projection_budget_remaining(selected_budget_positions)
     card_groups_map = {}
@@ -1274,6 +1328,7 @@ def old_family_view():
 
 @router.post("/month/close")
 def close_month(request: Request, year: int = Form(), month: int = Form(),
+                release_budget_remaining: bool = Form(False),
                 db: Session = Depends(get_db), user: User = Depends(current_user)):
     wid = current_workspace_id(request, user, db)
     if not 1 <= month <= 12:
@@ -1287,6 +1342,24 @@ def close_month(request: Request, year: int = Form(), month: int = Form(),
     period.is_closed = True
     period.closed_at = datetime.utcnow()
     period.closed_by_id = user.id
+    if release_budget_remaining:
+        allowed = allowed_person_ids(user, db)
+        person_ids = tuple(allowed) if allowed is not None else tuple(db.scalars(
+            select(Person.id).where(Person.workspace_id == wid, Person.is_active.is_(True))
+        ).all())
+        positions = monthly_budget_positions(
+            db, workspace_ids=(wid,), person_ids=person_ids, year=year, month=month,
+        )
+        for position in positions:
+            if position.is_released or not position.budget.include_in_projection:
+                continue
+            remaining = max(position.remaining, Decimal(0))
+            if remaining:
+                db.add(MonthlyBudgetOccurrence(
+                    monthly_budget_id=position.budget.id, year=year, month=month,
+                    status="released", released_amount=remaining,
+                    released_at=datetime.utcnow(), released_by_id=user.id,
+                ))
     db.commit()
     flash(request, "Mês fechado. Novas confirmações devem usar o próximo período aberto.")
     return redirect(f"/month?year={year}&month={month}")

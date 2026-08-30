@@ -3,7 +3,7 @@ from decimal import Decimal
 
 from app.database import SessionLocal
 from sqlalchemy import func, select
-from app.models import Account, AccountRole, AccountType, Card, Category, Financing, FinancingAmortization, MonthlyBudget, Person, PersonType, SystemAccount, SystemSetting, User, Workspace, WorkspaceMember, MemberRole, RecurrenceRule, RecurrenceOccurrence, Transaction, TransactionStatus, TransactionType
+from app.models import Account, AccountRole, AccountType, Card, Category, Financing, FinancingAmortization, MonthlyBudget, MonthlyBudgetOccurrence, Person, PersonType, SystemAccount, SystemSetting, User, Workspace, WorkspaceMember, MemberRole, RecurrenceRule, RecurrenceOccurrence, Transaction, TransactionStatus, TransactionType
 from app.security import hash_password
 
 
@@ -137,6 +137,17 @@ def test_monthly_budget_is_consumed_by_paid_and_pending_expenses(client):
     assert "reserva orçamentária: R$ 55,00" in page.text
     # The month tab and the macro KPI use the same accumulated projected balance.
     assert page.text.count("R$ -100,00") >= 2
+    release = client.post(f"/budgets/{budget_id}/month-release", data={"year": "2026", "month": "7"},
+                          follow_redirects=False)
+    assert release.status_code == 303
+    released_page = client.get("/month?year=2026&month=7")
+    assert "encerrado neste mês" in released_page.text
+    assert "R$ 55,00 liberados" in released_page.text
+    assert "reserva orçamentária: R$ 55,00" not in released_page.text
+    future_page = client.get("/month?year=2026&month=8")
+    assert "reserva orçamentária: R$ 100,00" in future_page.text
+    client.post(f"/budgets/{budget_id}/month-reactivate", data={"year": "2026", "month": "7"})
+    assert "reserva orçamentária: R$ 55,00" in client.get("/month?year=2026&month=7").text
     client.post(f"/budgets/{budget_id}/edit", data={
         "amount": "120.00", "start_month": "2026-07", "include_in_projection": "true",
     })
@@ -145,6 +156,31 @@ def test_monthly_budget_is_consumed_by_paid_and_pending_expenses(client):
     client.post(f"/budgets/{budget_id}/delete")
     with SessionLocal() as db:
         assert db.get(MonthlyBudget, budget_id).is_active is False
+
+
+def test_close_month_can_release_remaining_budgets(client):
+    area_id = seed_test()
+    client.post("/login", data={"username": "vh", "password": "123456"})
+    with SessionLocal() as db:
+        workspace_id = db.scalar(select(Workspace.id))
+        user_id = db.scalar(select(User.id).where(User.username == "vh"))
+        category = Category(workspace_id=workspace_id, kind=TransactionType.expense,
+                            parent_name="Alimentação", name="Padaria", color="#fdcb6e")
+        db.add(category); db.flush()
+        db.add(MonthlyBudget(workspace_id=workspace_id, person_id=area_id, category_id=category.id,
+                             amount=Decimal("100.00"), start_year=2026, start_month=8,
+                             include_in_projection=True, created_by_id=user_id))
+        db.commit()
+    response = client.post("/month/close", data={
+        "year": "2026", "month": "8", "release_budget_remaining": "true",
+    }, follow_redirects=False)
+    assert response.status_code == 303
+    with SessionLocal() as db:
+        occurrence = db.scalar(select(MonthlyBudgetOccurrence))
+        assert occurrence.status == "released"
+        assert occurrence.released_amount == Decimal("100.00")
+    page = client.get("/month?year=2026&month=8")
+    assert "encerrado neste mês" in page.text
 
 
 def test_future_month_starts_with_previous_month_projected_balance(client):
