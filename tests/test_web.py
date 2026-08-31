@@ -618,6 +618,42 @@ def test_confirmed_month_transaction_can_be_edited_and_deleted(client):
     assert "Confirmar pagamento" in client.get("/month?year=2026&month=7").text
 
 
+def test_confirmed_income_status_can_be_changed_to_pending(client):
+    area_id = seed_test()
+    client.post("/login", data={"username": "vh", "password": "123456"})
+    with SessionLocal() as db:
+        workspace_id = db.scalar(select(Workspace.id))
+        user_id = db.scalar(select(User.id).where(User.username == "vh"))
+        account = Account(workspace_id=workspace_id, person_id=area_id, name="Conta salário",
+                          account_type=AccountType.checking)
+        category = Category(workspace_id=workspace_id, kind=TransactionType.income,
+                            parent_name="Receitas", name="Salário", color="#00b894")
+        db.add_all([account, category]); db.flush()
+        income = Transaction(
+            workspace_id=workspace_id, transaction_type=TransactionType.income,
+            description="Salário", amount=Decimal("1500.00"), transaction_date=date(2026, 8, 5),
+            competence_year=2026, competence_month=8, status=TransactionStatus.paid,
+            person_id=area_id, account_id=account.id, category_id=category.id,
+            created_by_id=user_id,
+        )
+        db.add(income); db.commit()
+        income_id, account_id, category_id = income.id, account.id, category.id
+    page = client.get("/month?year=2026&month=8")
+    assert 'name="status"' in page.text
+    assert "Recebida</option>" in page.text
+    assert "A receber</option>" in page.text
+    response = client.post(f"/transactions/{income_id}/edit", data={
+        "description": "Salário", "amount": "1500.00", "transaction_date": "2026-08-05",
+        "competence_month": "2026-08", "status": "pending", "account_id": str(account_id),
+        "category_id": str(category_id), "notes": "", "return_year": "2026", "return_month": "8",
+    }, follow_redirects=False)
+    assert response.status_code == 303
+    with SessionLocal() as db:
+        assert db.get(Transaction, income_id).status == TransactionStatus.pending
+    pending_page = client.get("/month?year=2026&month=8")
+    assert f'action="/transactions/{income_id}/confirm"' in pending_page.text
+
+
 def test_superadmin_creates_account_and_refreshes_deepinfra_models(client, monkeypatch):
     seed_test(); client.post("/login", data={"username": "vh", "password": "123456"})
     response = client.post("/system/accounts", data={

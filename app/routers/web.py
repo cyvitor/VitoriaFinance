@@ -1526,13 +1526,14 @@ def transaction_delete(item_id: int, request: Request, return_year: int | None =
 def transaction_edit(item_id: int, request: Request, description: str = Form(), amount: Decimal = Form(),
                      transaction_date: date = Form(), category_id: str | None = Form(None),
                      account_id: str | None = Form(None), competence_month: str | None = Form(None),
+                     status: TransactionStatus | None = Form(None),
                      notes: str | None = Form(None), return_year: int | None = Form(None),
                      return_month: int | None = Form(None), db: Session = Depends(get_db),
                      user: User = Depends(current_user)):
     wid = current_workspace_id(request, user, db)
     item = db.scalar(select(Transaction).where(
         Transaction.id == item_id, Transaction.workspace_id == wid,
-        Transaction.status == TransactionStatus.paid,
+        Transaction.status.in_([TransactionStatus.paid, TransactionStatus.pending]),
     ))
     if not item: raise HTTPException(404)
     if item.person_id:
@@ -1572,6 +1573,8 @@ def transaction_edit(item_id: int, request: Request, description: str = Form(), 
     item.competence_month = target_month
     item.account_id = account_value
     item.category_id = category_value
+    if status in (TransactionStatus.paid, TransactionStatus.pending):
+        item.status = status
     item.notes = (notes or "").strip() or None
     db.commit()
     flash(request, "Lançamento atualizado.")
