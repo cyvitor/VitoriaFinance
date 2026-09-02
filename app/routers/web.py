@@ -1290,8 +1290,10 @@ def family_view(request: Request, year: int | None = None, month: int | None = N
     visible_months = [summary for summary in months if summary["has_activity"]]
     if selected_year == today.year and not any(summary["number"] == today.month for summary in visible_months):
         visible_months.append(months[today.month - 1])
+    # A competência escolhida deve sempre abrir, mesmo sem lançamentos. Isso permite
+    # consultar orçamento, fechamento e previsões de um mês ainda vazio.
     if not any(summary["number"] == selected_month for summary in visible_months):
-        selected_month = today.month if selected_year == today.year else (visible_months[0]["number"] if visible_months else 1)
+        visible_months.append(months[selected_month - 1])
     visible_months.sort(key=lambda summary: summary["number"])
     selected_items = [item for item in items if (item.competence_month or item.transaction_date.month) == selected_month]
     confirmed = [item for item in selected_items if item.status == TransactionStatus.paid]

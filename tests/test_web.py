@@ -448,10 +448,12 @@ def test_financial_analysis_groups_confirmed_items_by_competence(client):
     with SessionLocal() as db:
         workspace_id = db.scalar(select(Workspace.id))
         user_id = db.scalar(select(User.id).where(User.username == "vh"))
+        target_month = (date.today().month - 2) % 12 + 1
+        target_year = date.today().year if date.today().month > 1 else date.today().year - 1
         db.add(Transaction(
             workspace_id=workspace_id, transaction_type=TransactionType.income,
             description="Salário de julho confirmado em agosto", amount=Decimal("4267.00"),
-            transaction_date=date(2026, 8, 6), competence_year=2026, competence_month=7,
+            transaction_date=date(target_year, target_month, 6), competence_year=target_year, competence_month=target_month,
             status=TransactionStatus.paid, person_id=area_id, created_by_id=user_id,
         ))
         db.commit()
