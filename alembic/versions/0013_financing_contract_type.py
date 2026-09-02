@@ -13,8 +13,14 @@ depends_on = None
 
 
 def upgrade():
-    op.add_column("financings", sa.Column("contract_type", sa.String(length=30), nullable=False, server_default="financing"))
+    inspector = sa.inspect(op.get_bind())
+    columns = {column["name"] for column in inspector.get_columns("financings")}
+    if "contract_type" not in columns:
+        op.add_column("financings", sa.Column("contract_type", sa.String(length=30), nullable=False, server_default="financing"))
 
 
 def downgrade():
-    op.drop_column("financings", "contract_type")
+    inspector = sa.inspect(op.get_bind())
+    columns = {column["name"] for column in inspector.get_columns("financings")}
+    if "contract_type" in columns:
+        op.drop_column("financings", "contract_type")
