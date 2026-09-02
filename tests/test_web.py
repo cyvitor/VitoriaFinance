@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 
 from app.database import SessionLocal
@@ -222,6 +222,8 @@ def test_recurring_income_monthly_confirmation_skip_and_delete(client):
         assert db.scalar(select(func.count(RecurrenceRule.id))) == 1
         assert db.scalar(select(func.count(Transaction.id))) == 0
         rule_id = db.scalar(select(RecurrenceRule.id))
+        db.get(RecurrenceRule, rule_id).created_at = datetime(2026, 1, 1)
+        db.commit()
     month = client.get("/month?year=2026&month=7")
     assert month.status_code == 200
     assert "Não receber neste mês" in month.text
@@ -295,6 +297,8 @@ def test_fixed_expense_inline_confirm_and_skip(client):
     with SessionLocal() as db:
         rule = db.scalar(select(RecurrenceRule).where(RecurrenceRule.transaction_type == TransactionType.expense))
         rule_id = rule.id
+        rule.created_at = datetime(2026, 1, 1)
+        db.commit()
     month = client.get("/month?year=2026&month=7")
     assert "Aluguel" in month.text
     assert "Confirmar pagamento" in month.text
@@ -574,7 +578,8 @@ def test_confirmed_month_transaction_can_be_edited_and_deleted(client):
                              account_type=AccountType.checking)
         rule = RecurrenceRule(workspace_id=workspace_id, transaction_type=TransactionType.expense,
                               frequency="monthly", description="Energia", amount=Decimal("120.00"),
-                              person_id=area_id, created_by_id=user_id, is_active=True)
+                              person_id=area_id, created_by_id=user_id, is_active=True,
+                              created_at=datetime(2026, 1, 1))
         db.add_all([category, source, new_source, rule]); db.flush()
         tx = Transaction(workspace_id=workspace_id, transaction_type=TransactionType.expense,
                          description="Energia", amount=Decimal("120.00"), transaction_date=date(2026, 8, 7),
