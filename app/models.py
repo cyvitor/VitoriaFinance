@@ -376,6 +376,7 @@ class Financing(Base):
     person_id: Mapped[int] = mapped_column(ForeignKey("people.id", ondelete="CASCADE"), index=True)
     recurrence_rule_id: Mapped[int | None] = mapped_column(ForeignKey("recurrence_rules.id", ondelete="SET NULL"), unique=True, nullable=True)
     description: Mapped[str] = mapped_column(String(180))
+    contract_type: Mapped[str] = mapped_column(String(30), default="financing")
     paid_installments: Mapped[int] = mapped_column(default=0)
     total_installments: Mapped[int] = mapped_column()
     installment_amount: Mapped[Decimal] = mapped_column(Numeric(14, 2))

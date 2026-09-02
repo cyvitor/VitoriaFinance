@@ -5,7 +5,7 @@
   <div><p class="eyebrow">VISÃO GERAL</p><h1>Dashboard</h1><p>{{ today.strftime('%d/%m/%Y') }}</p></div>
   <div class="d-flex gap-2 flex-wrap"><a class="btn btn-light" href="/transactions/new?kind=income"><i class="bi bi-plus"></i> Receita</a><a class="btn btn-light" href="/card-expenses/new"><i class="bi bi-credit-card"></i> Gasto no cartão</a><a class="btn btn-primary" href="/transactions/new?kind=expense"><i class="bi bi-plus"></i> Despesa</a></div>
 </div>
-<form class="analysis-filters dashboard-filter" method="get"><label>Área financeira<select name="area_id" onchange="this.form.submit()"><option value="">Todas permitidas</option>{% for area in areas %}<option value="{{ area.id }}" {% if selected_area==area.id %}selected{% endif %}>{{ area.name }}</option>{% endfor %}</select></label></form>
+<form class="analysis-filters dashboard-filter" method="post" action="/context/area"><input type="hidden" name="return_to" value="/"><label>Área financeira<select name="person_id" data-context-area onchange="this.form.submit()">{% for area in areas %}<option value="{{ area.id }}" {% if selected_area==area.id %}selected{% endif %}>{{ area.name }}</option>{% endfor %}</select></label></form>
 <div class="summary-grid dashboard-summary-grid">
   <article class="summary primary"><span>Saldo confirmado</span><strong>{{ balance|money }}</strong><small>Movimentações já contabilizadas</small><i class="bi bi-wallet2"></i></article>
   <article class="summary projected-summary"><span>Saldo projetado</span><strong class="{% if projected_balance>=0 %}text-success{% else %}text-danger{% endif %}">{{ projected_balance|money }}</strong><small>Após previsões e orçamento</small><i class="bi bi-graph-up-arrow"></i></article>

@@ -164,12 +164,18 @@ def _resolve_category(db: Session, workspace_id: int, value: str) -> tuple[Categ
 def update_expense_draft(db: Session, user: User, *, description: str | None = None,
                          category: str | None = None,
                          payment_method: str | None = None, card: str | None = None,
-                         transaction_date: date | None = None) -> tuple[TelegramExpenseDraft | None, list[str], list[str]]:
+                         transaction_date: date | None = None,
+                         person: Person | None = None) -> tuple[TelegramExpenseDraft | None, list[str], list[str]]:
     draft = get_active_draft(db, user.id)
     if not draft:
         return None, [], []
     missing = []
     category_options = []
+    if person and person.id != draft.person_id:
+        # Conta e cartão pertencem à área: nunca carregue esses vínculos para outra área.
+        draft.person_id = person.id
+        draft.account_id = None
+        draft.card_id = None
     if description is not None:
         normalized_description = " ".join(str(description).split())
         if normalized_description:

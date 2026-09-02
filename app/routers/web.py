@@ -111,6 +111,30 @@ def visible_accounts(user: User, workspace_id: int, db: Session):
     return db.scalars(query.order_by(Account.name)).all()
 
 
+def active_area_id(request: Request, user: User, workspace_id: int, db: Session) -> int | None:
+    """Área financeira escolhida no Dashboard para toda a navegação web."""
+    visible = {item.id for item in visible_people(user, workspace_id, db)}
+    selected = optional_int(str(request.session.get("active_person_id") or ""))
+    if selected in visible:
+        return selected
+    default = user.default_person_id if user.default_person_id in visible else None
+    if default:
+        request.session["active_person_id"] = default
+    return default
+
+
+@router.post("/context/area")
+def change_active_area(request: Request, person_id: str = Form(""), return_to: str = Form("/"),
+                       db: Session = Depends(get_db), user: User = Depends(current_user)):
+    wid = current_workspace_id(request, user, db)
+    selected = optional_int(person_id)
+    visible = {item.id for item in visible_people(user, wid, db)}
+    if selected and selected not in visible:
+        raise HTTPException(403, "Área financeira não permitida")
+    request.session["active_person_id"] = selected
+    return redirect(return_to if return_to.startswith("/") and not return_to.startswith("//") else "/")
+
+
 def ensure_area_access(person_id: int, user: User, workspace_id: int, db: Session):
     area = db.scalar(select(Person).where(Person.id == person_id, Person.workspace_id == workspace_id, Person.is_active))
     allowed = allowed_person_ids(user, db)
@@ -180,15 +204,13 @@ def logout(request: Request):
 
 
 @router.get("/", response_class=HTMLResponse)
-def dashboard(request: Request, area_id: str | None = None,
+def dashboard(request: Request,
               db: Session = Depends(get_db), user: User = Depends(current_user)):
     wid = current_workspace_id(request, user, db)
     allowed = allowed_person_ids(user, db)
     areas = visible_people(user, wid, db)
     allowed_ids = {area.id for area in areas}
-    area_id = optional_int(area_id)
-    if area_id not in allowed_ids:
-        area_id = None
+    area_id = active_area_id(request, user, wid, db)
     area_condition = Transaction.person_id == area_id if area_id else (
         True if allowed is None else Transaction.person_id.in_(allowed_ids)
     )
@@ -546,15 +568,17 @@ def future_transactions(request: Request, db: Session = Depends(get_db), user: U
 @router.get("/recurring-incomes", response_class=HTMLResponse)
 def recurring_incomes(request: Request, db: Session = Depends(get_db), user: User = Depends(current_user)):
     wid = current_workspace_id(request, user, db)
+    active_area = active_area_id(request, user, wid, db)
     allowed = allowed_person_ids(user, db)
     rule_query = select(RecurrenceRule).where(
         RecurrenceRule.workspace_id == wid, RecurrenceRule.description.is_not(None),
         RecurrenceRule.transaction_type == TransactionType.income,
     )
     if allowed is not None: rule_query = rule_query.where(RecurrenceRule.person_id.in_(allowed))
+    if active_area: rule_query = rule_query.where(RecurrenceRule.person_id == active_area)
     rules = db.scalars(rule_query.order_by(RecurrenceRule.is_active.desc(), RecurrenceRule.description)).all()
     return render(request, "recurring_incomes/index.html", user=user, rules=rules,
-        accounts=visible_accounts(user, wid, db), people=visible_people(user, wid, db),
+        accounts=visible_accounts(user, wid, db), people=visible_people(user, wid, db), selected_area=active_area,
         categories=db.scalars(select(Category).where(
             Category.workspace_id == wid, Category.kind == TransactionType.income
         ).order_by(Category.name)).all())
@@ -566,7 +590,7 @@ def recurring_income_create(request: Request, description: str = Form(), amount:
         category_id: str | None = Form(None), notes: str | None = Form(None),
         db: Session = Depends(get_db), user: User = Depends(current_user)):
     wid = current_workspace_id(request, user, db)
-    person_id_value = optional_int(person_id)
+    person_id_value = active_area_id(request, user, wid, db) or optional_int(person_id)
     if not person_id_value:
         flash(request, "Selecione uma área financeira.", "danger")
         return redirect("/recurring-incomes")
@@ -637,6 +661,7 @@ def recurring_income_delete(rule_id: int, request: Request, db: Session = Depend
 @router.get("/fixed-expenses", response_class=HTMLResponse)
 def fixed_expenses(request: Request, db: Session = Depends(get_db), user: User = Depends(current_user)):
     wid = current_workspace_id(request, user, db)
+    active_area = active_area_id(request, user, wid, db)
     allowed = allowed_person_ids(user, db)
     rule_query = select(RecurrenceRule).where(
         RecurrenceRule.workspace_id == wid, RecurrenceRule.description.is_not(None),
@@ -644,9 +669,10 @@ def fixed_expenses(request: Request, db: Session = Depends(get_db), user: User =
         ~RecurrenceRule.id.in_(select(Financing.recurrence_rule_id).where(Financing.recurrence_rule_id.is_not(None))),
     )
     if allowed is not None: rule_query = rule_query.where(RecurrenceRule.person_id.in_(allowed))
+    if active_area: rule_query = rule_query.where(RecurrenceRule.person_id == active_area)
     rules = db.scalars(rule_query.order_by(RecurrenceRule.is_active.desc(), RecurrenceRule.description)).all()
     return render(request, "fixed_expenses/index.html", user=user, rules=rules,
-        accounts=visible_accounts(user, wid, db), people=visible_people(user, wid, db),
+        accounts=visible_accounts(user, wid, db), people=visible_people(user, wid, db), selected_area=active_area,
         categories=db.scalars(select(Category).where(
             Category.workspace_id == wid, Category.kind == TransactionType.expense
         ).order_by(Category.parent_name, Category.name)).all())
@@ -658,7 +684,7 @@ def fixed_expense_create(request: Request, description: str = Form(), amount: De
         category_id: str | None = Form(None), notes: str | None = Form(None),
         db: Session = Depends(get_db), user: User = Depends(current_user)):
     wid = current_workspace_id(request, user, db)
-    person_id_value = optional_int(person_id)
+    person_id_value = active_area_id(request, user, wid, db) or optional_int(person_id)
     if not person_id_value:
         flash(request, "Selecione uma área financeira.", "danger")
         return redirect("/fixed-expenses")
@@ -705,29 +731,35 @@ def fixed_expense_edit(rule_id: int, request: Request, description: str = Form()
 @router.get("/financings", response_class=HTMLResponse)
 def financings(request: Request, db: Session = Depends(get_db), user: User = Depends(current_user)):
     wid = current_workspace_id(request, user, db)
+    active_area = active_area_id(request, user, wid, db)
     allowed = allowed_person_ids(user, db)
     query = select(Financing).where(Financing.workspace_id == wid)
     if allowed is not None:
         query = query.where(Financing.person_id.in_(allowed))
+    if active_area: query = query.where(Financing.person_id == active_area)
     categories = db.scalars(select(Category).where(Category.workspace_id == wid,
         Category.kind == TransactionType.expense).order_by(Category.parent_name, Category.name)).all()
     return render(request, "financings/index.html", user=user,
         items=db.scalars(query.order_by(Financing.status, Financing.description)).all(),
-        people=visible_people(user, wid, db), accounts=visible_accounts(user, wid, db), categories=categories)
+        people=visible_people(user, wid, db), accounts=visible_accounts(user, wid, db), categories=categories, selected_area=active_area)
 
 
 @router.post("/financings")
 def financing_create(request: Request, description: str = Form(), paid_installments: int = Form(),
         total_installments: int = Form(), installment_amount: Decimal = Form(), person_id: int = Form(),
+        contract_type: str = Form("financing"),
         account_id: str | None = Form(None), category_id: str | None = Form(None),
         financed_amount: str | None = Form(None), outstanding_balance: str | None = Form(None),
         nominal_interest_rate: str | None = Form(None), institution: str | None = Form(None),
         due_day: str | None = Form(None), notes: str | None = Form(None),
         db: Session = Depends(get_db), user: User = Depends(current_user)):
     wid = current_workspace_id(request, user, db)
+    person_id = active_area_id(request, user, wid, db) or person_id
     ensure_area_access(person_id, user, wid, db)
     account_value, category_value = optional_int(account_id), optional_int(category_id)
     ensure_account_access(account_value, user, wid, db)
+    if contract_type not in ("financing", "negotiated_debt", "personal_loan"):
+        contract_type = "financing"
     if total_installments < 1 or paid_installments < 0 or paid_installments >= total_installments or installment_amount <= 0:
         flash(request, "Confira a quantidade de parcelas e o valor mensal.", "danger")
         return redirect("/financings")
@@ -738,7 +770,7 @@ def financing_create(request: Request, description: str = Form(), paid_installme
         notes=notes, created_by_id=user.id, is_active=True)
     db.add(rule); db.flush()
     db.add(Financing(workspace_id=wid, person_id=person_id, recurrence_rule_id=rule.id,
-        description=description.strip(), paid_installments=paid_installments,
+        description=description.strip(), contract_type=contract_type, paid_installments=paid_installments,
         total_installments=total_installments, installment_amount=installment_amount,
         financed_amount=optional_decimal(financed_amount), outstanding_balance=optional_decimal(outstanding_balance),
         nominal_interest_rate=optional_decimal(nominal_interest_rate), institution=(institution or "").strip() or None,
@@ -894,16 +926,18 @@ def fixed_expense_delete(rule_id: int, request: Request, db: Session = Depends(g
 @router.get("/budgets", response_class=HTMLResponse)
 def budgets(request: Request, db: Session = Depends(get_db), user: User = Depends(current_user)):
     wid = current_workspace_id(request, user, db)
+    active_area = active_area_id(request, user, wid, db)
     allowed = allowed_person_ids(user, db)
     query = select(MonthlyBudget).where(MonthlyBudget.workspace_id == wid)
     if allowed is not None:
         query = query.where(MonthlyBudget.person_id.in_(allowed))
+    if active_area: query = query.where(MonthlyBudget.person_id == active_area)
     items = db.scalars(query.order_by(MonthlyBudget.is_active.desc(), MonthlyBudget.id.desc())).all()
     categories = db.scalars(select(Category).where(
         Category.workspace_id == wid, Category.kind == TransactionType.expense,
     ).order_by(Category.parent_name, Category.name)).all()
     return render(request, "budgets/index.html", user=user, items=items,
-                  people=visible_people(user, wid, db), categories=categories,
+                  people=visible_people(user, wid, db), categories=categories, selected_area=active_area,
                   current_year=date.today().year, current_month=date.today().month)
 
 
@@ -913,6 +947,7 @@ def budget_create(request: Request, person_id: int = Form(), category_id: int = 
                   include_in_projection: bool = Form(False),
                   db: Session = Depends(get_db), user: User = Depends(current_user)):
     wid = current_workspace_id(request, user, db)
+    person_id = active_area_id(request, user, wid, db) or person_id
     ensure_area_access(person_id, user, wid, db)
     category = db.scalar(select(Category).where(
         Category.id == category_id, Category.workspace_id == wid,
@@ -1159,6 +1194,7 @@ def recurring_income_skip(rule_id: int, request: Request, year: int = Form(), mo
 def family_view(request: Request, year: int | None = None, month: int | None = None,
                 db: Session = Depends(get_db), user: User = Depends(current_user)):
     wid = current_workspace_id(request, user, db)
+    active_area = active_area_id(request, user, wid, db)
     allowed = allowed_person_ids(user, db)
     today = date.today()
     selected_year = year or today.year
@@ -1170,6 +1206,8 @@ def family_view(request: Request, year: int | None = None, month: int | None = N
         Transaction.competence_year == selected_year,
         Transaction.status != TransactionStatus.cancelled,
     )
+    if active_area:
+        item_query = item_query.where(Transaction.person_id == active_area)
     items = db.scalars(restrict_transactions(item_query, user, db).order_by(Transaction.transaction_date, Transaction.id)).all()
     months = [{
         "number": number, "income_paid": Decimal(0), "expense_paid": Decimal(0),
@@ -1185,6 +1223,7 @@ def family_view(request: Request, year: int | None = None, month: int | None = N
         RecurrenceRule.description.is_not(None), RecurrenceRule.amount.is_not(None),
     )
     if allowed is not None: rule_query = rule_query.where(RecurrenceRule.person_id.in_(allowed))
+    if active_area: rule_query = rule_query.where(RecurrenceRule.person_id == active_area)
     recurring_rules = db.scalars(rule_query).all()
     occurrences = db.scalars(select(RecurrenceOccurrence).join(RecurrenceRule).where(
         RecurrenceRule.workspace_id == wid, RecurrenceOccurrence.year == selected_year,
@@ -1209,20 +1248,22 @@ def family_view(request: Request, year: int | None = None, month: int | None = N
             months[number - 1][key] += Decimal(display_rule.amount)
     initial_query = select(func.coalesce(func.sum(Account.initial_balance), 0)).where(Account.workspace_id == wid)
     if allowed is not None: initial_query = initial_query.where(Account.person_id.in_(allowed))
+    if active_area: initial_query = initial_query.where(Account.person_id == active_area)
     initial_balance = Decimal(db.scalar(initial_query))
     before_year_query = select(Transaction).where(
         Transaction.workspace_id == wid,
         Transaction.competence_year < selected_year,
         Transaction.status == TransactionStatus.paid,
     )
+    if active_area: before_year_query = before_year_query.where(Transaction.person_id == active_area)
     before_year_items = db.scalars(restrict_transactions(before_year_query, user, db)).all()
     year_opening_balance = initial_balance + sum(
         (Decimal(item.amount) if item.transaction_type == TransactionType.income else -Decimal(item.amount)
          if item.transaction_type == TransactionType.expense else Decimal(0)) for item in before_year_items
     )
-    budget_person_ids = tuple(allowed) if allowed is not None else tuple(db.scalars(
+    budget_person_ids = (active_area,) if active_area else (tuple(allowed) if allowed is not None else tuple(db.scalars(
         select(Person.id).where(Person.workspace_id == wid, Person.is_active.is_(True))
-    ).all())
+    ).all()))
     projected_opening_balance = year_opening_balance
     for summary in months:
         summary["realized"] = summary["income_paid"] - summary["expense_paid"]
@@ -1590,14 +1631,17 @@ def crud_list(request, db, user, model, template):
 @router.get("/accounts", response_class=HTMLResponse)
 def accounts(request: Request, db: Session = Depends(get_db), user: User = Depends(current_user)):
     wid = current_workspace_id(request, user, db)
-    return render(request, "accounts/index.html", user=user, items=visible_accounts(user, wid, db),
-                  people=visible_people(user, wid, db))
+    active_area = active_area_id(request, user, wid, db)
+    items = visible_accounts(user, wid, db)
+    if active_area: items = [item for item in items if item.person_id == active_area]
+    return render(request, "accounts/index.html", user=user, items=items,
+                  people=visible_people(user, wid, db), selected_area=active_area)
 
 
 @router.post("/accounts")
 def account_create(request: Request, name: str = Form(), bank_name: str = Form(""), account_type: AccountType = Form(),
                    person_id: int = Form(), initial_balance: Decimal = Form(0), color: str = Form("#6c5ce7"), db: Session = Depends(get_db), user: User = Depends(current_user)):
-    wid = current_workspace_id(request, user, db); ensure_area_access(person_id, user, wid, db)
+    wid = current_workspace_id(request, user, db); person_id = active_area_id(request, user, wid, db) or person_id; ensure_area_access(person_id, user, wid, db)
     db.add(Account(workspace_id=wid, person_id=person_id, name=name.strip(), bank_name=bank_name.strip(), account_type=account_type, initial_balance=initial_balance, color=color)); db.commit()
     flash(request, "Conta adicionada."); return redirect("/accounts")
 
@@ -1605,12 +1649,14 @@ def account_create(request: Request, name: str = Form(), bank_name: str = Form("
 @router.get("/cards", response_class=HTMLResponse)
 def cards(request: Request, db: Session = Depends(get_db), user: User = Depends(current_user)):
     wid = current_workspace_id(request, user, db)
+    active_area = active_area_id(request, user, wid, db)
     accounts = visible_accounts(user, wid, db)
+    if active_area: accounts = [account for account in accounts if account.person_id == active_area]
     account_ids = [account.id for account in accounts]
     query = select(Card).where(Card.workspace_id == wid)
     if allowed_person_ids(user, db) is not None:
         query = query.where(Card.account_id.in_(account_ids))
-    return render(request, "cards/index.html", user=user, items=db.scalars(query.order_by(Card.id.desc())).all(), accounts=accounts)
+    return render(request, "cards/index.html", user=user, items=db.scalars(query.order_by(Card.id.desc())).all(), accounts=accounts, selected_area=active_area)
 
 
 @router.get("/cards/{card_id}", response_class=HTMLResponse)

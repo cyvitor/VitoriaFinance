@@ -1093,10 +1093,11 @@ def update_expense(db: Session, context: UserAccessContext, args: dict) -> dict:
         raise ToolError("Usuario sem permissao para alterar despesas")
     user = db.get(User, context.user_id)
     transaction_date = _date(args.get("transaction_date"), date.today()) if args.get("transaction_date") else None
+    person = _resolve_person(db, context, args.get("area")) if args.get("area") else None
     draft, missing, category_options = update_expense_draft(
         db, user, description=args.get("description"), category=args.get("category"),
         payment_method=args.get("payment_method"),
-        card=args.get("card"), transaction_date=transaction_date,
+        card=args.get("card"), transaction_date=transaction_date, person=person,
     )
     if not draft:
         raise ToolError("Nao ha despesa aguardando confirmacao")
