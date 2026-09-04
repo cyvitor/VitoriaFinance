@@ -176,6 +176,27 @@ def shift_month(value: date, offset: int) -> date:
     return date(value.year + month_index // 12, month_index % 12 + 1, 1)
 
 
+def earliest_open_month(db: Session, workspace_id: int, today: date) -> tuple[int, int]:
+    """Retorna a competência aberta mais antiga do ano corrente."""
+    periods = db.scalars(select(AccountingPeriod).where(
+        AccountingPeriod.workspace_id == workspace_id,
+        AccountingPeriod.year == today.year,
+        AccountingPeriod.month <= today.month,
+    )).all()
+    reopened = sorted(item.month for item in periods if not item.is_closed)
+    if reopened:
+        return today.year, reopened[0]
+    closed = {item.month for item in periods if item.is_closed}
+    consecutive_closed = 0
+    for month in range(1, today.month + 1):
+        if month not in closed:
+            break
+        consecutive_closed = month
+    if consecutive_closed:
+        return today.year, min(consecutive_closed + 1, today.month)
+    return today.year, today.month
+
+
 @router.get("/login", response_class=HTMLResponse)
 def login_page(request: Request):
     if request.session.get("user_id"):
@@ -1197,8 +1218,9 @@ def family_view(request: Request, year: int | None = None, month: int | None = N
     active_area = active_area_id(request, user, wid, db)
     allowed = allowed_person_ids(user, db)
     today = date.today()
-    selected_year = year or today.year
-    selected_month = month if month and 1 <= month <= 12 else today.month
+    default_year, default_month = earliest_open_month(db, wid, today)
+    selected_year = year or default_year
+    selected_month = month if month and 1 <= month <= 12 else default_month
     year_start = date(selected_year, 1, 1)
     year_end = date(selected_year + 1, 1, 1)
     item_query = select(Transaction).where(

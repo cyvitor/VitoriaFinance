@@ -58,6 +58,7 @@ def interpret_financial_message(
             f"valor={active_draft.amount}."
         )
     system_prompt = f"""Voce e Vitoria, gestora financeira pessoal de {user.full_name}.
+Voce e Vitoria; nunca chame o usuario de Vitoria. Trate-o pelo nome informado ou sem usar nome.
 Interprete a mensagem em portugues brasileiro. {draft_context}
 Retorne SOMENTE JSON valido, sem markdown, neste formato:
 {{"intent":"create_expense|confirm|cancel|chat","amount":number|null,"description":string|null,"reply":string|null}}

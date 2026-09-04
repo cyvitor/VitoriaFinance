@@ -3,8 +3,9 @@ from decimal import Decimal
 
 from app.database import SessionLocal
 from sqlalchemy import func, select
-from app.models import Account, AccountRole, AccountType, Card, Category, Financing, FinancingAmortization, MonthlyBudget, MonthlyBudgetOccurrence, Person, PersonType, SystemAccount, SystemSetting, User, Workspace, WorkspaceMember, MemberRole, RecurrenceRule, RecurrenceOccurrence, Transaction, TransactionStatus, TransactionType
+from app.models import Account, AccountRole, AccountType, AccountingPeriod, Card, Category, Financing, FinancingAmortization, MonthlyBudget, MonthlyBudgetOccurrence, Person, PersonType, SystemAccount, SystemSetting, User, Workspace, WorkspaceMember, MemberRole, RecurrenceRule, RecurrenceOccurrence, Transaction, TransactionStatus, TransactionType
 from app.security import hash_password
+from app.routers.web import earliest_open_month
 
 
 def seed_test():
@@ -21,6 +22,22 @@ def seed_test():
 
 
 def test_health(client): assert client.get("/health").json()["status"] == "ok"
+
+
+def test_month_defaults_to_earliest_open_period(client):
+    seed_test()
+    with SessionLocal() as db:
+        workspace_id = db.scalar(select(Workspace.id))
+        db.add_all([
+            AccountingPeriod(workspace_id=workspace_id, year=2026, month=month, is_closed=True)
+            for month in range(1, 7)
+        ])
+        db.commit()
+        assert earliest_open_month(db, workspace_id, date(2026, 9, 4)) == (2026, 7)
+        period = db.scalar(select(AccountingPeriod).where(AccountingPeriod.month == 6))
+        period.is_closed = False
+        db.commit()
+        assert earliest_open_month(db, workspace_id, date(2026, 9, 4)) == (2026, 6)
 
 
 def test_login_dashboard_and_change_password(client):
