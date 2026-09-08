@@ -433,3 +433,33 @@ class Transaction(Base):
     person: Mapped[Person | None] = relationship()
     category: Mapped[Category | None] = relationship()
     recurrence_rule: Mapped[RecurrenceRule | None] = relationship()
+
+
+class Vehicle(Base):
+    __tablename__ = "vehicles"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    workspace_id: Mapped[int] = mapped_column(ForeignKey("workspaces.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(120))
+    year: Mapped[int | None] = mapped_column(nullable=True)
+    initial_odometer_km: Mapped[Decimal] = mapped_column(Numeric(12, 1), default=0)
+    fuel_type: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class FuelFillup(Base):
+    __tablename__ = "fuel_fillups"
+    __table_args__ = (UniqueConstraint("transaction_id"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    workspace_id: Mapped[int] = mapped_column(ForeignKey("workspaces.id", ondelete="CASCADE"), index=True)
+    vehicle_id: Mapped[int] = mapped_column(ForeignKey("vehicles.id", ondelete="CASCADE"), index=True)
+    transaction_id: Mapped[int | None] = mapped_column(ForeignKey("transactions.id", ondelete="CASCADE"), index=True, nullable=True)
+    fillup_date: Mapped[date] = mapped_column(Date, default=date.today, index=True)
+    odometer_km: Mapped[Decimal] = mapped_column(Numeric(12, 1))
+    liters: Mapped[Decimal] = mapped_column(Numeric(12, 3))
+    price_per_liter: Mapped[Decimal] = mapped_column(Numeric(12, 3))
+    station: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    vehicle: Mapped[Vehicle] = relationship()
+    transaction: Mapped[Transaction | None] = relationship()

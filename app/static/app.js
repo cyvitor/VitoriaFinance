@@ -15,6 +15,10 @@ document.querySelector('select[data-context-area]')?.addEventListener('change', 
 });
 
 const sidebar = document.querySelector('.sidebar');
+const cardsMenu = sidebar?.querySelector('nav a[href="/cards"]');
+if (cardsMenu && !sidebar.querySelector('nav a[href="/vehicles"]')) {
+  cardsMenu.insertAdjacentHTML('afterend', '<a href="/vehicles"><i class="bi bi-car-front"></i> Veículos</a>');
+}
 const activeMenuItem = sidebar?.querySelector('nav a.active');
 if (activeMenuItem) activeMenuItem.scrollIntoView({block: 'nearest'});
 

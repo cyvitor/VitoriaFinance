@@ -1,6 +1,6 @@
 from calendar import monthrange
 from copy import copy
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 import json
 from pathlib import Path
@@ -21,7 +21,7 @@ from app.models import (
     Transaction, TransactionStatus, TransactionType, User, UserPersonAccess, WorkspaceMember, TelegramLink,
     RecurrenceRule, RecurrenceOccurrence, AccountingPeriod, Financing, FinancingAmortization, MonthlyBudget,
     MonthlyBudgetOccurrence,
-    MemberRole, UserMemory, Workspace,
+    MemberRole, UserMemory, Workspace, Vehicle, FuelFillup,
 )
 from app.security import hash_password, verify_password
 from app.services.card_billing import (
@@ -55,6 +55,14 @@ def flash(request: Request, message: str, kind: str = "success"):
 
 def redirect(url: str):
     return RedirectResponse(url, status_code=303)
+
+
+def is_fuel_category(category: Category | None) -> bool:
+    """Identifica categorias de combustível sem depender de um id fixo."""
+    if not category:
+        return False
+    label = f"{category.parent_name or ''} {category.name or ''}".lower()
+    return "combust" in label or "gasolina" in label or "etanol" in label or "diesel" in label
 
 
 def require_account_admin(user: User):
@@ -556,12 +564,13 @@ def card_expense_create(request: Request, card_id: int = Form(), description: st
         card_purchase_competence(db, card, purchase_date) if is_credit
         else (purchase_date.year, purchase_date.month)
     )
+    created = []
     for index in range(count):
         year, month = shift_competence_month(first_year, first_month, index)
         tx_date = date(year, month, min(purchase_date.day, monthrange(year, month)[1]))
         cents = base_cents + (remainder if index == count - 1 else 0)
         label = f"{description.strip()} ({index + 1}/{count})" if count > 1 else description.strip()
-        db.add(Transaction(
+        item = Transaction(
             workspace_id=wid, transaction_type=TransactionType.expense, description=label,
             amount=Decimal(cents) / 100, transaction_date=tx_date,
             status=TransactionStatus.pending if is_credit else TransactionStatus.paid,
@@ -569,9 +578,13 @@ def card_expense_create(request: Request, card_id: int = Form(), description: st
             category_id=category.id,
             payment_method="Crédito" if is_credit else "Débito", created_by_id=user.id,
             competence_year=year, competence_month=month,
-        ))
+        )
+        db.add(item)
+        created.append(item)
     db.commit()
     flash(request, f"Gasto no cartão registrado{' em ' + str(count) + ' parcelas' if count > 1 else ''}.")
+    if is_fuel_category(category) and created:
+        return redirect(f"/fuel-fillups/new?transaction_id={created[0].id}&prompt=1")
     return redirect(f"/cards/{card.id}?year={first_year}&month={first_month}&view=detailed")
 
 
@@ -1546,15 +1559,19 @@ def transaction_create(request: Request, transaction_type: TransactionType = For
     if transaction_type == TransactionType.transfer and (not account_id or not destination_account_id or account_id == destination_account_id):
         flash(request, "Selecione contas de origem e destino diferentes.", "danger")
         return redirect("/transactions/new?kind=transfer")
-    db.add(Transaction(
+    item = Transaction(
         workspace_id=wid, transaction_type=transaction_type, description=description.strip(), amount=amount,
         transaction_date=transaction_date, status=status, account_id=account_id,
         destination_account_id=destination_account_id, card_id=card_id, person_id=person_id,
         category_id=category_id, payment_method=payment_method, notes=notes, created_by_id=user.id,
         competence_year=competence_year, competence_month=competence_month,
-    ))
+    )
+    db.add(item)
     db.commit()
     flash(request, "Lançamento registrado.")
+    category = db.get(Category, category_id) if category_id else None
+    if transaction_type == TransactionType.expense and is_fuel_category(category):
+        return redirect(f"/fuel-fillups/new?transaction_id={item.id}&prompt=1&return_to={return_to or ''}")
     if return_to == "month":
         return redirect(f"/month?year={competence_year}&month={competence_month}")
     return redirect("/transactions")
@@ -1660,6 +1677,108 @@ def accounts(request: Request, db: Session = Depends(get_db), user: User = Depen
     if active_area: items = [item for item in items if item.person_id == active_area]
     return render(request, "accounts/index.html", user=user, items=items,
                   people=visible_people(user, wid, db), selected_area=active_area)
+
+
+@router.get("/vehicles", response_class=HTMLResponse)
+def vehicles(request: Request, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    wid = current_workspace_id(request, user, db)
+    items = db.scalars(select(Vehicle).where(Vehicle.workspace_id == wid).order_by(Vehicle.is_active.desc(), Vehicle.name)).all()
+    all_fillups = db.scalars(select(FuelFillup).where(FuelFillup.workspace_id == wid).order_by(FuelFillup.fillup_date, FuelFillup.id)).all()
+    fillups = list(reversed(all_fillups[-20:]))
+    monthly, last_odometer = {}, {}
+    for fillup in all_fillups:
+        month_key = fillup.fillup_date.strftime("%m/%Y")
+        item = monthly.setdefault(month_key, {"amount": Decimal(0), "liters": Decimal(0), "km": Decimal(0)})
+        item["amount"] += Decimal(fillup.liters) * Decimal(fillup.price_per_liter)
+        item["liters"] += Decimal(fillup.liters)
+        previous_km = last_odometer.get(fillup.vehicle_id)
+        if previous_km is not None and Decimal(fillup.odometer_km) >= previous_km:
+            item["km"] += Decimal(fillup.odometer_km) - previous_km
+        last_odometer[fillup.vehicle_id] = Decimal(fillup.odometer_km)
+    chart = {
+        "labels": list(monthly),
+        "amounts": [float(row["amount"]) for row in monthly.values()],
+        "liters": [float(row["liters"]) for row in monthly.values()],
+        "km": [float(row["km"]) for row in monthly.values()],
+        "prices": [float(row["amount"] / row["liters"]) if row["liters"] else 0 for row in monthly.values()],
+    }
+    rolling_fillups = [item for item in all_fillups if item.fillup_date >= date.today() - timedelta(days=365)]
+    previous_by_vehicle = {}
+    rolling_chart = {"labels": [], "amounts": [], "liters": [], "km": [], "prices": []}
+    for fillup in rolling_fillups:
+        current_km = Decimal(fillup.odometer_km)
+        previous_km = previous_by_vehicle.get(fillup.vehicle_id)
+        rolling_chart["labels"].append(fillup.fillup_date.strftime("%d/%m/%Y"))
+        rolling_chart["amounts"].append(float(Decimal(fillup.liters) * Decimal(fillup.price_per_liter)))
+        rolling_chart["liters"].append(float(fillup.liters))
+        rolling_chart["km"].append(float(current_km - previous_km) if previous_km is not None and current_km >= previous_km else 0)
+        rolling_chart["prices"].append(float(fillup.price_per_liter))
+        previous_by_vehicle[fillup.vehicle_id] = current_km
+    return render(request, "vehicles/index.html", user=user, items=items, fillups=fillups, chart=chart,
+                  rolling_chart=rolling_chart, rolling_start=date.today() - timedelta(days=365))
+
+
+@router.post("/vehicles")
+def vehicle_create(request: Request, name: str = Form(), year: str | None = Form(None),
+                   initial_odometer_km: Decimal = Form(0), fuel_type: str | None = Form(None),
+                   db: Session = Depends(get_db), user: User = Depends(current_user)):
+    wid = current_workspace_id(request, user, db)
+    if not name.strip() or initial_odometer_km < 0:
+        flash(request, "Informe nome e quilometragem inicial válidos.", "danger"); return redirect("/vehicles")
+    db.add(Vehicle(workspace_id=wid, name=name.strip(), year=optional_int(year), initial_odometer_km=initial_odometer_km, fuel_type=(fuel_type or "").strip() or None))
+    db.commit(); flash(request, "Veículo compartilhado cadastrado."); return redirect("/vehicles")
+
+
+@router.post("/vehicles/{vehicle_id}/edit")
+def vehicle_edit(vehicle_id: int, request: Request, name: str = Form(), year: str | None = Form(None),
+                 initial_odometer_km: Decimal = Form(0), fuel_type: str | None = Form(None),
+                 is_active: str | None = Form(None), db: Session = Depends(get_db), user: User = Depends(current_user)):
+    wid = current_workspace_id(request, user, db)
+    vehicle = db.scalar(select(Vehicle).where(Vehicle.id == vehicle_id, Vehicle.workspace_id == wid))
+    if not vehicle: raise HTTPException(404)
+    if not name.strip() or initial_odometer_km < 0:
+        flash(request, "Informe nome e quilometragem inicial válidos.", "danger"); return redirect("/vehicles")
+    latest = db.scalar(select(FuelFillup.odometer_km).where(FuelFillup.vehicle_id == vehicle.id).order_by(FuelFillup.odometer_km.desc()))
+    if latest is not None and initial_odometer_km > Decimal(latest):
+        flash(request, "A quilometragem inicial não pode ser maior que um abastecimento já informado.", "danger"); return redirect("/vehicles")
+    vehicle.name, vehicle.year = name.strip(), optional_int(year)
+    vehicle.initial_odometer_km, vehicle.fuel_type = initial_odometer_km, (fuel_type or "").strip() or None
+    vehicle.is_active = is_active == "on"
+    db.commit(); flash(request, "Veículo atualizado."); return redirect("/vehicles")
+
+
+@router.get("/fuel-fillups/new", response_class=HTMLResponse)
+def fuel_fillup_form(request: Request, transaction_id: int | None = None, manual: bool = False,
+                     prompt: bool = False, return_to: str | None = None,
+                     db: Session = Depends(get_db), user: User = Depends(current_user)):
+    wid = current_workspace_id(request, user, db)
+    transaction = db.scalar(select(Transaction).where(Transaction.id == transaction_id, Transaction.workspace_id == wid)) if transaction_id else None
+    if transaction and transaction.person_id: ensure_area_access(transaction.person_id, user, wid, db)
+    if transaction and transaction.transaction_type != TransactionType.expense:
+        raise HTTPException(404)
+    return render(request, "vehicles/fillup_form.html", user=user, transaction=transaction, manual=manual, prompt=prompt, return_to=return_to,
+                  vehicles=db.scalars(select(Vehicle).where(Vehicle.workspace_id == wid, Vehicle.is_active)).all(), today=date.today())
+
+
+@router.post("/fuel-fillups")
+def fuel_fillup_create(request: Request, vehicle_id: int = Form(), transaction_id: str | None = Form(None),
+                       fillup_date: date = Form(), odometer_km: Decimal = Form(), liters: Decimal = Form(), price_per_liter: Decimal = Form(),
+                       station: str | None = Form(None), notes: str | None = Form(None),
+                       db: Session = Depends(get_db), user: User = Depends(current_user)):
+    wid = current_workspace_id(request, user, db)
+    vehicle = db.scalar(select(Vehicle).where(Vehicle.id == vehicle_id, Vehicle.workspace_id == wid, Vehicle.is_active))
+    transaction_value = optional_int(transaction_id)
+    transaction = db.scalar(select(Transaction).where(Transaction.id == transaction_value, Transaction.workspace_id == wid, Transaction.transaction_type == TransactionType.expense)) if transaction_value else None
+    if not vehicle or (transaction_value and not transaction): raise HTTPException(404)
+    if transaction and transaction.person_id: ensure_area_access(transaction.person_id, user, wid, db)
+    previous = db.scalar(select(FuelFillup).where(FuelFillup.vehicle_id == vehicle.id).order_by(FuelFillup.odometer_km.desc()))
+    minimum = Decimal(previous.odometer_km) if previous else Decimal(vehicle.initial_odometer_km)
+    if odometer_km < minimum or liters <= 0 or price_per_liter <= 0:
+        flash(request, "Confira quilometragem, litros e valor por litro.", "danger"); return redirect(f"/fuel-fillups/new?transaction_id={transaction.id}" if transaction else "/fuel-fillups/new?manual=1")
+    if transaction and abs((liters * price_per_liter) - Decimal(transaction.amount)) > Decimal("0.80"):
+        flash(request, "Litros × valor por litro deve corresponder ao valor da despesa (tolerância de R$ 0,80).", "danger"); return redirect(f"/fuel-fillups/new?transaction_id={transaction.id}")
+    db.add(FuelFillup(workspace_id=wid, vehicle_id=vehicle.id, transaction_id=transaction.id if transaction else None, fillup_date=fillup_date, odometer_km=odometer_km, liters=liters, price_per_liter=price_per_liter, station=(station or "").strip() or None, notes=(notes or "").strip() or None))
+    db.commit(); flash(request, "Abastecimento registrado."); return redirect("/vehicles")
 
 
 @router.post("/accounts")

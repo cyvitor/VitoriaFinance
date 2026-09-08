@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 import json
 
@@ -8,7 +8,8 @@ from sqlalchemy import func, select
 from app.database import SessionLocal
 from app.models import (
     Account, AccountRole, AccountType, Card, CardBillingPeriod, Category, Financing, FinancingAmortization, MemberRole, Person, PersonType,
-    RecurrenceRule, SystemAccount, SystemSetting, Transaction, TransactionStatus, TransactionType, User, UserMemory, UserPersonAccess, Workspace, WorkspaceMember,
+    FuelFillup, RecurrenceRule, SystemAccount, SystemSetting, TelegramPendingAction, Transaction,
+    TransactionStatus, TransactionType, User, UserMemory, UserPersonAccess, Vehicle, Workspace, WorkspaceMember,
 )
 from app.security import hash_password
 from app.services.access_context import build_user_access_context
@@ -62,6 +63,43 @@ def test_tools_never_return_financing_from_forbidden_area():
                 "financing": "Carro da esposa", "new_outstanding_balance": 40000,
                 "remaining_installments": 30,
             })
+
+
+def test_fuel_fillup_tool_calculates_liters_from_known_expense_total():
+    with SessionLocal() as db:
+        user, financing, hidden, rule = setup_financings(db)
+        vehicle = Vehicle(workspace_id=financing.workspace_id, name="Corsa", initial_odometer_km=100000)
+        transaction = Transaction(
+            workspace_id=financing.workspace_id, transaction_type=TransactionType.expense,
+            description="Gasolina", amount=Decimal("50.00"), transaction_date=date(2026, 9, 8),
+            competence_year=2026, competence_month=9, status=TransactionStatus.pending,
+            person_id=financing.person_id, created_by_id=user.id,
+        )
+        db.add_all([vehicle, transaction]); db.flush()
+        db.add(TelegramPendingAction(
+            user_id=user.id, action_type="fuel_fillup", status="collecting",
+            payload=json.dumps({"transaction_id": transaction.id, "phase": "offer"}),
+            expires_at=datetime.utcnow() + timedelta(minutes=30),
+        ))
+        db.commit()
+        result = execute_tool(db, build_user_access_context(db, user), "preparar_abastecimento", {
+            "odometer_km": 140000, "price_per_liter": 7,
+        })
+        assert result["status"] == "awaiting_confirmation"
+        assert result["liters"] == "7.143"
+        assert db.scalar(select(FuelFillup)) is None
+        result = execute_tool(db, build_user_access_context(db, user), "confirmar_acao_pendente", {})
+        assert result["registered"] is True
+        fillup = db.scalar(select(FuelFillup))
+        assert fillup.vehicle_id == vehicle.id
+        correction = execute_tool(db, build_user_access_context(db, user), "preparar_correcao_abastecimento", {
+            "new_price_per_liter": 5.66,
+        })
+        assert correction["status"] == "awaiting_confirmation"
+        execute_tool(db, build_user_access_context(db, user), "confirmar_acao_pendente", {})
+        db.refresh(fillup)
+        assert fillup.price_per_liter == Decimal("5.660")
+        assert fillup.liters == Decimal("8.834")
 
 
 def test_amortization_collects_missing_data_and_updates_only_after_confirmation():
@@ -360,7 +398,7 @@ def test_balance_fallback_answers_query_instead_of_returning_format_error():
     assert "quanto pretende gastar" in reply
 
 
-def test_going_out_answer_keeps_practical_question_even_when_model_only_summarizes(monkeypatch):
+def test_agent_respects_model_tool_selection_without_fixed_intent_override(monkeypatch):
     responses = iter([
         json.dumps({"action": "tool", "tool": "consultar_resumo_mensal", "arguments": {}}),
         "Receitas e despesas consultadas.",
@@ -387,9 +425,8 @@ def test_going_out_answer_keeps_practical_question_even_when_model_only_summariz
             db, user, "Como está meu mês financeiro? Sextou amanhã, posso sair pra tomar uma?",
             reference_date=date(2026, 8, 20),
         )
-    assert called == {"tool": "consultar_saldo_livre", "arguments": {}}
-    assert "R$ 120,00" in reply and "R$ 739,77" in reply
-    assert "quanto pretende gastar" in reply
+    assert called == {"tool": "consultar_resumo_mensal", "arguments": {}}
+    assert reply == "Receitas e despesas consultadas."
 
 
 def test_expense_typo_with_financial_context_still_requires_tool():

@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.models import (
     Account, Card, Category, Financing, FinancingAmortization, Person, RecurrenceOccurrence, RecurrenceRule,
-    TelegramPendingAction, Transaction, TransactionStatus, TransactionType, User,
+    FuelFillup, TelegramPendingAction, Transaction, TransactionStatus, TransactionType, User, Vehicle,
 )
 from app.services.access_context import UserAccessContext
 from app.services.card_billing import card_invoice_is_closed, card_purchase_competence
@@ -851,6 +851,58 @@ def confirm_pending_action(db: Session, context: UserAccessContext, args: dict) 
     action = _active_action(db, context.user_id)
     if not action or action.status != "awaiting_confirmation":
         raise ToolError("Nao ha alteracao completa aguardando confirmacao")
+    if action.action_type == "fuel_fillup":
+        payload = json.loads(action.payload)
+        transaction = db.scalar(select(Transaction).where(
+            Transaction.id == payload.get("transaction_id"),
+            Transaction.workspace_id.in_(context.writable_workspace_ids),
+            Transaction.person_id.in_(context.allowed_person_ids),
+        ))
+        vehicle = db.scalar(select(Vehicle).where(
+            Vehicle.id == payload.get("vehicle_id"), Vehicle.is_active.is_(True),
+            Vehicle.workspace_id.in_(context.writable_workspace_ids),
+        ))
+        if not transaction or not vehicle:
+            action.status = "cancelled"; action.resolved_at = datetime.utcnow(); db.commit()
+            raise ToolError("A despesa ou o veiculo nao esta mais disponivel")
+        if db.scalar(select(FuelFillup.id).where(FuelFillup.transaction_id == transaction.id)):
+            action.status = "confirmed"; action.resolved_at = datetime.utcnow(); db.commit()
+            return {"registered": False, "already_registered": True, "fuel_fillup": True}
+        odometer, liters = Decimal(payload["odometer_km"]), Decimal(payload["liters"])
+        price, total = Decimal(payload["price_per_liter"]), Decimal(transaction.amount)
+        previous = db.scalar(select(FuelFillup.odometer_km).where(
+            FuelFillup.vehicle_id == vehicle.id,
+        ).order_by(FuelFillup.odometer_km.desc()))
+        minimum = Decimal(previous) if previous is not None else Decimal(vehicle.initial_odometer_km)
+        if odometer < minimum or abs((liters * price) - total) > Decimal("0.80"):
+            action.status = "collecting"; db.commit()
+            raise ToolError("Os dados mudaram ou ficaram inconsistentes; revise o abastecimento")
+        db.add(FuelFillup(workspace_id=transaction.workspace_id, vehicle_id=vehicle.id,
+                          transaction_id=transaction.id, fillup_date=transaction.transaction_date,
+                          odometer_km=odometer, liters=liters, price_per_liter=price))
+        action.status = "confirmed"; action.resolved_at = datetime.utcnow(); db.commit()
+        return {"registered": True, "fuel_fillup": True, "vehicle": vehicle.name,
+                "odometer_km": str(odometer), "liters": str(liters),
+                "price_per_liter": str(price), "total": _money(total)}
+    if action.action_type == "fuel_fillup_update":
+        payload = json.loads(action.payload)
+        fillup = db.scalar(select(FuelFillup).where(
+            FuelFillup.id == payload["fillup_id"],
+            FuelFillup.workspace_id.in_(context.writable_workspace_ids),
+        ))
+        original = payload["original"]
+        if not fillup or any((str(fillup.odometer_km) != original["odometer_km"],
+                              str(fillup.liters) != original["liters"],
+                              str(fillup.price_per_liter) != original["price_per_liter"])):
+            action.status = "cancelled"; action.resolved_at = datetime.utcnow(); db.commit()
+            raise ToolError("O abastecimento mudou desde o resumo; inicie a correcao novamente")
+        fillup.odometer_km = Decimal(payload["odometer_km"])
+        fillup.liters = Decimal(payload["liters"])
+        fillup.price_per_liter = Decimal(payload["price_per_liter"])
+        action.status = "confirmed"; action.resolved_at = datetime.utcnow(); db.commit()
+        return {"updated": True, "fuel_fillup_update": True, "vehicle": fillup.vehicle.name,
+                "odometer_km": payload["odometer_km"], "liters": payload["liters"],
+                "price_per_liter": payload["price_per_liter"]}
     if action.action_type == "transaction_update":
         payload = json.loads(action.payload)
         item = db.scalar(select(Transaction).where(
@@ -1021,6 +1073,12 @@ def prepare_expense(db: Session, context: UserAccessContext, args: dict) -> dict
             name for name, missing in (("valor", amount is None), ("descricao", not description)) if missing
         ]}
     user = db.get(User, context.user_id)
+    # Começar uma nova despesa encerra apenas o complemento opcional de combustível anterior.
+    pending_action = _active_action(db, context.user_id)
+    if pending_action and pending_action.action_type == "fuel_fillup":
+        pending_action.status = "cancelled"
+        pending_action.resolved_at = datetime.utcnow()
+        db.commit()
     if user.default_person_id:
         person = db.get(Person, user.default_person_id)
         if person and person.workspace_id not in context.writable_workspace_ids:
@@ -1084,8 +1142,27 @@ def confirm_expense(db: Session, context: UserAccessContext, args: dict) -> dict
     if not transaction:
         raise ToolError("Nao ha despesa aguardando confirmacao")
     finish_processing_queue_item(db, context.user_id, "confirmed")
+    next_expense = _advance_expense_queue(db, context)
+    fuel_followup = False
+    category = db.get(Category, transaction.category_id) if transaction.category_id else None
+    category_label = f"{category.parent_name or ''} {category.name or ''}".casefold() if category else ""
+    vehicles = db.scalars(select(Vehicle).where(
+        Vehicle.workspace_id == transaction.workspace_id, Vehicle.is_active.is_(True),
+    ).order_by(Vehicle.name)).all()
+    if not next_expense and vehicles and any(term in category_label for term in ("combust", "gasolina", "etanol", "diesel")):
+        previous = _active_action(db, context.user_id)
+        if previous:
+            previous.status = "cancelled"; previous.resolved_at = datetime.utcnow()
+        db.add(TelegramPendingAction(
+            user_id=context.user_id, action_type="fuel_fillup", status="collecting",
+            payload=json.dumps({"phase": "offer", "transaction_id": transaction.id}, ensure_ascii=False),
+            expires_at=datetime.utcnow() + timedelta(minutes=30),
+        ))
+        db.commit()
+        fuel_followup = True
     return {"registered": True, "description": transaction.description, "amount": _money(transaction.amount),
-            "next_expense": _advance_expense_queue(db, context)}
+            "next_expense": next_expense, "fuel_followup": fuel_followup,
+            "vehicles": [item.name for item in vehicles] if fuel_followup else []}
 
 
 def update_expense(db: Session, context: UserAccessContext, args: dict) -> dict:
@@ -1146,6 +1223,123 @@ def cancel_expense(db: Session, context: UserAccessContext, args: dict) -> dict:
             "next_expense": _advance_expense_queue(db, context) if cancelled else None}
 
 
+def prepare_fuel_fillup(db: Session, context: UserAccessContext, args: dict) -> dict:
+    """Completa um abastecimento pendente; a IA decide quando e com quais dados chamar."""
+    action = _active_action(db, context.user_id)
+    if not action or action.action_type != "fuel_fillup":
+        raise ToolError("Nao ha abastecimento pendente. Primeiro registre e confirme a despesa de combustivel")
+    payload = json.loads(action.payload)
+    transaction = db.scalar(select(Transaction).where(
+        Transaction.id == payload.get("transaction_id"),
+        Transaction.workspace_id.in_(context.writable_workspace_ids),
+        Transaction.person_id.in_(context.allowed_person_ids),
+    ))
+    if not transaction:
+        action.status = "cancelled"; action.resolved_at = datetime.utcnow(); db.commit()
+        raise ToolError("A despesa vinculada nao esta mais disponivel")
+    vehicles = db.scalars(select(Vehicle).where(
+        Vehicle.workspace_id == transaction.workspace_id, Vehicle.is_active.is_(True),
+    ).order_by(Vehicle.name)).all()
+    requested_vehicle = " ".join(str(args.get("vehicle") or "").casefold().split())
+    vehicle = db.get(Vehicle, payload.get("vehicle_id")) if payload.get("vehicle_id") else None
+    if requested_vehicle:
+        matches = [item for item in vehicles if requested_vehicle == item.name.casefold() or requested_vehicle in item.name.casefold()]
+        if len(matches) != 1:
+            return {"status": "missing_information", "missing_fields": ["veiculo valido"],
+                    "vehicle_options": [item.name for item in vehicles]}
+        vehicle = matches[0]; payload["vehicle_id"] = vehicle.id
+    elif not vehicle and len(vehicles) == 1:
+        vehicle = vehicles[0]; payload["vehicle_id"] = vehicle.id
+    for field in ("odometer_km", "liters", "price_per_liter"):
+        if args.get(field) not in (None, ""):
+            try:
+                value = Decimal(str(args.get(field)))
+            except InvalidOperation as exc:
+                raise ToolError(f"{field} invalido") from exc
+            if value is None or value <= 0:
+                raise ToolError(f"{field} deve ser maior que zero")
+            payload[field] = str(value)
+    total = Decimal(transaction.amount)
+    odometer = Decimal(payload["odometer_km"]) if payload.get("odometer_km") else None
+    liters = Decimal(payload["liters"]) if payload.get("liters") else None
+    price = Decimal(payload["price_per_liter"]) if payload.get("price_per_liter") else None
+    calculated = []
+    if liters is None and price:
+        liters = (total / price).quantize(Decimal("0.001")); payload["liters"] = str(liters); calculated.append("litros")
+    if price is None and liters:
+        price = (total / liters).quantize(Decimal("0.001")); payload["price_per_liter"] = str(price); calculated.append("preco por litro")
+    action.payload = json.dumps(payload, ensure_ascii=False)
+    missing = []
+    if not vehicle: missing.append("veiculo")
+    if odometer is None: missing.append("quilometragem")
+    if liters is None and price is None: missing.append("litros ou preco por litro")
+    if missing:
+        db.commit()
+        return {"status": "missing_information", "missing_fields": missing,
+                "vehicle_options": [item.name for item in vehicles], "known_total": _money(total)}
+    previous = db.scalar(select(FuelFillup.odometer_km).where(
+        FuelFillup.vehicle_id == vehicle.id,
+    ).order_by(FuelFillup.odometer_km.desc()))
+    minimum = Decimal(previous) if previous is not None else Decimal(vehicle.initial_odometer_km)
+    if odometer < minimum:
+        db.commit()
+        return {"status": "inconsistent", "field": "odometer_km", "informed": str(odometer),
+                "minimum": str(minimum), "message": "A quilometragem e menor que a ultima registrada"}
+    computed_total = liters * price
+    difference = abs(computed_total - total)
+    if difference > Decimal("0.80"):
+        db.commit()
+        return {"status": "inconsistent", "field": "fuel_values", "known_total": _money(total),
+                "computed_total": _money(computed_total), "difference": _money(difference),
+                "expected_liters": str((total / price).quantize(Decimal("0.001"))),
+                "message": "Litros e preco por litro nao correspondem ao valor da despesa"}
+    existing = db.scalar(select(FuelFillup).where(FuelFillup.transaction_id == transaction.id))
+    if existing:
+        action.status = "confirmed"; action.resolved_at = datetime.utcnow(); db.commit()
+        return {"registered": False, "already_registered": True, "fuel_fillup": True}
+    action.status = "awaiting_confirmation"
+    action.payload = json.dumps(payload, ensure_ascii=False)
+    db.commit()
+    return {"status": "awaiting_confirmation", "fuel_fillup": True, "vehicle": vehicle.name,
+            "odometer_km": str(odometer), "liters": str(liters), "price_per_liter": str(price),
+            "total": _money(total), "calculated_fields": calculated}
+
+
+def prepare_fuel_fillup_update(db: Session, context: UserAccessContext, args: dict) -> dict:
+    query = select(FuelFillup).where(FuelFillup.workspace_id.in_(context.writable_workspace_ids)).join(Vehicle)
+    vehicle_name = " ".join(str(args.get("vehicle") or "").casefold().split())
+    if vehicle_name:
+        query = query.where(func.lower(Vehicle.name).contains(vehicle_name))
+    fillup = db.scalar(query.order_by(FuelFillup.fillup_date.desc(), FuelFillup.id.desc()))
+    if not fillup:
+        raise ToolError("Nenhum abastecimento foi encontrado para corrigir")
+    total = Decimal(fillup.transaction.amount) if fillup.transaction else Decimal(fillup.liters) * Decimal(fillup.price_per_liter)
+    odometer = Decimal(str(args.get("new_odometer_km", fillup.odometer_km)))
+    liters = Decimal(str(args.get("new_liters", fillup.liters)))
+    price = Decimal(str(args.get("new_price_per_liter", fillup.price_per_liter)))
+    if args.get("new_price_per_liter") not in (None, "") and args.get("new_liters") in (None, "") and fillup.transaction:
+        liters = (total / price).quantize(Decimal("0.001"))
+    elif args.get("new_liters") not in (None, "") and args.get("new_price_per_liter") in (None, "") and fillup.transaction:
+        price = (total / liters).quantize(Decimal("0.001"))
+    if min(odometer, liters, price) <= 0 or abs((liters * price) - total) > Decimal("0.80"):
+        return {"status": "inconsistent", "known_total": _money(total),
+                "computed_total": _money(liters * price), "message": "Os dados corrigidos nao fecham com o total"}
+    previous = _active_action(db, context.user_id)
+    if previous:
+        previous.status = "cancelled"; previous.resolved_at = datetime.utcnow()
+    payload = {"fillup_id": fillup.id, "vehicle_id": fillup.vehicle_id,
+               "odometer_km": str(odometer), "liters": str(liters), "price_per_liter": str(price),
+               "original": {"odometer_km": str(fillup.odometer_km), "liters": str(fillup.liters),
+                            "price_per_liter": str(fillup.price_per_liter)}}
+    db.add(TelegramPendingAction(user_id=context.user_id, action_type="fuel_fillup_update",
+        status="awaiting_confirmation", payload=json.dumps(payload, ensure_ascii=False),
+        expires_at=datetime.utcnow() + timedelta(minutes=30)))
+    db.commit()
+    return {"status": "awaiting_confirmation", "fuel_fillup_update": True,
+            "vehicle": fillup.vehicle.name, "odometer_km": str(odometer), "liters": str(liters),
+            "price_per_liter": str(price), "total": _money(total)}
+
+
 TOOLS = {
     "listar_areas_financeiras": list_financial_areas,
     "consultar_contas": list_accounts,
@@ -1170,6 +1364,8 @@ TOOLS = {
     "sugerir_categoria_despesa": recommend_expense_category,
     "confirmar_despesa": confirm_expense,
     "cancelar_despesa": cancel_expense,
+    "preparar_abastecimento": prepare_fuel_fillup,
+    "preparar_correcao_abastecimento": prepare_fuel_fillup_update,
 }
 
 

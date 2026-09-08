@@ -1,4 +1,4 @@
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 import json
 import re
@@ -8,7 +8,7 @@ import httpx
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models import Account, Person, SystemSetting, TelegramConversationMessage, TelegramPendingAction, User
+from app.models import Account, FuelFillup, Person, SystemSetting, TelegramConversationMessage, TelegramPendingAction, Transaction, User, Vehicle
 from app.logging_config import get_bot_logger
 from app.services.access_context import build_user_access_context
 from app.services.financial_tools import ToolError, execute_tool
@@ -22,6 +22,8 @@ WRITE_TOOLS = {
     "preparar_amortizacao_financiamento", "confirmar_acao_pendente", "cancelar_acao_pendente",
     "preparar_despesa", "confirmar_despesa", "cancelar_despesa",
     "atualizar_despesa", "preparar_despesas", "sugerir_categoria_despesa",
+    "preparar_abastecimento",
+    "preparar_correcao_abastecimento",
 }
 
 
@@ -50,6 +52,8 @@ Ferramentas permitidas e argumentos:
 - sugerir_categoria_despesa: {}
 - confirmar_despesa: {}
 - cancelar_despesa: {}
+- preparar_abastecimento: {"vehicle":texto opcional,"odometer_km":numero opcional,"liters":numero opcional,"price_per_liter":numero opcional}. Use somente quando o contexto indicar action_type=fuel_fillup. Com total conhecido, quilometragem e apenas um entre liters/price_per_liter bastam.
+- preparar_correcao_abastecimento: {"vehicle":texto opcional,"new_odometer_km":numero opcional,"new_liters":numero opcional,"new_price_per_liter":numero opcional}. Corrige o abastecimento mais recente e sempre exige confirmacao posterior.
 """
 
 
@@ -493,6 +497,138 @@ def _pending_context(db: Session, user: User) -> str:
     return "\n".join(parts) or "Nenhuma acao pendente."
 
 
+def _fuel_conversation_reply(db: Session, user: User, text: str) -> str | None:
+    action = db.scalar(select(TelegramPendingAction).where(
+        TelegramPendingAction.user_id == user.id,
+        TelegramPendingAction.action_type == "fuel_fillup",
+        TelegramPendingAction.status == "collecting",
+    ).order_by(TelegramPendingAction.id.desc()))
+    if not action:
+        return None
+    if action.expires_at < datetime.utcnow():
+        action.status = "expired"; action.resolved_at = datetime.utcnow(); db.commit()
+        return None
+    payload = json.loads(action.payload)
+    normalized = _normalized_text(text).strip(" .,!?:;")
+    # Um novo gasto deve interromper o complemento opcional do abastecimento anterior.
+    # Sem isso, valores como "60 de gasolina" seriam confundidos com quilometragem.
+    fuel_terms = ("gasolina", "alcool", "alcol", "etanol", "diesel", "combustivel")
+    detail_terms = ("km", "quilometr", "litro", "preco por", "valor por litro")
+    starts_new_expense = (
+        payload.get("phase") in ("vehicle", "details")
+        and any(term in normalized for term in fuel_terms)
+        and not any(term in normalized for term in detail_terms)
+        and (
+            any(term in normalized for term in ("gastei", "paguei", "comprei", "reais", "r$"))
+            or re.search(r"^\s*\d+(?:[.,]\d+)?\s+(?:de|em|com)\s+", normalized)
+        )
+    )
+    if starts_new_expense:
+        action.status = "cancelled"
+        action.resolved_at = datetime.utcnow()
+        db.commit()
+        return None
+    negative = any(term in normalized for term in ("nao", "agora nao", "cancelar", "cancela", "ignore"))
+    affirmative = normalized in {"sim", "pode", "quero", "vamos", "ok", "certo", "yes"}
+    if payload.get("phase") == "offer":
+        if negative:
+            action.status = "cancelled"; action.resolved_at = datetime.utcnow(); db.commit()
+            return "Tudo certo. A despesa permanece registrada sem os dados do abastecimento."
+        if not affirmative:
+            return "Responda **sim** para informar o abastecimento ou **não** para encerrar."
+        transaction = db.get(Transaction, payload.get("transaction_id"))
+        vehicles = db.scalars(select(Vehicle).where(
+            Vehicle.workspace_id == transaction.workspace_id, Vehicle.is_active.is_(True),
+        ).order_by(Vehicle.name)).all() if transaction else []
+        if not transaction or not vehicles:
+            action.status = "cancelled"; action.resolved_at = datetime.utcnow(); db.commit()
+            return "Não encontrei veículo ativo nessa conta. Cadastre um veículo na interface web primeiro."
+        if len(vehicles) == 1:
+            payload.update(phase="details", vehicle_id=vehicles[0].id)
+            question = f"Veículo: **{vehicles[0].name}**. Informe a quilometragem e pelo menos litros ou preço por litro. Exemplo: `45230 km, preço por litro 6,00`. Como já conheço o valor total, calculo o dado restante."
+        else:
+            payload["phase"] = "vehicle"
+            question = "Qual veículo foi abastecido?\n\n" + "\n".join(f"- {item.name}" for item in vehicles)
+        action.payload = json.dumps(payload, ensure_ascii=False); db.commit(); return question
+    if payload.get("phase") == "vehicle":
+        transaction = db.get(Transaction, payload.get("transaction_id"))
+        vehicles = db.scalars(select(Vehicle).where(
+            Vehicle.workspace_id == transaction.workspace_id, Vehicle.is_active.is_(True),
+        )).all() if transaction else []
+        matches = [item for item in vehicles if normalized == _normalized_text(item.name) or normalized in _normalized_text(item.name)]
+        if len(matches) != 1:
+            return "Não identifiquei um único veículo. Escolha: " + ", ".join(item.name for item in vehicles)
+        payload.update(phase="details", vehicle_id=matches[0].id)
+        action.payload = json.dumps(payload, ensure_ascii=False); db.commit()
+        return f"Certo, **{matches[0].name}**. Informe a quilometragem e pelo menos litros ou preço por litro. Exemplo: `45230 km, preço por litro 6,00`. Como já conheço o total, calculo o restante."
+    if payload.get("phase") == "details":
+        def parsed_number(value: str) -> Decimal:
+            return Decimal(value.replace(".", "").replace(",", ".") if "," in value else value)
+        transaction, vehicle = db.get(Transaction, payload.get("transaction_id")), db.get(Vehicle, payload.get("vehicle_id"))
+        if not transaction or not vehicle:
+            action.status = "cancelled"; action.resolved_at = datetime.utcnow(); db.commit()
+            return "A despesa ou o veículo não está mais disponível. Inicie o cadastro novamente."
+        number = r"(\d+(?:[.,]\d+)?)"
+        normalized_details = _normalized_text(text)
+        km_match = re.search(number + r"\s*(?:km|quilometros?)", normalized_details) or re.search(r"quilometr(?:agem|os?)\s*(?:de|:|=)?\s*" + number, normalized_details)
+        liter_match = re.search(number + r"\s*(?:l|litros?)\b", normalized_details) or re.search(r"litros?\s*(?:de|:|=)?\s*" + number, normalized_details)
+        price_match = re.search(r"(?:valor|preco)(?:\s+por)?\s+(?:o\s+)?litro\s*(?:de|:|=)?\s*(?:r\$\s*)?" + number, normalized_details)
+        values = re.findall(number, normalized_details)
+        if km_match:
+            payload["odometer_km"] = str(parsed_number(km_match.group(1)))
+        if liter_match:
+            payload["liters"] = str(parsed_number(liter_match.group(1)))
+        if price_match:
+            payload["price_per_liter"] = str(parsed_number(price_match.group(1)))
+        if not any((km_match, liter_match, price_match)):
+            if len(values) >= 3:
+                payload.update(odometer_km=str(parsed_number(values[0])), liters=str(parsed_number(values[1])), price_per_liter=str(parsed_number(values[2])))
+            elif len(values) == 2:
+                payload.update(odometer_km=str(parsed_number(values[0])), price_per_liter=str(parsed_number(values[1])))
+            elif len(values) == 1 and not payload.get("odometer_km"):
+                payload["odometer_km"] = str(parsed_number(values[0]))
+        action.payload = json.dumps(payload, ensure_ascii=False)
+        odometer = Decimal(payload["odometer_km"]) if payload.get("odometer_km") else None
+        liters = Decimal(payload["liters"]) if payload.get("liters") else None
+        price = Decimal(payload["price_per_liter"]) if payload.get("price_per_liter") else None
+        if odometer is None:
+            db.commit(); return "Qual é a quilometragem atual do veículo?"
+        if liters is None and price is None:
+            db.commit(); return "Agora informe os litros abastecidos ou o preço por litro. Como o total da despesa já é conhecido, consigo calcular o outro valor."
+        total = Decimal(transaction.amount)
+        calculated = None
+        if liters is None and price and price > 0:
+            liters = (total / price).quantize(Decimal("0.001"))
+            payload["liters"] = str(liters); calculated = f"Calculei **{liters} litros** usando o total de {_format_brl(total)}."
+        elif price is None and liters and liters > 0:
+            price = (total / liters).quantize(Decimal("0.001"))
+            payload["price_per_liter"] = str(price); calculated = f"Calculei o preço de **{_format_brl(price)} por litro** usando o total da despesa."
+        action.payload = json.dumps(payload, ensure_ascii=False)
+        if liters is None or price is None or liters <= 0 or price <= 0:
+            db.commit(); return "Litros e preço por litro precisam ser maiores que zero. Corrija o dado informado."
+        previous = db.scalar(select(FuelFillup.odometer_km).where(FuelFillup.vehicle_id == vehicle.id).order_by(FuelFillup.odometer_km.desc()))
+        minimum = Decimal(previous) if previous is not None else Decimal(vehicle.initial_odometer_km)
+        if odometer < minimum:
+            db.commit(); return f"A quilometragem informada ({odometer} km) é menor que a última registrada ({minimum} km). Confira e envie a quilometragem correta."
+        informed_total = liters * price
+        difference = abs(informed_total - total)
+        if difference > Decimal("0.80"):
+            expected_liters = (total / price).quantize(Decimal("0.001"))
+            db.commit(); return (f"Encontrei uma inconsistência: {liters} litros × {_format_brl(price)} resulta em {_format_brl(informed_total)}, "
+                                 f"mas a despesa foi {_format_brl(total)}. Com esse preço, seriam aproximadamente {expected_liters} litros. Corrija os litros ou o preço por litro.")
+        existing = db.scalar(select(FuelFillup).where(FuelFillup.transaction_id == transaction.id))
+        if existing:
+            action.status = "confirmed"; action.resolved_at = datetime.utcnow(); db.commit()
+            return "Esse abastecimento já foi registrado anteriormente."
+        db.add(FuelFillup(workspace_id=transaction.workspace_id, vehicle_id=vehicle.id,
+                          transaction_id=transaction.id, fillup_date=transaction.transaction_date,
+                          odometer_km=odometer, liters=liters, price_per_liter=price))
+        action.status = "confirmed"; action.resolved_at = datetime.utcnow(); db.commit()
+        prefix = (calculated + "\n\n") if calculated else ""
+        return prefix + f"Abastecimento do **{vehicle.name}** registrado: {liters} litros, {odometer} km e {_format_brl(price)} por litro."
+    return None
+
+
 def _format_brl(value) -> str:
     try:
         formatted = f"{Decimal(str(value)):,.2f}"
@@ -607,6 +743,15 @@ def _expense_tool_reply(tool_name: str, result: dict, model_reply: str) -> str:
         return heading + "\n\nAgora vamos para a próxima despesa:\n\n" + str(
             next_expense.get("summary") or ""
         )
+    if result.get("registered"):
+        reply = (
+            f"Despesa registrada com sucesso: **{result.get('description', '')}**"
+            + (f" — {_format_brl(result.get('amount'))}" if result.get("amount") else "")
+            + "."
+        )
+        if result.get("fuel_followup"):
+            return reply + "\n\nDeseja registrar também os dados deste abastecimento no veículo?"
+        return reply + "\n\nSe quiser, posso mostrar o resumo de hoje ou consultar seu saldo disponível."
     if result.get("status") == "missing_information" and result.get("summary"):
         summary = str(result["summary"]).replace("\n\nPosso registrar?", "")
         options = result.get("category_options") or []
@@ -629,7 +774,32 @@ def _expense_tool_reply(tool_name: str, result: dict, model_reply: str) -> str:
                 f"Orçamento de **{impact['category']}**: havia **R$ {impact['remaining']}** disponíveis "
                 f"e restarão **R$ {impact['remaining_after_spending']}** após esta compra."
             )
-        return str(result.get("summary") or model_reply) + "\n\n" + budget_text + "\n\nPosso registrar?"
+        summary = str(result.get("summary") or model_reply).replace("\n\nPosso registrar?", "").rstrip()
+        return summary + "\n\n" + budget_text + "\n\nPosso registrar?"
+    return model_reply
+
+
+def _fuel_tool_reply(result: dict, model_reply: str) -> str:
+    if result.get("already_registered"):
+        return "Esse abastecimento já foi registrado. Se algum dado estiver incorreto, posso preparar uma correção."
+    if result.get("fuel_fillup") and result.get("status") == "awaiting_confirmation":
+        calculated = ", ".join(result.get("calculated_fields") or [])
+        note = f"\nCalculei automaticamente: {calculated}." if calculated else ""
+        return (f"Confira o abastecimento:\n\nVeículo: **{result.get('vehicle')}**\n"
+                f"Quilometragem: **{result.get('odometer_km')} km**\n"
+                f"Litros: **{result.get('liters')} L**\n"
+                f"Preço por litro: **{_format_brl(result.get('price_per_liter'))}**\n"
+                f"Total: **{_format_brl(result.get('total'))}**{note}\n\nPosso registrar?")
+    if result.get("registered") and result.get("fuel_fillup"):
+        return (f"Abastecimento do **{result.get('vehicle')}** registrado com sucesso: "
+                f"{result.get('liters')} L, {result.get('odometer_km')} km e "
+                f"{_format_brl(result.get('price_per_liter'))} por litro.")
+    if result.get("fuel_fillup_update") and result.get("status") == "awaiting_confirmation":
+        return (f"Confira a correção do abastecimento de **{result.get('vehicle')}**:\n\n"
+                f"Quilometragem: **{result.get('odometer_km')} km**\nLitros: **{result.get('liters')} L**\n"
+                f"Preço por litro: **{_format_brl(result.get('price_per_liter'))}**\n\nPosso confirmar a correção?")
+    if result.get("updated") and result.get("fuel_fillup_update"):
+        return f"Abastecimento do **{result.get('vehicle')}** corrigido com sucesso."
     return model_reply
 
 
@@ -711,7 +881,10 @@ Memorias sao pistas pessoais, nunca dados financeiros atuais. Quando marcadas co
 O historico da conversa nao prova que um lancamento ainda existe, pois ele pode ter sido alterado ou excluido pela interface web.
 Nunca afirme que uma despesa ja esta registrada ou que um dado financeiro esta atualizado usando apenas historico ou memoria; use a ferramenta adequada e considere o banco como fonte da verdade.
 Quando houver acao aguardando confirmacao, interprete confirmacao ou cancelamento natural e escolha a ferramenta correta.
-Uma confirmacao de despesa usa confirmar_despesa; receita e amortizacao usam confirmar_acao_pendente.
+Uma confirmacao de despesa usa confirmar_despesa; receita, amortizacao, abastecimento e correcao de abastecimento usam confirmar_acao_pendente.
+Quando houver abastecimento pendente em collecting, use preparar_abastecimento para aceitar os dados informados de forma livre. O valor total ja esta no contexto; quilometragem e pelo menos litros ou preco por litro bastam, pois o backend calcula o outro. Em respostas como "sim, 155000, 6,00l" durante a pergunta do abastecimento, interprete o primeiro numero como odometer_km e o segundo como price_per_liter, porque o total pago ja e conhecido; nao interprete 155000 como dinheiro. Se litros forem declarados explicitamente como quantidade abastecida, use liters. A ferramenta apenas prepara um resumo; depois use confirmar_acao_pendente quando o usuario confirmar. Se ele corrigir os dados antes da confirmacao, chame preparar_abastecimento novamente com a correcao. Se o abastecimento ja foi gravado e o usuario disser "na verdade" ou pedir correcao, use preparar_correcao_abastecimento. Se o usuario mudar de assunto, atenda ao novo pedido normalmente; nao force a continuacao do abastecimento.
+Se o usuario disser que quer adicionar um novo abastecimento e informar valor, cartao ou forma de pagamento, mas NAO existir action_type=fuel_fillup no contexto, isso ainda e uma nova despesa de combustivel: use preparar_despesa com description Gasolina/Etanol/Combustivel, amount, card e payment_method. Nunca use preparar_abastecimento antes de a despesa ser confirmada. Depois de confirmar_despesa, o backend criara o contexto de abastecimento e perguntara se ele deseja complementar os dados.
+Se o usuario disser "esqueca", "vamos adicionar outro" ou equivalente e ja trouxer os dados de uma nova despesa na mesma mensagem, escolha preparar_despesa diretamente; o backend encerrara o complemento opcional anterior. Nao desperdice o turno chamando apenas cancelamento.
 Quando houver despesa pendente e o usuario corrigir ou complementar descricao, area, categoria, pagamento ou cartao, use atualizar_despesa e envie todos os campos informados. A area padrao do usuario deve ser usada ao iniciar uma despesa; so troque a area se ele pedir explicitamente. Nunca apenas diga que atualizou.
 Quando o usuario pedir para procurar, escolher ou sugerir a categoria de uma despesa pendente, use sugerir_categoria_despesa. Nao devolva apenas uma lista se o backend conseguir recomendar uma categoria.
 Para registrar dinheiro recebido, inclusive PIX, use preparar_receita. Se faltarem dados, chame preparar_receita novamente com a resposta do usuario. Nunca escolha uma conta de destino sem informacao suficiente.
@@ -735,22 +908,7 @@ Retorne SOMENTE JSON valido em um destes formatos:
         TelegramPendingAction.status.in_(["collecting", "awaiting_confirmation"]),
     ).order_by(TelegramPendingAction.id.desc()))
     selector_messages = [{"role": "system", "content": system}, *history, {"role": "user", "content": text}]
-    undecided = {"action": "undecided"}
-    decision = _enforce_pending_confirmation_intent(text, has_expense_draft, undecided)
-    if decision is undecided:
-        decision = _enforce_category_recommendation_intent(text, has_expense_draft, undecided)
-    if decision is undecided:
-        decision = _enforce_pending_action_confirmation_intent(text, pending_action, undecided)
-    if decision is undecided:
-        decision = _enforce_pending_income_collection_intent(db, text, pending_action, undecided)
-    if decision is undecided:
-        decision = _select_decision(token, model, selector_messages, text)
-    decision = _enforce_pending_expense_intent(text, has_expense_draft, decision)
-    decision = _enforce_pending_description_intent(text, has_expense_draft, decision)
-    decision = _enforce_expense_reference_date(decision, reference_date, text)
-    decision = _enforce_balance_intent(text, history, decision)
-    decision = _enforce_spending_feasibility_intent(text, history, decision)
-    decision = _enforce_transaction_period_intent(text, decision, reference_date)
+    decision = _select_decision(token, model, selector_messages, text)
     db.add(TelegramConversationMessage(user_id=user.id, role="user", content=text[:4000]))
     if decision.get("action") == "respond":
         reply = str(decision.get("reply") or "Como posso ajudar com suas financas?")[:4000]
@@ -809,6 +967,7 @@ apresente o saldo livre e a projecao mensal e pergunte o valor aproximado e como
             except AIUnavailableError:
                 reply = _fallback_tool_reply(tool_name, result)
         reply = _expense_tool_reply(tool_name, result, reply)[:4000]
+        reply = _fuel_tool_reply(result, reply)[:4000]
         if (tool_name == "consultar_saldo_livre" and "error" not in result
                 and "free_balance" in result and _asks_spending_feasibility(text)
                 and Decimal(str(result.get("planned_spending") or 0)) == 0):
