@@ -10,3 +10,4 @@ htmlcov/
 .idea/
 .vscode/
 logs/
+backups/

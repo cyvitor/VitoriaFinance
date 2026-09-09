@@ -1,5 +1,6 @@
 import time
 
+import httpx
 from sqlalchemy import select
 
 from app.automation.telegram_bot import handle_message
@@ -45,6 +46,15 @@ def run() -> None:
         except KeyboardInterrupt:
             logger.info("Worker encerrado.")
             return
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 409:
+                logger.critical(
+                    "Telegram recusou o long polling: outro worker esta usando o mesmo token. "
+                    "Pare o bot duplicado ou configure tokens diferentes para producao e homologacao."
+                )
+                return
+            logger.exception("Erro HTTP no polling do Telegram; nova tentativa em 5 segundos.")
+            time.sleep(5)
         except Exception:
             logger.exception("Erro no polling do Telegram; nova tentativa em 5 segundos.")
             time.sleep(5)
