@@ -52,8 +52,8 @@ Ferramentas permitidas e argumentos:
 - sugerir_categoria_despesa: {}
 - confirmar_despesa: {}
 - cancelar_despesa: {}
-- preparar_abastecimento: {"vehicle":texto opcional,"odometer_km":numero opcional,"liters":numero opcional,"price_per_liter":numero opcional}. Use somente quando o contexto indicar action_type=fuel_fillup. Com total conhecido, quilometragem e apenas um entre liters/price_per_liter bastam.
-- preparar_correcao_abastecimento: {"vehicle":texto opcional,"new_odometer_km":numero opcional,"new_liters":numero opcional,"new_price_per_liter":numero opcional}. Corrige o abastecimento mais recente e sempre exige confirmacao posterior.
+- preparar_abastecimento: {"vehicle":texto opcional,"odometer_km":numero opcional,"liters":numero opcional,"price_per_liter":numero opcional,"full_tank":booleano opcional}. Use somente quando o contexto indicar action_type=fuel_fillup. Com total conhecido, quilometragem e apenas um entre liters/price_per_liter bastam. Pergunte se encheu o tanque quando full_tank ainda nao foi informado.
+- preparar_correcao_abastecimento: {"vehicle":texto opcional,"new_odometer_km":numero opcional,"new_liters":numero opcional,"new_price_per_liter":numero opcional,"new_full_tank":booleano opcional}. Corrige o abastecimento mais recente e sempre exige confirmacao posterior.
 """
 
 
@@ -789,15 +789,18 @@ def _fuel_tool_reply(result: dict, model_reply: str) -> str:
                 f"Quilometragem: **{result.get('odometer_km')} km**\n"
                 f"Litros: **{result.get('liters')} L**\n"
                 f"Preço por litro: **{_format_brl(result.get('price_per_liter'))}**\n"
+                f"Tanque: **{'cheio' if result.get('full_tank') else 'parcial'}**\n"
                 f"Total: **{_format_brl(result.get('total'))}**{note}\n\nPosso registrar?")
     if result.get("registered") and result.get("fuel_fillup"):
         return (f"Abastecimento do **{result.get('vehicle')}** registrado com sucesso: "
                 f"{result.get('liters')} L, {result.get('odometer_km')} km e "
-                f"{_format_brl(result.get('price_per_liter'))} por litro.")
+                f"{_format_brl(result.get('price_per_liter'))} por litro; "
+                f"tanque {'cheio' if result.get('full_tank') else 'parcial'}.")
     if result.get("fuel_fillup_update") and result.get("status") == "awaiting_confirmation":
         return (f"Confira a correção do abastecimento de **{result.get('vehicle')}**:\n\n"
                 f"Quilometragem: **{result.get('odometer_km')} km**\nLitros: **{result.get('liters')} L**\n"
-                f"Preço por litro: **{_format_brl(result.get('price_per_liter'))}**\n\nPosso confirmar a correção?")
+                f"Preço por litro: **{_format_brl(result.get('price_per_liter'))}**\n"
+                f"Tanque: **{'cheio' if result.get('full_tank') else 'parcial'}**\n\nPosso confirmar a correção?")
     if result.get("updated") and result.get("fuel_fillup_update"):
         return f"Abastecimento do **{result.get('vehicle')}** corrigido com sucesso."
     return model_reply
@@ -883,6 +886,7 @@ Nunca afirme que uma despesa ja esta registrada ou que um dado financeiro esta a
 Quando houver acao aguardando confirmacao, interprete confirmacao ou cancelamento natural e escolha a ferramenta correta.
 Uma confirmacao de despesa usa confirmar_despesa; receita, amortizacao, abastecimento e correcao de abastecimento usam confirmar_acao_pendente.
 Quando houver abastecimento pendente em collecting, use preparar_abastecimento para aceitar os dados informados de forma livre. O valor total ja esta no contexto; quilometragem e pelo menos litros ou preco por litro bastam, pois o backend calcula o outro. Em respostas como "sim, 155000, 6,00l" durante a pergunta do abastecimento, interprete o primeiro numero como odometer_km e o segundo como price_per_liter, porque o total pago ja e conhecido; nao interprete 155000 como dinheiro. Se litros forem declarados explicitamente como quantidade abastecida, use liters. A ferramenta apenas prepara um resumo; depois use confirmar_acao_pendente quando o usuario confirmar. Se ele corrigir os dados antes da confirmacao, chame preparar_abastecimento novamente com a correcao. Se o abastecimento ja foi gravado e o usuario disser "na verdade" ou pedir correcao, use preparar_correcao_abastecimento. Se o usuario mudar de assunto, atenda ao novo pedido normalmente; nao force a continuacao do abastecimento.
+Para abastecimentos, extraia full_tank=true de frases como "completei", "encheu", "tanque cheio" ou "ate completar"; use full_tank=false para "parcial", "nao encheu" ou "nao completei". Se a informacao nao foi dada, a ferramenta retornara o campo ausente e voce deve perguntar de forma objetiva antes de apresentar a confirmacao final.
 Se o usuario disser que quer adicionar um novo abastecimento e informar valor, cartao ou forma de pagamento, mas NAO existir action_type=fuel_fillup no contexto, isso ainda e uma nova despesa de combustivel: use preparar_despesa com description Gasolina/Etanol/Combustivel, amount, card e payment_method. Nunca use preparar_abastecimento antes de a despesa ser confirmada. Depois de confirmar_despesa, o backend criara o contexto de abastecimento e perguntara se ele deseja complementar os dados.
 Se o usuario disser "esqueca", "vamos adicionar outro" ou equivalente e ja trouxer os dados de uma nova despesa na mesma mensagem, escolha preparar_despesa diretamente; o backend encerrara o complemento opcional anterior. Nao desperdice o turno chamando apenas cancelamento.
 Quando houver despesa pendente e o usuario corrigir ou complementar descricao, area, categoria, pagamento ou cartao, use atualizar_despesa e envie todos os campos informados. A area padrao do usuario deve ser usada ao iniciar uma despesa; so troque a area se ele pedir explicitamente. Nunca apenas diga que atualizou.

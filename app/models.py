@@ -458,6 +458,7 @@ class FuelFillup(Base):
     odometer_km: Mapped[Decimal] = mapped_column(Numeric(12, 1))
     liters: Mapped[Decimal] = mapped_column(Numeric(12, 3))
     price_per_liter: Mapped[Decimal] = mapped_column(Numeric(12, 3))
+    is_full_tank: Mapped[bool] = mapped_column(Boolean, default=False)
     station: Mapped[str | None] = mapped_column(String(120), nullable=True)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

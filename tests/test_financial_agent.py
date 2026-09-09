@@ -83,7 +83,7 @@ def test_fuel_fillup_tool_calculates_liters_from_known_expense_total():
         ))
         db.commit()
         result = execute_tool(db, build_user_access_context(db, user), "preparar_abastecimento", {
-            "odometer_km": 140000, "price_per_liter": 7,
+            "odometer_km": 140000, "price_per_liter": 7, "full_tank": True,
         })
         assert result["status"] == "awaiting_confirmation"
         assert result["liters"] == "7.143"
@@ -92,6 +92,7 @@ def test_fuel_fillup_tool_calculates_liters_from_known_expense_total():
         assert result["registered"] is True
         fillup = db.scalar(select(FuelFillup))
         assert fillup.vehicle_id == vehicle.id
+        assert fillup.is_full_tank is True
         correction = execute_tool(db, build_user_access_context(db, user), "preparar_correcao_abastecimento", {
             "new_price_per_liter": 5.66,
         })

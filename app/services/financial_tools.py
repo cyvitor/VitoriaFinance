@@ -879,11 +879,13 @@ def confirm_pending_action(db: Session, context: UserAccessContext, args: dict) 
             raise ToolError("Os dados mudaram ou ficaram inconsistentes; revise o abastecimento")
         db.add(FuelFillup(workspace_id=transaction.workspace_id, vehicle_id=vehicle.id,
                           transaction_id=transaction.id, fillup_date=transaction.transaction_date,
-                          odometer_km=odometer, liters=liters, price_per_liter=price))
+                          odometer_km=odometer, liters=liters, price_per_liter=price,
+                          is_full_tank=bool(payload["full_tank"])))
         action.status = "confirmed"; action.resolved_at = datetime.utcnow(); db.commit()
         return {"registered": True, "fuel_fillup": True, "vehicle": vehicle.name,
                 "odometer_km": str(odometer), "liters": str(liters),
-                "price_per_liter": str(price), "total": _money(total)}
+                "price_per_liter": str(price), "full_tank": bool(payload["full_tank"]),
+                "total": _money(total)}
     if action.action_type == "fuel_fillup_update":
         payload = json.loads(action.payload)
         fillup = db.scalar(select(FuelFillup).where(
@@ -893,16 +895,18 @@ def confirm_pending_action(db: Session, context: UserAccessContext, args: dict) 
         original = payload["original"]
         if not fillup or any((str(fillup.odometer_km) != original["odometer_km"],
                               str(fillup.liters) != original["liters"],
-                              str(fillup.price_per_liter) != original["price_per_liter"])):
+                              str(fillup.price_per_liter) != original["price_per_liter"],
+                              fillup.is_full_tank != original["full_tank"])):
             action.status = "cancelled"; action.resolved_at = datetime.utcnow(); db.commit()
             raise ToolError("O abastecimento mudou desde o resumo; inicie a correcao novamente")
         fillup.odometer_km = Decimal(payload["odometer_km"])
         fillup.liters = Decimal(payload["liters"])
         fillup.price_per_liter = Decimal(payload["price_per_liter"])
+        fillup.is_full_tank = bool(payload["full_tank"])
         action.status = "confirmed"; action.resolved_at = datetime.utcnow(); db.commit()
         return {"updated": True, "fuel_fillup_update": True, "vehicle": fillup.vehicle.name,
                 "odometer_km": payload["odometer_km"], "liters": payload["liters"],
-                "price_per_liter": payload["price_per_liter"]}
+                "price_per_liter": payload["price_per_liter"], "full_tank": bool(payload["full_tank"])}
     if action.action_type == "transaction_update":
         payload = json.loads(action.payload)
         item = db.scalar(select(Transaction).where(
@@ -1259,6 +1263,8 @@ def prepare_fuel_fillup(db: Session, context: UserAccessContext, args: dict) -> 
             if value is None or value <= 0:
                 raise ToolError(f"{field} deve ser maior que zero")
             payload[field] = str(value)
+    if args.get("full_tank") is not None:
+        payload["full_tank"] = bool(args.get("full_tank"))
     total = Decimal(transaction.amount)
     odometer = Decimal(payload["odometer_km"]) if payload.get("odometer_km") else None
     liters = Decimal(payload["liters"]) if payload.get("liters") else None
@@ -1273,6 +1279,7 @@ def prepare_fuel_fillup(db: Session, context: UserAccessContext, args: dict) -> 
     if not vehicle: missing.append("veiculo")
     if odometer is None: missing.append("quilometragem")
     if liters is None and price is None: missing.append("litros ou preco por litro")
+    if "full_tank" not in payload: missing.append("se o tanque foi completado")
     if missing:
         db.commit()
         return {"status": "missing_information", "missing_fields": missing,
@@ -1302,7 +1309,7 @@ def prepare_fuel_fillup(db: Session, context: UserAccessContext, args: dict) -> 
     db.commit()
     return {"status": "awaiting_confirmation", "fuel_fillup": True, "vehicle": vehicle.name,
             "odometer_km": str(odometer), "liters": str(liters), "price_per_liter": str(price),
-            "total": _money(total), "calculated_fields": calculated}
+            "total": _money(total), "full_tank": payload["full_tank"], "calculated_fields": calculated}
 
 
 def prepare_fuel_fillup_update(db: Session, context: UserAccessContext, args: dict) -> dict:
@@ -1317,6 +1324,7 @@ def prepare_fuel_fillup_update(db: Session, context: UserAccessContext, args: di
     odometer = Decimal(str(args.get("new_odometer_km", fillup.odometer_km)))
     liters = Decimal(str(args.get("new_liters", fillup.liters)))
     price = Decimal(str(args.get("new_price_per_liter", fillup.price_per_liter)))
+    full_tank = bool(args.get("new_full_tank")) if args.get("new_full_tank") is not None else fillup.is_full_tank
     if args.get("new_price_per_liter") not in (None, "") and args.get("new_liters") in (None, "") and fillup.transaction:
         liters = (total / price).quantize(Decimal("0.001"))
     elif args.get("new_liters") not in (None, "") and args.get("new_price_per_liter") in (None, "") and fillup.transaction:
@@ -1328,16 +1336,16 @@ def prepare_fuel_fillup_update(db: Session, context: UserAccessContext, args: di
     if previous:
         previous.status = "cancelled"; previous.resolved_at = datetime.utcnow()
     payload = {"fillup_id": fillup.id, "vehicle_id": fillup.vehicle_id,
-               "odometer_km": str(odometer), "liters": str(liters), "price_per_liter": str(price),
+               "odometer_km": str(odometer), "liters": str(liters), "price_per_liter": str(price), "full_tank": full_tank,
                "original": {"odometer_km": str(fillup.odometer_km), "liters": str(fillup.liters),
-                            "price_per_liter": str(fillup.price_per_liter)}}
+                            "price_per_liter": str(fillup.price_per_liter), "full_tank": fillup.is_full_tank}}
     db.add(TelegramPendingAction(user_id=context.user_id, action_type="fuel_fillup_update",
         status="awaiting_confirmation", payload=json.dumps(payload, ensure_ascii=False),
         expires_at=datetime.utcnow() + timedelta(minutes=30)))
     db.commit()
     return {"status": "awaiting_confirmation", "fuel_fillup_update": True,
             "vehicle": fillup.vehicle.name, "odometer_km": str(odometer), "liters": str(liters),
-            "price_per_liter": str(price), "total": _money(total)}
+            "price_per_liter": str(price), "full_tank": full_tank, "total": _money(total)}
 
 
 TOOLS = {

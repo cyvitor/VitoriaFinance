@@ -1714,8 +1714,30 @@ def vehicles(request: Request, db: Session = Depends(get_db), user: User = Depen
         rolling_chart["km"].append(float(current_km - previous_km) if previous_km is not None and current_km >= previous_km else 0)
         rolling_chart["prices"].append(float(fillup.price_per_liter))
         previous_by_vehicle[fillup.vehicle_id] = current_km
+    consumption_chart = {"labels": [], "values": []}
+    consumption_state = {}
+    total_interval_km, total_interval_liters = Decimal(0), Decimal(0)
+    vehicle_names = {item.id: item.name for item in items}
+    for fillup in all_fillups:
+        state = consumption_state.setdefault(fillup.vehicle_id, {"full_odometer": None, "liters": Decimal(0)})
+        if state["full_odometer"] is not None:
+            state["liters"] += Decimal(fillup.liters)
+        if not fillup.is_full_tank:
+            continue
+        current_odometer = Decimal(fillup.odometer_km)
+        if state["full_odometer"] is not None and current_odometer > state["full_odometer"] and state["liters"] > 0:
+            interval_km = current_odometer - state["full_odometer"]
+            consumption = interval_km / state["liters"]
+            consumption_chart["labels"].append(f"{vehicle_names.get(fillup.vehicle_id, 'Veículo')} · {fillup.fillup_date.strftime('%d/%m/%Y')}")
+            consumption_chart["values"].append(round(float(consumption), 2))
+            total_interval_km += interval_km
+            total_interval_liters += state["liters"]
+        state["full_odometer"] = current_odometer
+        state["liters"] = Decimal(0)
+    average_consumption = total_interval_km / total_interval_liters if total_interval_liters else None
     return render(request, "vehicles/index.html", user=user, items=items, fillups=fillups, chart=chart,
-                  rolling_chart=rolling_chart, rolling_start=date.today() - timedelta(days=365))
+                  rolling_chart=rolling_chart, rolling_start=date.today() - timedelta(days=365),
+                  consumption_chart=consumption_chart, average_consumption=average_consumption)
 
 
 @router.post("/vehicles")
@@ -1763,7 +1785,7 @@ def fuel_fillup_form(request: Request, transaction_id: int | None = None, manual
 @router.post("/fuel-fillups")
 def fuel_fillup_create(request: Request, vehicle_id: int = Form(), transaction_id: str | None = Form(None),
                        fillup_date: date = Form(), odometer_km: Decimal = Form(), liters: Decimal = Form(), price_per_liter: Decimal = Form(),
-                       station: str | None = Form(None), notes: str | None = Form(None),
+                       is_full_tank: str | None = Form(None), station: str | None = Form(None), notes: str | None = Form(None),
                        db: Session = Depends(get_db), user: User = Depends(current_user)):
     wid = current_workspace_id(request, user, db)
     vehicle = db.scalar(select(Vehicle).where(Vehicle.id == vehicle_id, Vehicle.workspace_id == wid, Vehicle.is_active))
@@ -1777,7 +1799,7 @@ def fuel_fillup_create(request: Request, vehicle_id: int = Form(), transaction_i
         flash(request, "Confira quilometragem, litros e valor por litro.", "danger"); return redirect(f"/fuel-fillups/new?transaction_id={transaction.id}" if transaction else "/fuel-fillups/new?manual=1")
     if transaction and abs((liters * price_per_liter) - Decimal(transaction.amount)) > Decimal("0.80"):
         flash(request, "Litros × valor por litro deve corresponder ao valor da despesa (tolerância de R$ 0,80).", "danger"); return redirect(f"/fuel-fillups/new?transaction_id={transaction.id}")
-    db.add(FuelFillup(workspace_id=wid, vehicle_id=vehicle.id, transaction_id=transaction.id if transaction else None, fillup_date=fillup_date, odometer_km=odometer_km, liters=liters, price_per_liter=price_per_liter, station=(station or "").strip() or None, notes=(notes or "").strip() or None))
+    db.add(FuelFillup(workspace_id=wid, vehicle_id=vehicle.id, transaction_id=transaction.id if transaction else None, fillup_date=fillup_date, odometer_km=odometer_km, liters=liters, price_per_liter=price_per_liter, is_full_tank=is_full_tank == "on", station=(station or "").strip() or None, notes=(notes or "").strip() or None))
     db.commit(); flash(request, "Abastecimento registrado."); return redirect("/vehicles")
 
 
