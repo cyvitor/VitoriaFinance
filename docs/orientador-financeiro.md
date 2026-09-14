@@ -124,22 +124,24 @@ O usuário continua livre para prosseguir, mediante confirmação consciente.
 
 ### Etapa 1 — Simulação determinística
 
-- [ ] Definir os indicadores, margens e níveis de risco.
-- [ ] Criar o serviço de simulação sem persistência de lançamentos.
-- [ ] Calcular a competência pelo fechamento real do cartão.
-- [ ] Considerar fatura atual, limite e parcelas futuras existentes.
-- [ ] Considerar receitas, despesas fixas, financiamentos, orçamentos e saldo transportado.
-- [ ] Projetar o efeito da compra por pelo menos 3, 6 e 12 meses.
-- [ ] Criar testes para mês aberto/fechado, parcelas, orçamento excedido e saldo negativo.
+- [x] Definir os indicadores, margens e níveis de risco.
+- [x] Criar o serviço de simulação sem persistência de lançamentos.
+- [x] Calcular a competência pelo fechamento real do cartão.
+- [x] Considerar fatura atual, limite e parcelas futuras existentes.
+- [x] Considerar receitas, despesas fixas, financiamentos, orçamentos e saldo transportado.
+- [x] Projetar o efeito da compra por 3, 6 ou 12 meses, com 6 meses como padrão.
+- [x] Criar testes para mês aberto/fechado, parcelas, orçamento excedido e saldo negativo.
 
 ### Etapa 2 — Ferramenta do Telegram
 
-- [ ] Expor `simular_compra_cartao` ao agente.
-- [ ] Ensinar a IA a coletar somente os dados ausentes.
-- [ ] Garantir que a simulação nunca crie uma despesa.
-- [ ] Apresentar diferença entre limite disponível e capacidade financeira.
-- [ ] Perguntar sobre urgência somente depois de apresentar os números.
-- [ ] Testar mudança natural de assunto durante a análise.
+- [x] Expor `simular_compra_cartao` ao agente.
+- [x] Ensinar a IA a coletar somente os dados ausentes.
+- [x] Garantir que a simulação nunca crie uma despesa.
+- [x] Apresentar diferença entre limite disponível e capacidade financeira.
+- [x] Perguntar sobre urgência somente depois de apresentar os números.
+- [x] Testar mudança natural de assunto durante a análise.
+
+O MVP usa três regras transparentes: fica **arriscado** se o limite for insuficiente ou algum saldo projetado ficar negativo; fica em **atenção** se ultrapassar o orçamento ou consumir pelo menos metade da margem projetada de algum mês; nos demais casos, fica **confortável**. Esses limites poderão se tornar configuráveis em uma etapa posterior.
 
 ### Etapa 3 — Comparação de cenários
 

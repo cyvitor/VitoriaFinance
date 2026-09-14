@@ -13,6 +13,7 @@ from app.models import (
 from app.services.access_context import UserAccessContext
 from app.services.card_billing import card_invoice_is_closed, card_purchase_competence
 from app.services.monthly_projection import monthly_budget_positions, projection_budget_remaining
+from app.services.purchase_advisor import simulate_credit_purchase
 from app.services.telegram_expenses import (
     ExpenseInput, cancel_expense_draft, confirm_expense_draft, create_expense_draft,
     finish_processing_queue_item, format_draft, get_active_draft,
@@ -1348,6 +1349,80 @@ def prepare_fuel_fillup_update(db: Session, context: UserAccessContext, args: di
             "price_per_liter": str(price), "full_tank": full_tank, "total": _money(total)}
 
 
+def simulate_card_purchase(db: Session, context: UserAccessContext, args: dict) -> dict:
+    amount = _decimal(args.get("amount"), "valor")
+    missing = []
+    if amount is None or amount <= 0:
+        missing.append("valor da compra")
+
+    person = _resolve_person(db, context, args.get("area")) if args.get("area") else None
+    card_query = select(Card).join(Account, Account.id == Card.account_id).where(
+        Card.is_active.is_(True),
+        Card.workspace_id.in_(context.workspace_ids),
+        Account.person_id.in_(context.allowed_person_ids),
+    )
+    if person:
+        card_query = card_query.where(Account.person_id == person.id)
+    cards = db.scalars(card_query.order_by(Card.name)).all()
+    requested_card = str(args.get("card") or "").strip()
+    if requested_card:
+        normalized = requested_card.casefold()
+        exact = [card for card in cards if card.name.casefold() == normalized]
+        candidates = exact or [card for card in cards if normalized in card.name.casefold()]
+        if not candidates:
+            raise ToolError(f"Cartao '{requested_card}' nao encontrado ou sem permissao")
+        if len(candidates) > 1:
+            raise ToolError("Cartao ambiguo: " + ", ".join(card.name for card in candidates))
+        card = candidates[0]
+    elif len(cards) == 1:
+        card = cards[0]
+    else:
+        card = None
+        missing.append("cartao")
+
+    category_value = str(args.get("category") or "").strip()
+    category = None
+    if not category_value:
+        missing.append("categoria")
+    elif card:
+        category = _resolve_category(db, context, category_value, TransactionType.expense)
+        if category.workspace_id != card.workspace_id:
+            raise ToolError("A categoria e o cartao pertencem a contas diferentes")
+
+    try:
+        installments = int(args["installments"]) if args.get("installments") not in (None, "") else 1
+    except (TypeError, ValueError) as exc:
+        raise ToolError("Quantidade de parcelas invalida") from exc
+    try:
+        horizon = int(args["horizon_months"]) if args.get("horizon_months") not in (None, "") else 6
+    except (TypeError, ValueError) as exc:
+        raise ToolError("Horizonte invalido") from exc
+    purchase_date = _date(args.get("purchase_date"), date.today())
+
+    if missing:
+        return {
+            "status": "missing_information",
+            "read_only": True,
+            "missing_fields": missing,
+            "card_options": [item.name for item in cards],
+            "defaults": {"installments": installments, "horizon_months": horizon,
+                         "purchase_date": purchase_date.isoformat()},
+            "message": "A simulacao ainda nao criou nenhum lancamento.",
+        }
+    try:
+        return simulate_credit_purchase(
+            db,
+            card=card,
+            category=category,
+            amount=amount,
+            installments=installments,
+            purchase_date=purchase_date,
+            horizon_months=horizon,
+        )
+    except ValueError as exc:
+        raise ToolError(str(exc)) from exc
+
+
 TOOLS = {
     "listar_areas_financeiras": list_financial_areas,
     "consultar_contas": list_accounts,
@@ -1360,6 +1435,7 @@ TOOLS = {
     "consultar_orcamentos": query_budgets,
     "consultar_orcamento_categoria": query_category_budget,
     "consultar_saldo_livre": calculate_free_balance,
+    "simular_compra_cartao": simulate_card_purchase,
     "consultar_financiamentos": list_financings,
     "preparar_receita": prepare_income,
     "preparar_correcao_lancamento": prepare_transaction_update,

@@ -40,6 +40,7 @@ Ferramentas permitidas e argumentos:
 - consultar_orcamentos: {"area":texto opcional,"reference_date":"YYYY-MM-DD" opcional}
 - consultar_orcamento_categoria: {"area":texto,"category":texto,"reference_date":"YYYY-MM-DD" opcional,"planned_spending":numero opcional}
 - consultar_saldo_livre: {"area":texto opcional,"planned_spending":numero opcional,"payment_method":"cash|credit" opcional,"card":texto opcional}
+- simular_compra_cartao: {"amount":numero,"card":texto opcional,"installments":inteiro opcional,"category":texto opcional,"purchase_date":"YYYY-MM-DD" opcional,"horizon_months":3|6|12 opcional,"area":texto opcional}. Ferramenta somente leitura para avaliar uma compra antes de realiza-la; nao cria despesa.
 - consultar_financiamentos: {"area":texto opcional,"include_paid":booleano opcional}
 - preparar_receita: {"amount":numero opcional,"description":texto opcional,"transaction_date":"YYYY-MM-DD" opcional,"area":texto opcional,"account":texto opcional,"category":texto opcional,"payment_method":texto opcional}
 - preparar_correcao_lancamento: {"target_description":texto opcional,"target_amount":numero opcional,"target_transaction_date":"YYYY-MM-DD" opcional,"area":texto opcional,"new_description":texto opcional,"new_amount":numero opcional,"new_transaction_date":"YYYY-MM-DD" opcional,"new_category":texto opcional,"new_invoice_month":"YYYY-MM" opcional}
@@ -673,7 +674,72 @@ def _card_spending_reply(result: dict) -> str:
     return "\n".join(lines)
 
 
+def _purchase_simulation_reply(result: dict) -> str:
+    if result.get("status") == "missing_information":
+        missing = list(result.get("missing_fields") or [])
+        cards = list(result.get("card_options") or [])
+        details = ", ".join(missing) or "os dados da compra"
+        reply = f"Para simular sem criar nenhum lançamento, preciso de: **{details}**."
+        if "cartao" in missing and cards:
+            reply += "\n\nCartões disponíveis: " + ", ".join(f"**{item}**" for item in cards) + "."
+        return reply
+
+    purchase = result.get("purchase") or {}
+    limit = result.get("card_limit") or {}
+    invoice = result.get("first_invoice") or {}
+    risk = result.get("risk") or {}
+    level_labels = {"comfortable": "Confortável", "attention": "Atenção", "risky": "Arriscado"}
+    installments = int(purchase.get("installments") or 1)
+    installment_text = "à vista" if installments == 1 else f"em {installments}x de {_format_brl(purchase.get('first_installment'))}"
+    lines = [
+        "*Simulação de Compra Consciente*",
+        f"Compra: *{_format_brl(purchase.get('amount'))}* {installment_text}",
+        f"Cartão: *{purchase.get('card')}* • primeira fatura: *{purchase.get('first_invoice')}*",
+        "",
+        f"Fatura: {_format_brl(invoice.get('before'))} → *{_format_brl(invoice.get('after'))}*",
+        f"Limite disponível: {_format_brl(limit.get('available_before'))} → *{_format_brl(limit.get('available_after'))}*",
+        "",
+        "*Projeção do saldo*",
+    ]
+    for item in result.get("projections") or []:
+        line = (
+            f"• {item.get('label')}: {_format_brl(item.get('balance_before'))} → "
+            f"*{_format_brl(item.get('balance_after'))}*"
+        )
+        if Decimal(str(item.get("new_installment") or 0)):
+            line += (
+                f" • cartão atual {_format_brl(item.get('existing_card_installments'))}"
+                f" + nova parcela {_format_brl(item.get('new_installment'))}"
+            )
+        lines.append(line)
+    budget_rows = result.get("category_budget") or []
+    first_budget = budget_rows[0] if budget_rows else None
+    if first_budget and first_budget.get("budget_found"):
+        lines.extend([
+            "",
+            f"Orçamento de *{purchase.get('category')}*: "
+            f"{_format_brl(first_budget.get('remaining_before'))} → "
+            f"*{_format_brl(first_budget.get('remaining_after'))}*",
+        ])
+    elif first_budget:
+        lines.extend(["", f"Não há orçamento cadastrado para *{purchase.get('category')}* nessa competência."])
+    lines.extend(["", f"Avaliação: *{level_labels.get(risk.get('level'), 'Incompleta')}*"])
+    for reason in risk.get("reasons") or []:
+        lines.append(f"• {reason.capitalize()}.")
+    lines.append("")
+    if risk.get("level") == "risky":
+        lines.append("Pelos números atuais, não recomendo assumir essa compra agora. Ela precisa ser feita neste momento ou pode esperar?")
+    elif risk.get("level") == "attention":
+        lines.append("A compra cabe com ressalvas. Ela precisa ser feita agora ou podemos buscar um mês mais seguro?")
+    else:
+        lines.append("Pelos dados atuais, a compra cabe no cenário analisado. Ela precisa ser feita agora ou pode esperar?")
+    lines.append("\nEsta foi apenas uma simulação; nenhum lançamento foi criado.")
+    return "\n".join(lines)
+
+
 def _fallback_tool_reply(tool_name: str, result: dict) -> str:
+    if tool_name == "simular_compra_cartao":
+        return _purchase_simulation_reply(result)
     if tool_name == "consultar_gastos_cartao" and "items" in result:
         return _card_spending_reply(result)
     if result.get("transaction_updated"):
@@ -894,10 +960,11 @@ Quando o usuario pedir para procurar, escolher ou sugerir a categoria de uma des
 Para registrar dinheiro recebido, inclusive PIX, use preparar_receita. Se faltarem dados, chame preparar_receita novamente com a resposta do usuario. Nunca escolha uma conta de destino sem informacao suficiente.
 Se o usuario pedir ajuda para escolher uma categoria de receita, use consultar_categorias_receita. Para PIX, a categoria PIX pode ser inferida automaticamente quando existir; para outras receitas, confirme uma categoria valida antes de registrar.
 Para perguntas gerais sobre limites por categoria, use consultar_orcamentos. Para uma categoria especifica ou para simular um gasto dentro dela, use consultar_orcamento_categoria com area, categoria e planned_spending quando informado.
+Quando o usuario estiver pensando em uma compra no cartao antes de realiza-la, pedir avaliacao de impacto ou perguntar se a compra cabe, use simular_compra_cartao. Nao use preparar_despesa, pois uma simulacao nunca registra gasto. A ferramenta pode inferir o unico cartao permitido e usa 1 parcela, data atual e horizonte de 6 meses como padrao. Se faltarem cartao ou categoria, chame a ferramenta com os dados conhecidos; ela devolvera somente o que ainda precisa ser perguntado. Reaproveite os dados dos turnos recentes quando o usuario responder. Diferencie limite disponivel de capacidade financeira e so pergunte sobre urgencia depois de apresentar os numeros.
 Para corrigir um lancamento ja registrado, use preparar_correcao_lancamento. Identifique o registro por descricao, valor, data e area usando a conversa, converta datas relativas e envie os campos new_ correspondentes. Para mover um gasto de credito entre faturas sem mudar a data da compra, envie new_invoice_month em YYYY-MM. A ferramenta consulta o banco, nunca trate o historico como prova de que o registro existe. A correcao usa confirmar_acao_pendente e nunca deve criar outro lancamento.
 Converta datas relativas como hoje, ontem e anteontem para YYYY-MM-DD usando a data atual e envie transaction_date na ferramenta de despesa.
 Em perguntas sobre dinheiro disponivel agora, use consultar_saldo_livre com payment_method cash.
-Em perguntas sobre fechar o mes, salarios futuros ou compra no credito, use consultar_saldo_livre com payment_method credit quando aplicavel. Reaproveite planned_spending mencionado nos turnos recentes.
+Em perguntas sobre fechar o mes, salarios futuros ou uma consulta generica sobre credito sem intencao concreta de compra, use consultar_saldo_livre com payment_method credit quando aplicavel. Para avaliar uma compra antes de realiza-la, prefira sempre simular_compra_cartao. Reaproveite valores mencionados nos turnos recentes.
 Para amortizacao incompleta, chame preparar_amortizacao_financiamento novamente com os novos dados fornecidos.
 Se precisar consultar dados, use uma ferramenta. Se for apenas conversa sem necessidade de dados, responda diretamente.
 Retorne SOMENTE JSON valido em um destes formatos:
@@ -962,6 +1029,8 @@ apresente o saldo livre e a projecao mensal e pergunte o valor aproximado e como
         )
         if tool_name == "consultar_gastos_cartao" and "items" in result:
             reply = _card_spending_reply(result)
+        elif tool_name == "simular_compra_cartao":
+            reply = _purchase_simulation_reply(result)
         else:
             try:
                 reply = _complete(token, model, [{"role": "system", "content": synthesis_system},
