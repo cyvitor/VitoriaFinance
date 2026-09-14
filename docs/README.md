@@ -9,6 +9,7 @@ Esta pasta separa o funcionamento atual do sistema das ideias planejadas para as
 - [Instalação e deploy DevOps](deploy-devops.md): instalação em VPS, serviços systemd, backups e atualizações por branch ou tag.
 - [Arquitetura e modelo de dados](arquitetura.md): estrutura técnica, isolamento dos dados e entidades persistidas.
 - [Agente financeiro do Telegram](agente-telegram.md): vínculo, segurança, ferramentas e operações confirmadas por conversa.
+- [Orientador Financeiro](orientador-financeiro.md): especificação e checklist do módulo Compra Consciente.
 - [Roadmap](roadmap.md): o que já foi entregue e quais evoluções continuam planejadas.
 - [Planejamento inicial](plano-inicial.md): visão que deu origem ao produto; mantida como referência histórica.
 

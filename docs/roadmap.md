@@ -33,13 +33,15 @@ Este documento diferencia o que está disponível no código atual do que contin
 - [x] Registrar logs básicos ou detalhados do worker e do agente.
 - [ ] Registrar receitas e transferências por conversa.
 - [ ] Adicionar consultas de pendências e projeções detalhadas.
+- [ ] Implementar o **Orientador Financeiro — Compra Consciente**, com simulação de impacto no cartão, projeção futura, comparação de cenários e planos de compra; acompanhar o checklist em [Orientador Financeiro](orientador-financeiro.md).
+- [ ] Permitir que o bot localize e confirme gastos fixos/recorrentes já previstos, com ajuste de valor e cartão, sem duplicar o lançamento mensal.
 - [ ] Expor a trilha de ferramentas e ações em uma tela administrativa.
 - [ ] Evoluir para um agente multi-turno de ferramentas, permitindo que o modelo execute várias consultas sequenciais no mesmo pedido, como nos fluxos de agentes do n8n, com limite de passos, orçamento, auditoria e prevenção de ciclos.
 
 ## Planejamento e relatórios
 
 - Metas financeiras e cálculo de economia mensal necessária.
-- Planejamento de viagens, compras e prestações.
+- Planejamento de viagens, compras e prestações, integrado ao Orientador Financeiro.
 - Relatórios por pessoa, conta, cartão, categoria e período.
 - Exportação para CSV e Excel e, quando útil, PDF.
 - Alertas de vencimento, limite e comportamento financeiro.

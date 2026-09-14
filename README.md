@@ -116,6 +116,7 @@ Essa operação é destrutiva para os dados financeiros e deve ser usada com cui
 - [Instalação e deploy DevOps](docs/deploy-devops.md)
 - [Arquitetura e modelo de dados](docs/arquitetura.md)
 - [Agente financeiro do Telegram](docs/agente-telegram.md)
+- [Orientador Financeiro — Compra Consciente](docs/orientador-financeiro.md)
 - [Roadmap](docs/roadmap.md)
 - [Planejamento inicial](docs/plano-inicial.md)
 
