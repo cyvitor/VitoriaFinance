@@ -675,6 +675,11 @@ def _card_spending_reply(result: dict) -> str:
 
 
 def _purchase_simulation_reply(result: dict) -> str:
+    if result.get("error"):
+        return (
+            "Não consegui concluir a simulação porque "
+            f"{str(result['error']).rstrip('.').lower()}. Nenhum lançamento foi criado."
+        )
     if result.get("status") == "missing_information":
         missing = list(result.get("missing_fields") or [])
         cards = list(result.get("card_options") or [])
@@ -726,13 +731,6 @@ def _purchase_simulation_reply(result: dict) -> str:
     lines.extend(["", f"Avaliação: *{level_labels.get(risk.get('level'), 'Incompleta')}*"])
     for reason in risk.get("reasons") or []:
         lines.append(f"• {reason.capitalize()}.")
-    lines.append("")
-    if risk.get("level") == "risky":
-        lines.append("Pelos números atuais, não recomendo assumir essa compra agora. Ela precisa ser feita neste momento ou pode esperar?")
-    elif risk.get("level") == "attention":
-        lines.append("A compra cabe com ressalvas. Ela precisa ser feita agora ou podemos buscar um mês mais seguro?")
-    else:
-        lines.append("Pelos dados atuais, a compra cabe no cenário analisado. Ela precisa ser feita agora ou pode esperar?")
     lines.append("\nEsta foi apenas uma simulação; nenhum lançamento foi criado.")
     return "\n".join(lines)
 
@@ -1020,6 +1018,19 @@ Distinga obrigatoriamente saldo disponivel em conta agora de resultado projetado
 Para pagamento em dinheiro, responda com free_balance e free_balance_after_planned_spending.
 Para credito, avalie projected_month_result_after_planned_spending e explique em qual competencia a compra entra.
 Se card_selection_required for verdadeiro, pergunte qual cartao sera usado antes de concluir."""
+        if tool_name == "simular_compra_cartao":
+            synthesis_system += """
+Converse como uma orientadora financeira humana, sem reproduzir um relatorio padrao ou uma sequencia fixa.
+Considere o motivo descrito pelo usuario. Saude, seguranca, alimentacao essencial e outras necessidades nao devem
+ser tratadas como compra por impulso: reconheca a necessidade e nao pergunte automaticamente se pode esperar.
+Para gastos discricionarios, pergunte sobre urgencia somente quando isso realmente ajudar a decisao.
+Se status for missing_information, nao apresente valores zerados e nao diga que a compra cabe: reconheca brevemente
+o contexto e pergunte apenas os dados ausentes. Quando category_error e category_options existirem, sugira a opcao
+valida mais coerente com o pedido e confirme com o usuario, sem listar todas as categorias.
+Se houver error, explique-o de forma simples e nunca fabrique uma simulacao.
+Se status for simulated, destaque os numeros decisivos e o pior mes em linguagem natural; nao precisa despejar todos
+os meses se eles repetirem a mesma conclusao. Diferencie limite do cartao de capacidade financeira e diga claramente
+que nenhum lancamento foi criado. A classificacao do backend e os valores retornados nao podem ser alterados."""
         synthesis_system += """
 Responda a todas as partes da pergunta original. Se o usuario perguntou se pode gastar ou sair, dê uma
 orientacao pratica com base nos dados. Sem valor ou forma de pagamento, nao dê uma aprovacao definitiva:
@@ -1029,8 +1040,6 @@ apresente o saldo livre e a projecao mensal e pergunte o valor aproximado e como
         )
         if tool_name == "consultar_gastos_cartao" and "items" in result:
             reply = _card_spending_reply(result)
-        elif tool_name == "simular_compra_cartao":
-            reply = _purchase_simulation_reply(result)
         else:
             try:
                 reply = _complete(token, model, [{"role": "system", "content": synthesis_system},

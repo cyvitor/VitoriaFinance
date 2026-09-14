@@ -178,6 +178,35 @@ def test_purchase_simulation_requests_only_missing_information():
         assert "nenhum lançamento" in reply
 
 
+def test_purchase_simulation_turns_unknown_category_into_a_conversational_follow_up():
+    with SessionLocal() as db:
+        user, workspace, person, account, card, category = setup_purchase_scenario(db)
+        db.add(Category(
+            workspace_id=workspace.id,
+            parent_name="Saúde",
+            name="Consulta",
+            kind=TransactionType.expense,
+        ))
+        db.commit()
+        result = execute_tool(db, build_user_access_context(db, user), "simular_compra_cartao", {
+            "amount": 150,
+            "category": "Podólogo",
+            "purchase_date": "2026-09-14",
+        })
+        assert result["status"] == "missing_information"
+        assert result["missing_fields"] == ["categoria"]
+        assert result["known_purchase"]["amount"] == "150.00"
+        assert result["known_purchase"]["requested_category"] == "Podólogo"
+        assert "Saúde > Consulta" in result["category_options"]
+
+
+def test_purchase_simulation_error_fallback_never_invents_zero_values():
+    reply = _purchase_simulation_reply({"error": "Categoria não encontrada"})
+    assert "não consegui concluir" in reply.lower()
+    assert "R$ 0,00" not in reply
+    assert "None" not in reply
+
+
 def test_agent_can_leave_purchase_simulation_and_change_subject(monkeypatch):
     responses = iter([
         json.dumps({
@@ -190,6 +219,7 @@ def test_agent_can_leave_purchase_simulation_and_change_subject(monkeypatch):
                 "purchase_date": "2026-09-14",
             },
         }),
+        "Pelos números atuais, essa compra cabe. Como é uma necessidade, não faz sentido tratá-la como impulso.",
         json.dumps({"action": "respond", "reply": "Claro. Sobre qual assunto você quer falar?"}),
     ])
     monkeypatch.setattr("app.services.telegram_agent._complete", lambda *args, **kwargs: next(responses))
@@ -205,7 +235,10 @@ def test_agent_can_leave_purchase_simulation_and_change_subject(monkeypatch):
             db, user, "Estou pensando em comprar um eletrônico de 200 reais no C6",
             reference_date=date(2026, 9, 14),
         )
-        assert "Simulação de Compra Consciente" in simulation
+        assert simulation == (
+            "Pelos números atuais, essa compra cabe. Como é uma necessidade, "
+            "não faz sentido tratá-la como impulso."
+        )
         assert db.scalar(select(Transaction)) is None
         changed_subject = run_financial_agent(
             db, user, "Mudei de assunto: quero conversar sobre outra coisa",

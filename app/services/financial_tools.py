@@ -1382,11 +1382,16 @@ def simulate_card_purchase(db: Session, context: UserAccessContext, args: dict) 
 
     category_value = str(args.get("category") or "").strip()
     category = None
+    category_error = None
     if not category_value:
         missing.append("categoria")
-    elif card:
-        category = _resolve_category(db, context, category_value, TransactionType.expense)
-        if category.workspace_id != card.workspace_id:
+    else:
+        try:
+            category = _resolve_category(db, context, category_value, TransactionType.expense)
+        except ToolError as exc:
+            category_error = str(exc)
+            missing.append("categoria")
+        if card and category and category.workspace_id != card.workspace_id:
             raise ToolError("A categoria e o cartao pertencem a contas diferentes")
 
     try:
@@ -1400,11 +1405,27 @@ def simulate_card_purchase(db: Session, context: UserAccessContext, args: dict) 
     purchase_date = _date(args.get("purchase_date"), date.today())
 
     if missing:
+        category_options = []
+        if "categoria" in missing:
+            categories = db.scalars(select(Category).where(
+                Category.workspace_id.in_(context.workspace_ids),
+                Category.kind == TransactionType.expense,
+            ).order_by(Category.parent_name, Category.name)).all()
+            category_options = [
+                f"{item.parent_name} > {item.name}" if item.parent_name else item.name
+                for item in categories
+            ]
         return {
             "status": "missing_information",
             "read_only": True,
             "missing_fields": missing,
+            "known_purchase": {
+                "amount": _money(amount) if amount is not None else None,
+                "requested_category": category_value or None,
+            },
             "card_options": [item.name for item in cards],
+            "category_options": category_options,
+            "category_error": category_error,
             "defaults": {"installments": installments, "horizon_months": horizon,
                          "purchase_date": purchase_date.isoformat()},
             "message": "A simulacao ainda nao criou nenhum lancamento.",
