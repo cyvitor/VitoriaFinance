@@ -1,23 +1,29 @@
-const storedArea = localStorage.getItem('vitoriafinance.activePersonId');
+const activeArea = document.body.dataset.activeArea || '';
+if (activeArea) localStorage.setItem('vitoriafinance.activePersonId', activeArea);
+
 document.querySelectorAll('select[name="person_id"]:not([data-context-area])').forEach((select) => {
   select.required = true;
   const empty = select.querySelector('option[value=""]');
   if (empty) empty.textContent = 'Selecione uma área';
   const label = select.closest('div')?.querySelector('label');
   if (label) label.textContent = 'Área financeira';
-  const defaultArea = document.body.dataset.defaultArea;
-  const preferredArea = select.value || storedArea || defaultArea;
+  const preferredArea = select.value || activeArea || document.body.dataset.defaultArea;
   if (preferredArea && select.querySelector(`option[value="${preferredArea}"]`)) select.value = preferredArea;
 });
+
+function areaCatalog(select) {
+  const templateId = select.dataset.areaCatalog;
+  const template = templateId ? document.getElementById(templateId) : null;
+  const source = template ? template.content : select;
+  return Array.from(source.querySelectorAll('option[data-area-id]')).map((option) => option.cloneNode(true));
+}
 
 document.querySelectorAll('[data-area-resource-form]').forEach((form) => {
   const areaSelect = form.querySelector('select[name="person_id"]');
   const resourceSelects = form.querySelectorAll('select[data-area-resource]');
   if (!areaSelect || !resourceSelects.length) return;
   const catalogs = new Map();
-  resourceSelects.forEach((select) => {
-    catalogs.set(select, Array.from(select.querySelectorAll('option[data-area-id]')).map((option) => option.cloneNode(true)));
-  });
+  resourceSelects.forEach((select) => catalogs.set(select, areaCatalog(select)));
   const refreshResources = () => {
     const areaId = areaSelect.value;
     resourceSelects.forEach((select) => {
@@ -25,7 +31,7 @@ document.querySelectorAll('[data-area-resource-form]').forEach((form) => {
       select.querySelectorAll('option[data-area-id]').forEach((option) => option.remove());
       let restored = false;
       catalogs.get(select).forEach((option) => {
-        if (!areaId || option.dataset.areaId !== areaId) return;
+        if (option.dataset.areaId !== areaId) return;
         const copy = option.cloneNode(true);
         if (copy.value === current) {
           copy.selected = true;
@@ -38,10 +44,6 @@ document.querySelectorAll('[data-area-resource-form]').forEach((form) => {
   };
   areaSelect.addEventListener('change', refreshResources);
   refreshResources();
-});
-
-document.querySelector('select[data-context-area]')?.addEventListener('change', (event) => {
-  localStorage.setItem('vitoriafinance.activePersonId', event.target.value);
 });
 
 const sidebar = document.querySelector('.sidebar');

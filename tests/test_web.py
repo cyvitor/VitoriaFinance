@@ -115,8 +115,15 @@ def test_account_admin_can_reset_user_password_to_default(client):
         admin = db.scalar(select(User).where(User.username == "vh"))
         target = User(system_account_id=admin.system_account_id, username="nana", full_name="Nana",
                       password_hash=hash_password("senha-antiga"), account_role=AccountRole.member)
-        db.add(target); db.commit(); target_id = target.id
+        db.add(target); db.commit(); admin_id, target_id = admin.id, target.id
     client.post("/login", data={"username": "vh", "password": "123456"})
+    page = client.get("/account/users")
+    assert f'/account/users/{admin_id}/reset-password' not in page.text
+    assert f'/account/users/{target_id}/reset-password' in page.text
+    own = client.post(f"/account/users/{admin_id}/reset-password", follow_redirects=True)
+    assert "Altere a própria senha em Meu perfil." in own.text
+    with SessionLocal() as db:
+        assert verify_password("123456", db.get(User, admin_id).password_hash)
     response = client.post(f"/account/users/{target_id}/reset-password", follow_redirects=True)
     assert "Senha de Nana redefinida para 123456" in response.text
     with SessionLocal() as db:

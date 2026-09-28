@@ -1,6 +1,6 @@
 {% extends "base.html" %}{% block title %}Novo lançamento · VitoriaFinance{% endblock %}{% block content %}
 <div class="page-head"><div><p class="eyebrow">NOVO</p><h1>{% if kind=='income' %}Receita{% elif kind=='transfer' %}Transferência{% else %}Despesa{% endif %}</h1></div></div>
-<form class="panel form-panel" method="post" data-area-resource-form>
+<form class="panel form-panel" method="post" data-area-resource-form autocomplete="off">
 <input type="hidden" name="transaction_type" value="{{ kind }}">
 <input type="hidden" name="return_to" value="{{ return_to or '' }}">
 <input type="hidden" name="return_year" value="{{ return_year or '' }}">
@@ -11,16 +11,18 @@
 <div class="col-md-4"><label class="form-label">Data</label><input class="form-control" type="date" name="transaction_date" value="{{ today }}" required></div>
 <div class="col-md-4"><label class="form-label">Status</label><select class="form-select" name="status"><option value="paid">Pago</option><option value="pending">Pendente</option><option value="cancelled">Cancelado</option></select></div>
 <div class="col-md-4"><label class="form-label">Área financeira</label><select class="form-select" name="person_id"><option value="">Selecione</option>{% for x in people %}<option value="{{ x.id }}" {% if selected_area==x.id %}selected{% endif %}>{{ x.name }}</option>{% endfor %}</select></div>
-<div class="col-md-6"><label class="form-label">{% if kind=='transfer' %}Conta de origem{% else %}Conta{% endif %}</label><select class="form-select" name="account_id" data-area-resource><option value="">Selecione</option>{% for x in accounts %}<option value="{{ x.id }}" data-area-id="{{ x.person_id or '' }}">{{ x.name }}</option>{% endfor %}</select></div>
+<div class="col-md-6"><label class="form-label">{% if kind=='transfer' %}Conta de origem{% else %}Conta{% endif %}</label><select class="form-select" name="account_id" data-area-resource data-area-catalog="accountAreaCatalog"><option value="">Selecione</option>{% for x in accounts if not selected_area or x.person_id == selected_area %}<option value="{{ x.id }}" data-area-id="{{ x.person_id or '' }}">{{ x.name }}</option>{% endfor %}</select></div>
 {% if kind=='transfer' %}
-<div class="col-md-6"><label class="form-label">Conta de destino</label><select class="form-select" name="destination_account_id" data-area-resource required><option value="">Selecione</option>{% for x in accounts %}<option value="{{ x.id }}" data-area-id="{{ x.person_id or '' }}">{{ x.name }}</option>{% endfor %}</select></div>
+<div class="col-md-6"><label class="form-label">Conta de destino</label><select class="form-select" name="destination_account_id" data-area-resource data-area-catalog="accountAreaCatalog" required><option value="">Selecione</option>{% for x in accounts if not selected_area or x.person_id == selected_area %}<option value="{{ x.id }}" data-area-id="{{ x.person_id or '' }}">{{ x.name }}</option>{% endfor %}</select></div>
 {% else %}
 <div class="col-md-6"><label class="form-label">Categoria</label><select class="form-select" name="category_id"><option value="">Sem categoria</option>{% for x in categories if x.kind.value==kind %}<option value="{{ x.id }}">{{ x.parent_name + ' · ' if x.parent_name else '' }}{{ x.name }}</option>{% endfor %}</select></div>
 {% if kind!='income' %}
-<div class="col-md-6"><label class="form-label">Cartão</label><select class="form-select" name="card_id" data-area-resource><option value="">Não utilizado</option>{% for x in cards %}<option value="{{ x.id }}" data-area-id="{{ x.account.person_id if x.account and x.account.person_id else '' }}">{{ x.name }}</option>{% endfor %}</select></div>
+<div class="col-md-6"><label class="form-label">Cartão</label><select class="form-select" name="card_id" data-area-resource data-area-catalog="cardAreaCatalog"><option value="">Não utilizado</option>{% for x in cards if not selected_area or (x.account and x.account.person_id == selected_area) %}<option value="{{ x.id }}" data-area-id="{{ x.account.person_id if x.account and x.account.person_id else '' }}">{{ x.name }}</option>{% endfor %}</select></div>
 <div class="col-md-6"><label class="form-label">Forma de pagamento</label><select class="form-select" name="payment_method"><option value="">Selecione</option><option>PIX</option><option>Débito</option><option>Crédito</option><option>Dinheiro</option><option>Transferência</option></select></div>
 {% endif %}{% endif %}
 <div class="col-12"><label class="form-label">Observação</label><textarea class="form-control" name="notes" rows="3"></textarea></div>
 </div>
 <div class="form-actions"><a class="btn btn-light" href="{% if return_to=='month' %}/month?year={{ return_year }}&month={{ return_month }}{% else %}/transactions{% endif %}">Cancelar</a><button class="btn btn-primary">Salvar lançamento</button></div>
+<template id="accountAreaCatalog">{% for x in accounts %}<option value="{{ x.id }}" data-area-id="{{ x.person_id or '' }}">{{ x.name }}</option>{% endfor %}</template>
+<template id="cardAreaCatalog">{% for x in cards %}<option value="{{ x.id }}" data-area-id="{{ x.account.person_id if x.account and x.account.person_id else '' }}">{{ x.name }}</option>{% endfor %}</template>
 </form>{% endblock %}

@@ -46,7 +46,10 @@ templates.env.globals["set"] = set
 
 
 def render(request: Request, template: str, user=None, **context):
-    context.update(request=request, user=user, flash=request.session.pop("flash", None))
+    context.update(
+        request=request, user=user, flash=request.session.pop("flash", None),
+        session_area_id=request.session.get("active_person_id") or "",
+    )
     return templates.TemplateResponse(request, template, context)
 
 
@@ -2174,6 +2177,9 @@ def account_user_reset_password(target_id: int, request: Request, db: Session = 
     ))
     if not target:
         raise HTTPException(404)
+    if target.id == user.id:
+        flash(request, "Altere a própria senha em Meu perfil.", "danger")
+        return redirect("/account/users")
     target.password_hash = hash_password(DEFAULT_USER_PASSWORD)
     db.commit()
     flash(request, f"Senha de {target.full_name} redefinida para {DEFAULT_USER_PASSWORD}. Peça para alterar em Meu perfil.", "warning")
