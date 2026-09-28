@@ -3,8 +3,8 @@ from decimal import Decimal
 
 from app.database import SessionLocal
 from sqlalchemy import func, select
-from app.models import Account, AccountRole, AccountType, AccountingPeriod, Card, Category, Financing, FinancingAmortization, MonthlyBudget, MonthlyBudgetOccurrence, Person, PersonType, SystemAccount, SystemSetting, User, Workspace, WorkspaceMember, MemberRole, RecurrenceRule, RecurrenceOccurrence, Transaction, TransactionStatus, TransactionType
-from app.security import hash_password
+from app.models import Account, AccountRole, AccountType, AccountingPeriod, Card, Category, Financing, FinancingAmortization, MonthlyBudget, MonthlyBudgetOccurrence, Person, PersonType, SystemAccount, SystemSetting, User, UserPersonAccess, Workspace, WorkspaceMember, MemberRole, RecurrenceRule, RecurrenceOccurrence, Transaction, TransactionStatus, TransactionType
+from app.security import hash_password, verify_password
 from app.routers.web import earliest_open_month
 
 
@@ -50,6 +50,81 @@ def test_login_dashboard_and_change_password(client):
     assert client.get("/").status_code == 200
     response = client.post("/profile/password", data={"current_password":"123456", "new_password":"novasenha8", "confirm_password":"novasenha8"}, follow_redirects=False)
     assert response.status_code == 303
+
+
+def test_area_selected_in_form_filters_accounts_cards_and_blocks_cross_area_post(client):
+    vitor_id = seed_test()
+    with SessionLocal() as db:
+        workspace_id = db.scalar(select(Workspace.id))
+        admin = db.scalar(select(User).where(User.username == "vh"))
+        nana = Person(workspace_id=workspace_id, name="Nana", person_type=PersonType.personal)
+        db.add(nana); db.flush()
+        vitor_account = Account(workspace_id=workspace_id, person_id=vitor_id, name="Conta Vitor", account_type=AccountType.checking)
+        nana_account = Account(workspace_id=workspace_id, person_id=nana.id, name="Conta Nana", account_type=AccountType.checking)
+        db.add_all([vitor_account, nana_account]); db.flush()
+        db.add_all([
+            Card(workspace_id=workspace_id, account_id=vitor_account.id, name="Cartão Vitor", closing_day=5, due_day=10),
+            Card(workspace_id=workspace_id, account_id=nana_account.id, name="Cartão Nana", closing_day=5, due_day=10),
+            Category(workspace_id=workspace_id, kind=TransactionType.income, parent_name="Receitas", name="Salário"),
+        ])
+        nana_user = User(system_account_id=admin.system_account_id, username="nana", full_name="Nana",
+                         password_hash=hash_password("senha-nana-123"), account_role=AccountRole.member,
+                         default_person_id=nana.id)
+        db.add(nana_user); db.flush()
+        db.add_all([
+            WorkspaceMember(workspace_id=workspace_id, user_id=nana_user.id, role=MemberRole.editor),
+            UserPersonAccess(user_id=nana_user.id, person_id=nana.id),
+        ])
+        db.commit()
+        nana_id, vitor_account_id = nana.id, vitor_account.id
+
+    client.post("/login", data={"username": "vh", "password": "123456"})
+    response = client.post("/context/area", data={"person_id": str(nana_id), "return_to": "/transactions/new?kind=income"}, follow_redirects=False)
+    assert response.status_code == 303
+    form = client.get("/transactions/new?kind=income")
+    assert f'value="{nana_id}" selected' in form.text
+    assert f'data-area-id="{nana_id}">Conta Nana' in form.text
+    assert f'data-area-id="{vitor_id}">Conta Vitor' in form.text
+    blocked = client.post("/transactions/new", data={
+        "transaction_type": "income", "description": "Teste", "amount": "10", "transaction_date": "2026-09-28",
+        "status": "paid", "person_id": str(nana_id), "account_id": str(vitor_account_id), "category_id": "",
+    }, follow_redirects=False)
+    assert blocked.status_code == 403
+
+    client.post("/logout")
+    client.post("/login", data={"username": "nana", "password": "senha-nana-123"})
+    nana_form = client.get("/transactions/new?kind=expense")
+    assert "Conta Nana" in nana_form.text and "Cartão Nana" in nana_form.text
+    assert "Conta Vitor" not in nana_form.text and "Cartão Vitor" not in nana_form.text
+    card_form = client.get("/card-expenses/new")
+    assert "Cartão Nana" in card_form.text and "Cartão Vitor" not in card_form.text
+    for path in ("/recurring-incomes", "/fixed-expenses", "/financings", "/accounts", "/cards"):
+        page = client.get(path)
+        assert page.status_code == 200
+        assert "Conta Vitor" not in page.text and "Cartão Vitor" not in page.text
+    blocked_account = client.post("/accounts", data={
+        "name": "Conta indevida", "bank_name": "", "account_type": "checking",
+        "person_id": str(vitor_id), "initial_balance": "0", "color": "#6c5ce7",
+    }, follow_redirects=False)
+    assert blocked_account.status_code == 403
+
+
+def test_account_admin_can_reset_user_password_to_default(client):
+    seed_test()
+    with SessionLocal() as db:
+        admin = db.scalar(select(User).where(User.username == "vh"))
+        target = User(system_account_id=admin.system_account_id, username="nana", full_name="Nana",
+                      password_hash=hash_password("senha-antiga"), account_role=AccountRole.member)
+        db.add(target); db.commit(); target_id = target.id
+    client.post("/login", data={"username": "vh", "password": "123456"})
+    response = client.post(f"/account/users/{target_id}/reset-password", follow_redirects=True)
+    assert "Senha de Nana redefinida para 123456" in response.text
+    with SessionLocal() as db:
+        target = db.get(User, target_id)
+        assert verify_password("123456", target.password_hash)
+    client.post("/logout")
+    login = client.post("/login", data={"username": "nana", "password": "123456"}, follow_redirects=False)
+    assert login.status_code == 303
 
 
 def test_month_income_form_is_simplified_and_returns_to_selected_month(client):

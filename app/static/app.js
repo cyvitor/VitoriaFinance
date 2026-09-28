@@ -6,8 +6,38 @@ document.querySelectorAll('select[name="person_id"]:not([data-context-area])').f
   const label = select.closest('div')?.querySelector('label');
   if (label) label.textContent = 'Área financeira';
   const defaultArea = document.body.dataset.defaultArea;
-  const preferredArea = storedArea || defaultArea;
+  const preferredArea = select.value || storedArea || defaultArea;
   if (preferredArea && select.querySelector(`option[value="${preferredArea}"]`)) select.value = preferredArea;
+});
+
+document.querySelectorAll('[data-area-resource-form]').forEach((form) => {
+  const areaSelect = form.querySelector('select[name="person_id"]');
+  const resourceSelects = form.querySelectorAll('select[data-area-resource]');
+  if (!areaSelect || !resourceSelects.length) return;
+  const catalogs = new Map();
+  resourceSelects.forEach((select) => {
+    catalogs.set(select, Array.from(select.querySelectorAll('option[data-area-id]')).map((option) => option.cloneNode(true)));
+  });
+  const refreshResources = () => {
+    const areaId = areaSelect.value;
+    resourceSelects.forEach((select) => {
+      const current = select.value;
+      select.querySelectorAll('option[data-area-id]').forEach((option) => option.remove());
+      let restored = false;
+      catalogs.get(select).forEach((option) => {
+        if (!areaId || option.dataset.areaId !== areaId) return;
+        const copy = option.cloneNode(true);
+        if (copy.value === current) {
+          copy.selected = true;
+          restored = true;
+        }
+        select.appendChild(copy);
+      });
+      if (!restored) select.value = '';
+    });
+  };
+  areaSelect.addEventListener('change', refreshResources);
+  refreshResources();
 });
 
 document.querySelector('select[data-context-area]')?.addEventListener('change', (event) => {

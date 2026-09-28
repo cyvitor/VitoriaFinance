@@ -33,6 +33,7 @@ from scripts.seed import seed_categories
 
 router = APIRouter()
 templates = Jinja2Templates(directory=Path(__file__).parents[1] / "templates")
+DEFAULT_USER_PASSWORD = "123456"
 
 
 def money(value):
@@ -158,6 +159,22 @@ def ensure_account_access(account_id: int | None, user: User, workspace_id: int,
         raise HTTPException(403, "Conta bancária não permitida")
     if account.person_id:
         ensure_area_access(account.person_id, user, workspace_id, db)
+
+
+def ensure_account_area(account_id: int | None, person_id: int | None, user: User,
+                        workspace_id: int, db: Session) -> Account | None:
+    """Garante que a conta pertence à área financeira informada no formulário."""
+    if not account_id:
+        return None
+    account = db.scalar(select(Account).where(
+        Account.id == account_id, Account.workspace_id == workspace_id, Account.is_active,
+    ))
+    if not account:
+        raise HTTPException(403, "Conta bancária não permitida")
+    ensure_account_access(account_id, user, workspace_id, db)
+    if person_id and account.person_id != person_id:
+        raise HTTPException(403, "A conta selecionada não pertence à área financeira")
+    return account
 
 
 def optional_int(value: str | None) -> int | None:
@@ -521,10 +538,14 @@ def transactions(request: Request, db: Session = Depends(get_db), user: User = D
 @router.get("/card-expenses/new", response_class=HTMLResponse)
 def card_expense_form(request: Request, db: Session = Depends(get_db), user: User = Depends(current_user)):
     wid = current_workspace_id(request, user, db)
-    accounts = visible_accounts(user, wid, db); account_ids = [account.id for account in accounts]
-    query = select(Card).where(Card.workspace_id == wid, Card.is_active)
-    if allowed_person_ids(user, db) is not None: query = query.where(Card.account_id.in_(account_ids))
-    cards = db.scalars(query.order_by(Card.name)).all()
+    active_area = active_area_id(request, user, wid, db)
+    accounts = visible_accounts(user, wid, db)
+    if active_area:
+        accounts = [account for account in accounts if account.person_id == active_area]
+    account_ids = [account.id for account in accounts]
+    cards = db.scalars(select(Card).where(
+        Card.workspace_id == wid, Card.is_active, Card.account_id.in_(account_ids),
+    ).order_by(Card.name)).all() if account_ids else []
     categories = db.scalars(select(Category).where(
         Category.workspace_id == wid, Category.kind == TransactionType.expense
     ).order_by(Category.parent_name, Category.name)).all()
@@ -624,12 +645,12 @@ def recurring_income_create(request: Request, description: str = Form(), amount:
         category_id: str | None = Form(None), notes: str | None = Form(None),
         db: Session = Depends(get_db), user: User = Depends(current_user)):
     wid = current_workspace_id(request, user, db)
-    person_id_value = active_area_id(request, user, wid, db) or optional_int(person_id)
+    person_id_value = optional_int(person_id) or active_area_id(request, user, wid, db)
     if not person_id_value:
         flash(request, "Selecione uma área financeira.", "danger")
         return redirect("/recurring-incomes")
     ensure_area_access(person_id_value, user, wid, db)
-    ensure_account_access(optional_int(account_id), user, wid, db)
+    ensure_account_area(optional_int(account_id), person_id_value, user, wid, db)
     if amount <= 0:
         flash(request, "O valor deve ser maior que zero.", "danger")
         return redirect("/recurring-incomes")
@@ -659,7 +680,7 @@ def recurring_income_edit(rule_id: int, request: Request, description: str = For
     ensure_area_access(rule.person_id, user, wid, db)
     ensure_area_access(person_id, user, wid, db)
     account_value, category_value = optional_int(account_id), optional_int(category_id)
-    ensure_account_access(account_value, user, wid, db)
+    ensure_account_area(account_value, person_id, user, wid, db)
     if category_value and not db.scalar(select(Category.id).where(
         Category.id == category_value, Category.workspace_id == wid,
         Category.kind == TransactionType.income,
@@ -718,12 +739,12 @@ def fixed_expense_create(request: Request, description: str = Form(), amount: De
         category_id: str | None = Form(None), notes: str | None = Form(None),
         db: Session = Depends(get_db), user: User = Depends(current_user)):
     wid = current_workspace_id(request, user, db)
-    person_id_value = active_area_id(request, user, wid, db) or optional_int(person_id)
+    person_id_value = optional_int(person_id) or active_area_id(request, user, wid, db)
     if not person_id_value:
         flash(request, "Selecione uma área financeira.", "danger")
         return redirect("/fixed-expenses")
     ensure_area_access(person_id_value, user, wid, db)
-    ensure_account_access(optional_int(account_id), user, wid, db)
+    ensure_account_area(optional_int(account_id), person_id_value, user, wid, db)
     if amount <= 0:
         flash(request, "O valor deve ser maior que zero.", "danger")
         return redirect("/fixed-expenses")
@@ -788,10 +809,10 @@ def financing_create(request: Request, description: str = Form(), paid_installme
         due_day: str | None = Form(None), notes: str | None = Form(None),
         db: Session = Depends(get_db), user: User = Depends(current_user)):
     wid = current_workspace_id(request, user, db)
-    person_id = active_area_id(request, user, wid, db) or person_id
+    person_id = person_id or active_area_id(request, user, wid, db)
     ensure_area_access(person_id, user, wid, db)
     account_value, category_value = optional_int(account_id), optional_int(category_id)
-    ensure_account_access(account_value, user, wid, db)
+    ensure_account_area(account_value, person_id, user, wid, db)
     if contract_type not in ("financing", "negotiated_debt", "personal_loan"):
         contract_type = "financing"
     if total_installments < 1 or paid_installments < 0 or paid_installments >= total_installments or installment_amount <= 0:
@@ -854,7 +875,7 @@ def financing_edit(financing_id: int, request: Request, description: str = Form(
     ensure_area_access(financing.person_id, user, wid, db)
     ensure_area_access(person_id, user, wid, db)
     account_value, category_value = optional_int(account_id), optional_int(category_id)
-    ensure_account_access(account_value, user, wid, db)
+    ensure_account_area(account_value, person_id, user, wid, db)
     if category_value and not db.scalar(select(Category.id).where(
         Category.id == category_value, Category.workspace_id == wid,
         Category.kind == TransactionType.expense,
@@ -981,7 +1002,7 @@ def budget_create(request: Request, person_id: int = Form(), category_id: int = 
                   include_in_projection: bool = Form(False),
                   db: Session = Depends(get_db), user: User = Depends(current_user)):
     wid = current_workspace_id(request, user, db)
-    person_id = active_area_id(request, user, wid, db) or person_id
+    person_id = person_id or active_area_id(request, user, wid, db)
     ensure_area_access(person_id, user, wid, db)
     category = db.scalar(select(Category).where(
         Category.id == category_id, Category.workspace_id == wid,
@@ -1156,14 +1177,13 @@ def recurring_income_confirm(rule_id: int, request: Request, year: int = Form(),
             card = db.scalar(select(Card).where(Card.id == source_id, Card.workspace_id == wid, Card.is_active))
             if not card or not card.account_id:
                 raise HTTPException(403)
-            ensure_account_access(card.account_id, user, wid, db)
+            ensure_account_area(card.account_id, rule.person_id, user, wid, db)
             account_id, card_id, payment_method = card.account_id, card.id, "Crédito"
             transaction_status = TransactionStatus.pending
         elif source_type == "account":
-            account = db.scalar(select(Account).where(Account.id == source_id, Account.workspace_id == wid, Account.is_active))
+            account = ensure_account_area(source_id, rule.person_id, user, wid, db)
             if not account:
                 raise HTTPException(403)
-            ensure_account_access(account.id, user, wid, db)
             account_id, payment_method = account.id, "Conta bancária"
         else:
             raise HTTPException(400)
@@ -1501,11 +1521,16 @@ def transaction_form(request: Request, kind: str = "expense", return_to: str | N
         return_year: int | None = None, return_month: int | None = None,
         db: Session = Depends(get_db), user: User = Depends(current_user)):
     wid = current_workspace_id(request, user, db)
+    selected_area = active_area_id(request, user, wid, db)
+    accounts = visible_accounts(user, wid, db)
+    account_ids = [account.id for account in accounts]
     return render(request, "transactions/form.html", user=user, kind=kind, today=date.today(),
-        accounts=visible_accounts(user, wid, db),
-        cards=db.scalars(select(Card).where(Card.workspace_id == wid, Card.is_active)).all(),
+        accounts=accounts,
+        cards=db.scalars(select(Card).where(
+            Card.workspace_id == wid, Card.is_active, Card.account_id.in_(account_ids),
+        )).all() if account_ids else [],
         people=visible_people(user, wid, db), return_to=return_to,
-        return_year=return_year, return_month=return_month,
+        selected_area=selected_area, return_year=return_year, return_month=return_month,
         categories=db.scalars(select(Category).where(Category.workspace_id == wid).order_by(Category.parent_name, Category.name)).all())
 
 
@@ -1542,17 +1567,22 @@ def transaction_create(request: Request, transaction_type: TransactionType = For
         return redirect(f"/transactions/new?kind={transaction_type.value}")
     if person_id:
         ensure_area_access(person_id, user, wid, db)
-    ensure_account_access(account_id, user, wid, db)
+    if transaction_type != TransactionType.transfer:
+        ensure_account_area(account_id, person_id, user, wid, db)
+    else:
+        ensure_account_access(account_id, user, wid, db)
     ensure_account_access(destination_account_id, user, wid, db)
     if card_id:
         card = db.scalar(select(Card).where(Card.id == card_id, Card.workspace_id == wid))
         if not card: raise HTTPException(403, "Cartão não permitido")
-        ensure_account_access(card.account_id, user, wid, db)
+        card_account = ensure_account_area(card.account_id, person_id, user, wid, db)
+        if account_id and account_id != card.account_id:
+            raise HTTPException(403, "O cartão deve usar sua conta vinculada")
         method = (payment_method or "Crédito").lower()
         status = TransactionStatus.pending if method in ("crédito", "credito") else TransactionStatus.paid
         if status == TransactionStatus.pending:
             competence_year, competence_month = card_purchase_competence(db, card, transaction_date)
-        if not account_id: account_id = card.account_id
+        account_id = card_account.id
     if amount <= 0:
         flash(request, "O valor deve ser maior que zero.", "danger")
         return redirect(f"/transactions/new?kind={transaction_type.value}")
@@ -1806,7 +1836,8 @@ def fuel_fillup_create(request: Request, vehicle_id: int = Form(), transaction_i
 @router.post("/accounts")
 def account_create(request: Request, name: str = Form(), bank_name: str = Form(""), account_type: AccountType = Form(),
                    person_id: int = Form(), initial_balance: Decimal = Form(0), color: str = Form("#6c5ce7"), db: Session = Depends(get_db), user: User = Depends(current_user)):
-    wid = current_workspace_id(request, user, db); person_id = active_area_id(request, user, wid, db) or person_id; ensure_area_access(person_id, user, wid, db)
+    wid = current_workspace_id(request, user, db)
+    ensure_area_access(person_id, user, wid, db)
     db.add(Account(workspace_id=wid, person_id=person_id, name=name.strip(), bank_name=bank_name.strip(), account_type=account_type, initial_balance=initial_balance, color=color)); db.commit()
     flash(request, "Conta adicionada."); return redirect("/accounts")
 
@@ -1818,10 +1849,10 @@ def cards(request: Request, db: Session = Depends(get_db), user: User = Depends(
     accounts = visible_accounts(user, wid, db)
     if active_area: accounts = [account for account in accounts if account.person_id == active_area]
     account_ids = [account.id for account in accounts]
-    query = select(Card).where(Card.workspace_id == wid)
-    if allowed_person_ids(user, db) is not None:
-        query = query.where(Card.account_id.in_(account_ids))
-    return render(request, "cards/index.html", user=user, items=db.scalars(query.order_by(Card.id.desc())).all(), accounts=accounts, selected_area=active_area)
+    items = db.scalars(select(Card).where(
+        Card.workspace_id == wid, Card.account_id.in_(account_ids),
+    ).order_by(Card.id.desc())).all() if account_ids else []
+    return render(request, "cards/index.html", user=user, items=items, accounts=accounts, selected_area=active_area)
 
 
 @router.get("/cards/{card_id}", response_class=HTMLResponse)
@@ -2131,6 +2162,21 @@ def account_user_access(target_id: int, request: Request, area_ids: list[int] = 
         if target.default_person_id not in valid_ids:
             target.default_person_id = valid_ids[0] if valid_ids else None
     db.commit(); flash(request, "Permissões atualizadas.")
+    return redirect("/account/users")
+
+
+@router.post("/account/users/{target_id}/reset-password")
+def account_user_reset_password(target_id: int, request: Request, db: Session = Depends(get_db),
+                                user: User = Depends(current_user)):
+    require_account_admin(user)
+    target = db.scalar(select(User).where(
+        User.id == target_id, User.system_account_id == user.system_account_id,
+    ))
+    if not target:
+        raise HTTPException(404)
+    target.password_hash = hash_password(DEFAULT_USER_PASSWORD)
+    db.commit()
+    flash(request, f"Senha de {target.full_name} redefinida para {DEFAULT_USER_PASSWORD}. Peça para alterar em Meu perfil.", "warning")
     return redirect("/account/users")
 
 
