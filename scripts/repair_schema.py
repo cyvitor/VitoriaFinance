@@ -32,6 +32,21 @@ def run():
             )
         print("Coluna system_accounts.is_super_account adicionada.")
         changes += 1
+    access_columns = {column["name"] for column in inspect(engine).get_columns("user_person_access")}
+    if "access_level" not in access_columns:
+        with engine.begin() as connection:
+            if engine.dialect.name == "mysql":
+                connection.exec_driver_sql(
+                    "ALTER TABLE user_person_access ADD COLUMN access_level "
+                    "ENUM('read','write') NOT NULL DEFAULT 'write'"
+                )
+            else:
+                connection.exec_driver_sql(
+                    "ALTER TABLE user_person_access ADD COLUMN access_level "
+                    "VARCHAR(10) NOT NULL DEFAULT 'write'"
+                )
+        print("Coluna user_person_access.access_level adicionada.")
+        changes += 1
     draft_columns = {column["name"] for column in inspect(engine).get_columns("telegram_expense_drafts")}
     draft_additions = {
         "account_id": "INTEGER NULL",

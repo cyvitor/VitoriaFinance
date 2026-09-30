@@ -15,9 +15,10 @@ from sqlalchemy import case, delete, extract, func, select
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.dependencies import allowed_person_ids, current_user, current_workspace_id
+from app.database import SessionLocal
+from app.dependencies import allowed_person_ids, can_write_all_areas, current_user, current_workspace_id, writable_person_ids
 from app.models import (
-    Account, AccountRole, AccountType, Card, CardBillingPeriod, Category, Person, PersonType, SystemAccount, SystemSetting,
+    Account, AccountRole, AccountType, AreaAccessLevel, Card, CardBillingPeriod, Category, Person, PersonType, SystemAccount, SystemSetting,
     Transaction, TransactionStatus, TransactionType, User, UserPersonAccess, WorkspaceMember, TelegramLink,
     RecurrenceRule, RecurrenceOccurrence, AccountingPeriod, Financing, FinancingAmortization, MonthlyBudget,
     MonthlyBudgetOccurrence,
@@ -46,9 +47,17 @@ templates.env.globals["set"] = set
 
 
 def render(request: Request, template: str, user=None, **context):
+    writable_areas = ""
+    can_close_month = False
+    if user is not None:
+        with SessionLocal() as permission_db:
+            writable = writable_person_ids(user, permission_db)
+            can_close_month = can_write_all_areas(user, permission_db)
+        writable_areas = "all" if writable is None else (",".join(str(item) for item in writable) or "none")
     context.update(
         request=request, user=user, flash=request.session.pop("flash", None),
         session_area_id=request.session.get("active_person_id") or "",
+        writable_areas=writable_areas, can_close_month=can_close_month,
     )
     return templates.TemplateResponse(request, template, context)
 
@@ -147,21 +156,25 @@ def change_active_area(request: Request, person_id: str = Form(""), return_to: s
     return redirect(return_to if return_to.startswith("/") and not return_to.startswith("//") else "/")
 
 
-def ensure_area_access(person_id: int, user: User, workspace_id: int, db: Session):
+def ensure_area_access(person_id: int, user: User, workspace_id: int, db: Session, *, write: bool = True):
     area = db.scalar(select(Person).where(Person.id == person_id, Person.workspace_id == workspace_id, Person.is_active))
     allowed = allowed_person_ids(user, db)
     if not area or (allowed is not None and person_id not in allowed):
         raise HTTPException(403, "Área financeira não permitida")
+    if write:
+        writable = writable_person_ids(user, db)
+        if writable is not None and person_id not in writable:
+            raise HTTPException(403, "Esta área financeira está disponível apenas para leitura")
 
 
-def ensure_account_access(account_id: int | None, user: User, workspace_id: int, db: Session):
+def ensure_account_access(account_id: int | None, user: User, workspace_id: int, db: Session, *, write: bool = False):
     if not account_id:
         return
     account = db.scalar(select(Account).where(Account.id == account_id, Account.workspace_id == workspace_id))
     if not account:
         raise HTTPException(403, "Conta bancária não permitida")
     if account.person_id:
-        ensure_area_access(account.person_id, user, workspace_id, db)
+        ensure_area_access(account.person_id, user, workspace_id, db, write=write)
 
 
 def ensure_account_area(account_id: int | None, person_id: int | None, user: User,
@@ -174,10 +187,35 @@ def ensure_account_area(account_id: int | None, person_id: int | None, user: Use
     ))
     if not account:
         raise HTTPException(403, "Conta bancária não permitida")
-    ensure_account_access(account_id, user, workspace_id, db)
+    ensure_account_access(account_id, user, workspace_id, db, write=True)
     if person_id and account.person_id != person_id:
         raise HTTPException(403, "A conta selecionada não pertence à área financeira")
     return account
+
+
+def parse_area_access(values: list[str]) -> dict[int, AreaAccessLevel]:
+    granted = {}
+    for raw in values:
+        if not raw or ":" not in raw:
+            continue
+        area_raw, level_raw = raw.split(":", 1)
+        area_id = optional_int(area_raw)
+        if area_id and level_raw in ("read", "write"):
+            granted[area_id] = AreaAccessLevel(level_raw)
+    return granted
+
+
+def replace_area_access(db: Session, target: User, workspace_id: int, granted: dict[int, AreaAccessLevel]):
+    db.execute(delete(UserPersonAccess).where(UserPersonAccess.user_id == target.id))
+    valid_ids = set(db.scalars(select(Person.id).where(
+        Person.workspace_id == workspace_id, Person.id.in_(list(granted)),
+    )).all()) if granted else set()
+    for area_id, level in granted.items():
+        if area_id in valid_ids:
+            db.add(UserPersonAccess(user_id=target.id, person_id=area_id, access_level=level))
+    if target.default_person_id not in valid_ids:
+        writable_ids = [area_id for area_id, level in granted.items() if area_id in valid_ids and level == AreaAccessLevel.write]
+        target.default_person_id = (writable_ids or [area_id for area_id in valid_ids] or [None])[0]
 
 
 def optional_int(value: str | None) -> int | None:
@@ -564,7 +602,7 @@ def card_expense_create(request: Request, card_id: int = Form(), description: st
     wid = current_workspace_id(request, user, db)
     card = db.scalar(select(Card).where(Card.id == card_id, Card.workspace_id == wid, Card.is_active))
     if not card: raise HTTPException(404)
-    ensure_account_access(card.account_id, user, wid, db)
+    ensure_account_access(card.account_id, user, wid, db, write=True)
     category = db.scalar(select(Category).where(
         Category.id == category_id, Category.workspace_id == wid,
         Category.kind == TransactionType.expense,
@@ -710,6 +748,7 @@ def recurring_income_delete(rule_id: int, request: Request, db: Session = Depend
     rule = db.scalar(select(RecurrenceRule).where(RecurrenceRule.id == rule_id, RecurrenceRule.workspace_id == wid))
     if not rule:
         raise HTTPException(404)
+    ensure_area_access(rule.person_id, user, wid, db)
     rule.is_active = False
     db.commit()
     flash(request, "Receita recorrente excluída dos meses futuros. Lançamentos já confirmados foram preservados.")
@@ -975,6 +1014,7 @@ def fixed_expense_delete(rule_id: int, request: Request, db: Session = Depends(g
     ))
     if not rule:
         raise HTTPException(404)
+    ensure_area_access(rule.person_id, user, wid, db)
     rule.is_active = False
     db.commit()
     flash(request, "Despesa fixa excluída dos meses futuros. Pagamentos confirmados foram preservados.")
@@ -1236,6 +1276,7 @@ def recurring_income_skip(rule_id: int, request: Request, year: int = Form(), mo
     rule = db.scalar(select(RecurrenceRule).where(RecurrenceRule.id == rule_id, RecurrenceRule.workspace_id == wid))
     if not rule:
         raise HTTPException(404)
+    ensure_area_access(rule.person_id, user, wid, db)
     existing = db.scalar(select(RecurrenceOccurrence).where(
         RecurrenceOccurrence.recurrence_rule_id == rule_id,
         RecurrenceOccurrence.year == year, RecurrenceOccurrence.month == month,
@@ -1434,6 +1475,9 @@ def close_month(request: Request, year: int = Form(), month: int = Form(),
     wid = current_workspace_id(request, user, db)
     if not 1 <= month <= 12:
         raise HTTPException(400)
+    if not can_write_all_areas(user, db):
+        flash(request, "Fechar o mês exige permissão de escrita em todas as áreas financeiras.", "danger")
+        return redirect(f"/month?year={year}&month={month}")
     period = db.scalar(select(AccountingPeriod).where(
         AccountingPeriod.workspace_id == wid, AccountingPeriod.year == year, AccountingPeriod.month == month,
     ))
@@ -1470,6 +1514,9 @@ def close_month(request: Request, year: int = Form(), month: int = Form(),
 def reopen_month(request: Request, year: int = Form(), month: int = Form(),
                  db: Session = Depends(get_db), user: User = Depends(current_user)):
     wid = current_workspace_id(request, user, db)
+    if not can_write_all_areas(user, db):
+        flash(request, "Reabrir o mês exige permissão de escrita em todas as áreas financeiras.", "danger")
+        return redirect(f"/month?year={year}&month={month}")
     period = db.scalar(select(AccountingPeriod).where(
         AccountingPeriod.workspace_id == wid, AccountingPeriod.year == year, AccountingPeriod.month == month,
     ))
@@ -1490,6 +1537,8 @@ def transaction_confirm(item_id: int, request: Request, db: Session = Depends(ge
     ))
     if not item:
         raise HTTPException(404)
+    if item.person_id:
+        ensure_area_access(item.person_id, user, wid, db)
     target_year = item.competence_year or item.transaction_date.year
     target_month = item.competence_month or item.transaction_date.month
     referer = request.headers.get("referer", "")
@@ -1573,8 +1622,8 @@ def transaction_create(request: Request, transaction_type: TransactionType = For
     if transaction_type != TransactionType.transfer:
         ensure_account_area(account_id, person_id, user, wid, db)
     else:
-        ensure_account_access(account_id, user, wid, db)
-    ensure_account_access(destination_account_id, user, wid, db)
+        ensure_account_access(account_id, user, wid, db, write=True)
+    ensure_account_access(destination_account_id, user, wid, db, write=True)
     if card_id:
         card = db.scalar(select(Card).where(Card.id == card_id, Card.workspace_id == wid))
         if not card: raise HTTPException(403, "Cartão não permitido")
@@ -1661,7 +1710,7 @@ def transaction_edit(item_id: int, request: Request, description: str = Form(), 
         if not account or (item.person_id and account.person_id != item.person_id):
             flash(request, "Selecione uma fonte pagadora da mesma área financeira.", "danger")
             return redirect(f"/month?year={return_year or item.competence_year}&month={return_month or item.competence_month}")
-        ensure_account_access(account_value, user, wid, db)
+        ensure_account_access(account_value, user, wid, db, write=True)
     target_year = item.competence_year or item.transaction_date.year
     target_month = item.competence_month or item.transaction_date.month
     if competence_month:
@@ -1808,7 +1857,7 @@ def fuel_fillup_form(request: Request, transaction_id: int | None = None, manual
                      db: Session = Depends(get_db), user: User = Depends(current_user)):
     wid = current_workspace_id(request, user, db)
     transaction = db.scalar(select(Transaction).where(Transaction.id == transaction_id, Transaction.workspace_id == wid)) if transaction_id else None
-    if transaction and transaction.person_id: ensure_area_access(transaction.person_id, user, wid, db)
+    if transaction and transaction.person_id: ensure_area_access(transaction.person_id, user, wid, db, write=False)
     if transaction and transaction.transaction_type != TransactionType.expense:
         raise HTTPException(404)
     return render(request, "vehicles/fillup_form.html", user=user, transaction=transaction, manual=manual, prompt=prompt, return_to=return_to,
@@ -1917,7 +1966,7 @@ def card_expense_edit(card_id: int, transaction_id: int, request: Request,
     wid = current_workspace_id(request, user, db)
     card = db.scalar(select(Card).where(Card.id == card_id, Card.workspace_id == wid))
     if not card: raise HTTPException(404)
-    ensure_account_access(card.account_id, user, wid, db)
+    ensure_account_access(card.account_id, user, wid, db, write=True)
     item = db.scalar(select(Transaction).where(
         Transaction.id == transaction_id, Transaction.card_id == card.id,
         Transaction.workspace_id == wid,
@@ -1967,7 +2016,7 @@ def card_confirm(card_id: int, request: Request, year: int = Form(), month: int 
     wid = current_workspace_id(request, user, db)
     card = db.scalar(select(Card).where(Card.id == card_id, Card.workspace_id == wid))
     if not card: raise HTTPException(404)
-    ensure_account_access(card.account_id, user, wid, db)
+    ensure_account_access(card.account_id, user, wid, db, write=True)
     items = db.scalars(select(Transaction).where(
         Transaction.card_id == card.id, Transaction.competence_year == year,
         Transaction.competence_month == month, Transaction.status == TransactionStatus.pending,
@@ -1993,7 +2042,7 @@ def card_reopen(card_id: int, request: Request, year: int = Form(), month: int =
     wid = current_workspace_id(request, user, db)
     card = db.scalar(select(Card).where(Card.id == card_id, Card.workspace_id == wid))
     if not card: raise HTTPException(404)
-    ensure_account_access(card.account_id, user, wid, db)
+    ensure_account_access(card.account_id, user, wid, db, write=True)
     period = db.scalar(select(CardBillingPeriod).where(
         CardBillingPeriod.card_id == card.id, CardBillingPeriod.year == year,
         CardBillingPeriod.month == month,
@@ -2013,7 +2062,7 @@ def card_expense_delete(card_id: int, transaction_id: int, request: Request,
     wid = current_workspace_id(request, user, db)
     card = db.scalar(select(Card).where(Card.id == card_id, Card.workspace_id == wid))
     if not card: raise HTTPException(404)
-    ensure_account_access(card.account_id, user, wid, db)
+    ensure_account_access(card.account_id, user, wid, db, write=True)
     item = db.scalar(select(Transaction).where(Transaction.id == transaction_id, Transaction.card_id == card.id))
     if not item: raise HTTPException(404)
     year, month = item.competence_year, item.competence_month
@@ -2024,7 +2073,7 @@ def card_expense_delete(card_id: int, transaction_id: int, request: Request,
 @router.post("/cards")
 def card_create(request: Request, name: str = Form(), brand: str = Form(""), account_id: str | None = Form(None), credit_limit: Decimal = Form(0), closing_day: int = Form(), due_day: int = Form(), color: str = Form("#1e293b"), db: Session = Depends(get_db), user: User = Depends(current_user)):
     if not 1 <= closing_day <= 31 or not 1 <= due_day <= 31: flash(request, "Os dias devem estar entre 1 e 31.", "danger"); return redirect("/cards")
-    wid = current_workspace_id(request, user, db); account_value = optional_int(account_id); ensure_account_access(account_value, user, wid, db)
+    wid = current_workspace_id(request, user, db, write=True); account_value = optional_int(account_id); ensure_account_access(account_value, user, wid, db)
     db.add(Card(workspace_id=wid, name=name.strip(), brand=brand.strip(), account_id=account_value, credit_limit=credit_limit, closing_day=closing_day, due_day=due_day, color=color)); db.commit()
     flash(request, "Cartão adicionado."); return redirect("/cards")
 
@@ -2046,7 +2095,7 @@ def person_create(request: Request, name: str = Form(), person_type: PersonType 
 @router.post("/people/{person_id}/default")
 def person_set_default(person_id: int, request: Request, db: Session = Depends(get_db), user: User = Depends(current_user)):
     wid = current_workspace_id(request, user, db)
-    ensure_area_access(person_id, user, wid, db)
+    ensure_area_access(person_id, user, wid, db, write=False)
     user.default_person_id = person_id
     db.commit(); flash(request, "Área padrão alterada.")
     return redirect("/people")
@@ -2119,16 +2168,18 @@ def account_users(request: Request, db: Session = Depends(get_db), user: User = 
     wid = current_workspace_id(request, user, db)
     users = db.scalars(select(User).where(User.system_account_id == user.system_account_id).order_by(User.full_name)).all()
     areas = db.scalars(select(Person).where(Person.workspace_id == wid, Person.is_active).order_by(Person.name)).all()
-    access_rows = db.execute(select(UserPersonAccess.user_id, UserPersonAccess.person_id)).all()
+    access_rows = db.execute(select(
+        UserPersonAccess.user_id, UserPersonAccess.person_id, UserPersonAccess.access_level,
+    )).all()
     access = {}
-    for user_id, person_id in access_rows:
-        access.setdefault(user_id, set()).add(person_id)
+    for user_id, person_id, level in access_rows:
+        access.setdefault(user_id, {})[person_id] = level.value if hasattr(level, "value") else level
     return render(request, "admin/users.html", user=user, users=users, areas=areas, access=access)
 
 
 @router.post("/account/users")
 def account_user_create(request: Request, username: str = Form(), full_name: str = Form(), password: str = Form(),
-        account_role: AccountRole = Form(AccountRole.member), area_ids: list[int] = Form(default=[]),
+        account_role: AccountRole = Form(AccountRole.member), area_access: list[str] = Form(default=[]),
         db: Session = Depends(get_db), user: User = Depends(current_user)):
     require_account_admin(user)
     wid = current_workspace_id(request, user, db)
@@ -2144,26 +2195,21 @@ def account_user_create(request: Request, username: str = Form(), full_name: str
     role = MemberRole.admin if account_role == AccountRole.admin else MemberRole.editor
     db.add(WorkspaceMember(workspace_id=wid, user_id=new_user.id, role=role))
     if account_role != AccountRole.admin:
-        valid_ids = db.scalars(select(Person.id).where(Person.workspace_id == wid, Person.id.in_(area_ids))).all() if area_ids else []
-        db.add_all([UserPersonAccess(user_id=new_user.id, person_id=area_id) for area_id in valid_ids])
-        new_user.default_person_id = valid_ids[0] if valid_ids else None
+        replace_area_access(db, new_user, wid, parse_area_access(area_access))
     db.commit(); flash(request, "Usuário adicionado à conta.")
     return redirect("/account/users")
 
 
 @router.post("/account/users/{target_id}/access")
-def account_user_access(target_id: int, request: Request, area_ids: list[int] = Form(default=[]),
+def account_user_access(target_id: int, request: Request, area_access: list[str] = Form(default=[]),
         db: Session = Depends(get_db), user: User = Depends(current_user)):
     require_account_admin(user)
     target = db.scalar(select(User).where(User.id == target_id, User.system_account_id == user.system_account_id))
     if not target: raise HTTPException(404)
-    db.execute(delete(UserPersonAccess).where(UserPersonAccess.user_id == target.id))
     if target.account_role != AccountRole.admin:
-        wid = current_workspace_id(request, user, db)
-        valid_ids = db.scalars(select(Person.id).where(Person.workspace_id == wid, Person.id.in_(area_ids))).all() if area_ids else []
-        db.add_all([UserPersonAccess(user_id=target.id, person_id=area_id) for area_id in valid_ids])
-        if target.default_person_id not in valid_ids:
-            target.default_person_id = valid_ids[0] if valid_ids else None
+        replace_area_access(db, target, current_workspace_id(request, user, db), parse_area_access(area_access))
+    else:
+        db.execute(delete(UserPersonAccess).where(UserPersonAccess.user_id == target.id))
     db.commit(); flash(request, "Permissões atualizadas.")
     return redirect("/account/users")
 

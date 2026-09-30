@@ -20,6 +20,11 @@ class AccountRole(str, Enum):
     member = "member"
 
 
+class AreaAccessLevel(str, Enum):
+    read = "read"
+    write = "write"
+
+
 class PersonType(str, Enum):
     personal = "personal"
     shared = "shared"
@@ -241,6 +246,9 @@ class UserPersonAccess(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     person_id: Mapped[int] = mapped_column(ForeignKey("people.id", ondelete="CASCADE"), index=True)
+    access_level: Mapped[AreaAccessLevel] = mapped_column(
+        SAEnum(AreaAccessLevel), default=AreaAccessLevel.write, server_default=AreaAccessLevel.write.value,
+    )
 
 
 class Account(Base):

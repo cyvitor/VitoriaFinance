@@ -46,6 +46,42 @@ document.querySelectorAll('[data-area-resource-form]').forEach((form) => {
   refreshResources();
 });
 
+function areaIsWritable(areaId) {
+  const raw = document.body.dataset.writableAreas || 'all';
+  if (!areaId || raw === 'all') return true;
+  if (raw === 'none') return false;
+  return raw.split(',').includes(String(areaId));
+}
+
+document.querySelectorAll('form').forEach((form) => {
+  const areaSelect = form.querySelector('select[name="person_id"]:not([data-context-area])');
+  if (!areaSelect) return;
+  const submit = form.querySelector('button.btn-primary');
+  if (!submit) return;
+  const note = document.createElement('div');
+  note.className = 'alert alert-warning d-none mt-3';
+  note.textContent = 'Esta área financeira está disponível apenas para leitura.';
+  const actions = form.querySelector('.form-actions');
+  (actions || submit).before(note);
+  const refreshAccess = () => {
+    const writable = areaIsWritable(areaSelect.value);
+    note.classList.toggle('d-none', writable);
+    submit.disabled = !writable;
+  };
+  areaSelect.addEventListener('change', refreshAccess);
+  refreshAccess();
+});
+
+document.querySelectorAll('[data-person-id]').forEach((element) => {
+  if (areaIsWritable(element.dataset.personId)) return;
+  const row = element.closest('.sheet-row');
+  if (!row) return;
+  row.querySelectorAll('button').forEach((button) => {
+    button.disabled = true;
+    button.title = 'Área disponível apenas para leitura';
+  });
+});
+
 const sidebar = document.querySelector('.sidebar');
 const cardsMenu = sidebar?.querySelector('nav a[href="/cards"]');
 if (cardsMenu && !sidebar.querySelector('nav a[href="/vehicles"]')) {

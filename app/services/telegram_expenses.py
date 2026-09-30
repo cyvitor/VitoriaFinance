@@ -8,7 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models import (
-    Account, AccountRole, Card, Category, Person, TelegramExpenseDraft, TelegramExpenseQueueItem,
+    Account, AccountRole, AreaAccessLevel, Card, Category, Person, TelegramExpenseDraft, TelegramExpenseQueueItem,
     Transaction, TransactionStatus, TransactionType, User, UserPersonAccess, WorkspaceMember,
 )
 from app.services.card_billing import card_purchase_competence
@@ -22,25 +22,29 @@ class ExpenseInput:
     description: str
 
 
+def _person_is_writable(db: Session, user: User, person: Person) -> bool:
+    if user.is_super_admin or user.account_role == AccountRole.admin:
+        return True
+    return bool(db.scalar(select(UserPersonAccess.id).where(
+        UserPersonAccess.user_id == user.id,
+        UserPersonAccess.person_id == person.id,
+        UserPersonAccess.access_level == AreaAccessLevel.write,
+    )))
+
+
 def _telegram_context(db: Session, user: User) -> tuple[int, Person] | None:
     if user.default_person_id:
         person = db.get(Person, user.default_person_id)
         if person and person.is_active and db.scalar(select(WorkspaceMember.id).where(
             WorkspaceMember.user_id == user.id, WorkspaceMember.workspace_id == person.workspace_id,
-        )):
-            has_access = user.is_super_admin or user.account_role == AccountRole.admin or db.scalar(
-                select(UserPersonAccess.id).where(
-                    UserPersonAccess.user_id == user.id, UserPersonAccess.person_id == person.id,
-                )
-            )
-            if has_access:
-                return person.workspace_id, person
+        )) and _person_is_writable(db, user, person):
+            return person.workspace_id, person
     memberships = db.scalars(select(WorkspaceMember).where(WorkspaceMember.user_id == user.id)).all()
     if len(memberships) == 1:
         people = db.scalars(select(Person).where(
             Person.workspace_id == memberships[0].workspace_id, Person.is_active,
         )).all()
-        if len(people) == 1:
+        if len(people) == 1 and _person_is_writable(db, user, people[0]):
             return memberships[0].workspace_id, people[0]
     return None
 
@@ -172,10 +176,13 @@ def update_expense_draft(db: Session, user: User, *, description: str | None = N
     missing = []
     category_options = []
     if person and person.id != draft.person_id:
-        # Conta e cartão pertencem à área: nunca carregue esses vínculos para outra área.
-        draft.person_id = person.id
-        draft.account_id = None
-        draft.card_id = None
+        if not _person_is_writable(db, user, person):
+            missing.append("area com permissao de escrita")
+        else:
+            # Conta e cartão pertencem à área: nunca carregue esses vínculos para outra área.
+            draft.person_id = person.id
+            draft.account_id = None
+            draft.card_id = None
     if description is not None:
         normalized_description = " ".join(str(description).split())
         if normalized_description:
@@ -262,6 +269,9 @@ def confirm_expense_draft(db: Session, user: User, now: datetime | None = None) 
     now = now or datetime.utcnow()
     draft = get_active_draft(db, user.id, now)
     if not draft:
+        return None
+    person = db.get(Person, draft.person_id)
+    if not person or not _person_is_writable(db, user, person):
         return None
     is_credit = draft.payment_method == "Crédito"
     if is_credit and not draft.card_id:

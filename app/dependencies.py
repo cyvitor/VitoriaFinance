@@ -3,7 +3,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.models import AccountRole, User, UserPersonAccess, WorkspaceMember
+from app.models import AccountRole, AreaAccessLevel, Person, User, UserPersonAccess, WorkspaceMember
 
 
 def current_user(request: Request, db: Session = Depends(get_db)) -> User:
@@ -36,3 +36,29 @@ def allowed_person_ids(user: User, db: Session) -> list[int] | None:
     if user.is_super_admin or user.account_role == AccountRole.admin:
         return None
     return list(db.scalars(select(UserPersonAccess.person_id).where(UserPersonAccess.user_id == user.id)).all())
+
+
+def writable_person_ids(user: User, db: Session) -> list[int] | None:
+    """None significa escrita em todas as áreas. Membros só escrevem onde o nível é escrita."""
+    if user.is_super_admin or user.account_role == AccountRole.admin:
+        return None
+    return list(db.scalars(select(UserPersonAccess.person_id).where(
+        UserPersonAccess.user_id == user.id,
+        UserPersonAccess.access_level == AreaAccessLevel.write,
+    )).all())
+
+
+def can_write_all_areas(user: User, db: Session) -> bool:
+    writable = writable_person_ids(user, db)
+    if writable is None:
+        return True
+    workspace_ids = list(db.scalars(
+        select(WorkspaceMember.workspace_id).where(WorkspaceMember.user_id == user.id)
+    ).all())
+    if not workspace_ids:
+        return False
+    area_ids = list(db.scalars(select(Person.id).where(
+        Person.workspace_id.in_(workspace_ids), Person.is_active.is_(True),
+    )).all())
+    granted = set(writable)
+    return all(area_id in granted for area_id in area_ids)

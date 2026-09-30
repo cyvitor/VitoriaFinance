@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models import AccountRole, MemberRole, Person, User, UserPersonAccess, WorkspaceMember
+from app.models import AccountRole, AreaAccessLevel, MemberRole, Person, User, UserPersonAccess, WorkspaceMember
 
 
 @dataclass(frozen=True)
@@ -12,6 +12,7 @@ class UserAccessContext:
     system_account_id: int | None
     workspace_ids: tuple[int, ...]
     allowed_person_ids: tuple[int, ...]
+    writable_person_ids: tuple[int, ...]
     writable_workspace_ids: tuple[int, ...]
     default_person_id: int | None
     can_write: bool
@@ -33,6 +34,17 @@ def build_user_access_context(db: Session, user: User) -> UserAccessContext:
             Person.workspace_id.in_(workspace_ids),
             Person.is_active.is_(True),
         )).all()) if workspace_ids else ()
+    if is_admin:
+        writable_ids = person_ids
+    else:
+        writable_ids = tuple(db.scalars(select(UserPersonAccess.person_id).join(
+            Person, Person.id == UserPersonAccess.person_id
+        ).where(
+            UserPersonAccess.user_id == user.id,
+            UserPersonAccess.access_level == AreaAccessLevel.write,
+            Person.workspace_id.in_(workspace_ids),
+            Person.is_active.is_(True),
+        )).all()) if workspace_ids else ()
     writable_workspace_ids = workspace_ids if is_admin else tuple(
         item.workspace_id for item in memberships if item.role in (MemberRole.admin, MemberRole.editor)
     )
@@ -42,6 +54,7 @@ def build_user_access_context(db: Session, user: User) -> UserAccessContext:
         system_account_id=user.system_account_id,
         workspace_ids=workspace_ids,
         allowed_person_ids=person_ids,
+        writable_person_ids=writable_ids,
         writable_workspace_ids=writable_workspace_ids,
         default_person_id=user.default_person_id if user.default_person_id in person_ids else None,
         can_write=can_write,

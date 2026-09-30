@@ -109,6 +109,61 @@ def test_area_selected_in_form_filters_accounts_cards_and_blocks_cross_area_post
     assert blocked_account.status_code == 403
 
 
+def test_read_only_area_can_be_viewed_but_not_changed(client):
+    vitor_id = seed_test()
+    with SessionLocal() as db:
+        workspace_id = db.scalar(select(Workspace.id))
+        admin = db.scalar(select(User).where(User.username == "vh"))
+        nana = Person(workspace_id=workspace_id, name="Nana", person_type=PersonType.personal)
+        db.add(nana); db.flush()
+        vitor_account = Account(workspace_id=workspace_id, person_id=vitor_id, name="Conta Vitor", account_type=AccountType.checking)
+        nana_account = Account(workspace_id=workspace_id, person_id=nana.id, name="Conta Nana", account_type=AccountType.checking)
+        category = Category(workspace_id=workspace_id, kind=TransactionType.income, parent_name="Receitas", name="Salário")
+        db.add_all([vitor_account, nana_account, category]); db.flush()
+        nana_user = User(system_account_id=admin.system_account_id, username="nana", full_name="Nana",
+                         password_hash=hash_password("senha-nana-123"), account_role=AccountRole.member,
+                         default_person_id=nana.id)
+        db.add(nana_user); db.flush()
+        db.add(WorkspaceMember(workspace_id=workspace_id, user_id=nana_user.id, role=MemberRole.editor))
+        db.commit()
+        nana_id, nana_user_id = nana.id, nana_user.id
+        vitor_account_id, nana_account_id, category_id = vitor_account.id, nana_account.id, category.id
+
+    client.post("/login", data={"username": "vh", "password": "123456"})
+    saved = client.post(f"/account/users/{nana_user_id}/access", data={
+        "area_access": [f"{nana_id}:write", f"{vitor_id}:read"],
+    }, follow_redirects=True)
+    assert f'value="{vitor_id}:read" selected' in saved.text
+    assert f'value="{nana_id}:write" selected' in saved.text
+
+    client.post("/logout")
+    client.post("/login", data={"username": "nana", "password": "senha-nana-123"})
+    form = client.get("/transactions/new?kind=income")
+    assert "Conta Vitor" in form.text and "Conta Nana" in form.text
+    assert f'data-writable-areas="{nana_id}"' in form.text
+    blocked = client.post("/transactions/new", data={
+        "transaction_type": "income", "description": "Consulta", "amount": "10",
+        "transaction_date": "2026-09-30", "status": "paid", "person_id": str(vitor_id),
+        "account_id": str(vitor_account_id), "category_id": str(category_id),
+    }, follow_redirects=False)
+    assert blocked.status_code == 403
+    allowed = client.post("/transactions/new", data={
+        "transaction_type": "income", "description": "Salario Nana", "amount": "20",
+        "transaction_date": "2026-09-30", "status": "paid", "person_id": str(nana_id),
+        "account_id": str(nana_account_id), "category_id": str(category_id),
+    }, follow_redirects=False)
+    assert allowed.status_code == 303
+    blocked_account = client.post("/accounts", data={
+        "name": "Nova de Vitor", "bank_name": "", "account_type": "checking",
+        "person_id": str(vitor_id), "initial_balance": "0", "color": "#6c5ce7",
+    }, follow_redirects=False)
+    assert blocked_account.status_code == 403
+    month = client.get("/month")
+    assert "Fechar mês" not in month.text
+    close = client.post("/month/close", data={"year": "2026", "month": "9"}, follow_redirects=True)
+    assert "escrita em todas as áreas" in close.text
+
+
 def test_account_admin_can_reset_user_password_to_default(client):
     seed_test()
     with SessionLocal() as db:
@@ -522,7 +577,7 @@ def test_account_admin_grants_only_selected_areas(client):
     client.post("/people", data={"name": "Casal", "person_type": "shared"})
     response = client.post("/account/users", data={
         "username": "esposa", "full_name": "Esposa", "password": "abcdef",
-        "account_role": "member", "area_ids": str(first_area_id),
+        "account_role": "member", "area_access": f"{first_area_id}:write",
     }, follow_redirects=False)
     assert response.status_code == 303
     client.post("/logout")

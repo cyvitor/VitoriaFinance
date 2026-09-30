@@ -609,7 +609,7 @@ def prepare_income(db: Session, context: UserAccessContext, args: dict) -> dict:
     category = None
     category_options = []
     if person:
-        if person.workspace_id not in context.writable_workspace_ids:
+        if person.workspace_id not in context.writable_workspace_ids or person.id not in context.writable_person_ids:
             raise ToolError("Usuario possui somente leitura nesta area financeira")
         account, account_options = _resolve_income_account(db, context, person, payload.get("account"))
         if not account:
@@ -695,6 +695,7 @@ def prepare_transaction_update(db: Session, context: UserAccessContext, args: di
     if args.get("area"):
         person = _resolve_person(db, context, args["area"])
         query = query.where(Transaction.person_id == person.id)
+    query = query.where(Transaction.person_id.in_(context.writable_person_ids or (-1,)))
     matches = db.scalars(query.order_by(Transaction.transaction_date.desc(), Transaction.id.desc()).limit(10)).all()
     if not matches:
         return {
@@ -811,7 +812,7 @@ def prepare_financing_amortization(db: Session, context: UserAccessContext, args
     payload = json.loads(action.payload) if action and action.action_type == "financing_amortization" else {}
     if not payload:
         financing = _resolve_financing(db, context, args.get("financing"))
-        if financing.workspace_id not in context.writable_workspace_ids:
+        if financing.workspace_id not in context.writable_workspace_ids or financing.person_id not in context.writable_person_ids:
             raise ToolError("Usuario possui somente leitura neste financiamento")
         payload = {"financing_id": financing.id, "description": financing.description,
                    "previous_balance": _money(financing.outstanding_balance) if financing.outstanding_balance is not None else None,
@@ -857,7 +858,7 @@ def confirm_pending_action(db: Session, context: UserAccessContext, args: dict) 
         transaction = db.scalar(select(Transaction).where(
             Transaction.id == payload.get("transaction_id"),
             Transaction.workspace_id.in_(context.writable_workspace_ids),
-            Transaction.person_id.in_(context.allowed_person_ids),
+            Transaction.person_id.in_(context.writable_person_ids),
         ))
         vehicle = db.scalar(select(Vehicle).where(
             Vehicle.id == payload.get("vehicle_id"), Vehicle.is_active.is_(True),
@@ -900,6 +901,8 @@ def confirm_pending_action(db: Session, context: UserAccessContext, args: dict) 
                               fillup.is_full_tank != original["full_tank"])):
             action.status = "cancelled"; action.resolved_at = datetime.utcnow(); db.commit()
             raise ToolError("O abastecimento mudou desde o resumo; inicie a correcao novamente")
+        if fillup.transaction and fillup.transaction.person_id not in context.writable_person_ids:
+            raise ToolError("Usuario possui somente leitura nesta area financeira")
         fillup.odometer_km = Decimal(payload["odometer_km"])
         fillup.liters = Decimal(payload["liters"])
         fillup.price_per_liter = Decimal(payload["price_per_liter"])
@@ -913,7 +916,7 @@ def confirm_pending_action(db: Session, context: UserAccessContext, args: dict) 
         item = db.scalar(select(Transaction).where(
             Transaction.id == payload["transaction_id"],
             Transaction.workspace_id.in_(context.writable_workspace_ids),
-            Transaction.person_id.in_(context.allowed_person_ids),
+            Transaction.person_id.in_(context.writable_person_ids),
             Transaction.status != TransactionStatus.cancelled,
         ))
         original = payload["original"]
@@ -953,7 +956,7 @@ def confirm_pending_action(db: Session, context: UserAccessContext, args: dict) 
         payload = json.loads(action.payload)
         person = db.scalar(select(Person).where(
             Person.id == payload["person_id"],
-            Person.id.in_(context.allowed_person_ids),
+            Person.id.in_(context.writable_person_ids),
             Person.workspace_id.in_(context.writable_workspace_ids),
         ))
         account = db.scalar(select(Account).where(
@@ -997,7 +1000,7 @@ def confirm_pending_action(db: Session, context: UserAccessContext, args: dict) 
     payload = json.loads(action.payload)
     financing = db.scalar(select(Financing).where(
         Financing.id == payload["financing_id"], Financing.workspace_id.in_(context.workspace_ids),
-        Financing.person_id.in_(context.allowed_person_ids), Financing.status == "active",
+        Financing.person_id.in_(context.writable_person_ids), Financing.status == "active",
     ))
     if not financing:
         raise ToolError("Financiamento nao encontrado ou sem permissao")
@@ -1086,7 +1089,7 @@ def prepare_expense(db: Session, context: UserAccessContext, args: dict) -> dict
         db.commit()
     if user.default_person_id:
         person = db.get(Person, user.default_person_id)
-        if person and person.workspace_id not in context.writable_workspace_ids:
+        if person and (person.workspace_id not in context.writable_workspace_ids or person.id not in context.writable_person_ids):
             raise ToolError("Usuario possui somente leitura na area financeira padrao")
     draft = create_expense_draft(db, user, ExpenseInput(amount, description[:180]))
     if not draft:
@@ -1237,7 +1240,7 @@ def prepare_fuel_fillup(db: Session, context: UserAccessContext, args: dict) -> 
     transaction = db.scalar(select(Transaction).where(
         Transaction.id == payload.get("transaction_id"),
         Transaction.workspace_id.in_(context.writable_workspace_ids),
-        Transaction.person_id.in_(context.allowed_person_ids),
+        Transaction.person_id.in_(context.writable_person_ids),
     ))
     if not transaction:
         action.status = "cancelled"; action.resolved_at = datetime.utcnow(); db.commit()
