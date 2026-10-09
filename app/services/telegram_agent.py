@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from app.models import Account, FuelFillup, Person, SystemSetting, TelegramConversationMessage, TelegramPendingAction, Transaction, User, Vehicle
 from app.logging_config import get_bot_logger
-from app.services.access_context import build_user_access_context
+from app.services.access_context import build_user_access_context, scope_to_principal_area
 from app.services.financial_tools import ToolError, execute_tool
 from app.services.telegram_ai import AIResponseFormatError, AIToolSelectionError, AIUnavailableError
 from app.services.telegram_expenses import get_active_draft
@@ -47,7 +47,7 @@ Ferramentas permitidas e argumentos:
 - preparar_amortizacao_financiamento: {"financing":texto opcional,"new_outstanding_balance":numero opcional,"remaining_installments":inteiro opcional,"new_installment_amount":numero opcional,"amortized_amount":numero opcional,"strategy":"reduce_term|reduce_installment|reduce_both" opcional,"amortization_date":"YYYY-MM-DD" opcional,"notes":texto opcional}
 - confirmar_acao_pendente: {}
 - cancelar_acao_pendente: {}
-- preparar_despesa: {"amount":numero,"description":texto,"transaction_date":"YYYY-MM-DD" opcional,"category":texto opcional,"payment_method":"cash|credit" opcional,"card":texto opcional}
+- preparar_despesa: {"amount":numero,"description":texto,"transaction_date":"YYYY-MM-DD" opcional,"category":texto opcional,"payment_method":"cash|credit" opcional,"card":texto opcional}. Omita category quando o usuario nao disse a categoria; o backend identifica pelo estabelecimento.
 - preparar_despesas: {"expenses":[objetos com os mesmos campos de preparar_despesa, um para cada gasto]}
 - atualizar_despesa: {"description":texto opcional,"transaction_date":"YYYY-MM-DD" opcional,"area":texto opcional,"category":texto opcional,"payment_method":"cash|credit" opcional,"card":texto opcional}
 - sugerir_categoria_despesa: {}
@@ -931,7 +931,7 @@ def run_financial_agent(db: Session, user: User, text: str, reference_date: date
         logger.info("explicit_user_preference_stored user_id=%s subject=data_padrao_dos_gastos", user.id)
         return explicit_preference_reply
     token, model = _settings(db)
-    context = build_user_access_context(db, user)
+    context = scope_to_principal_area(build_user_access_context(db, user))
     areas = db.scalars(select(Person.name).where(Person.id.in_(context.allowed_person_ids))).all() if context.allowed_person_ids else []
     pending = _pending_context(db, user)
     memory_context = format_memory_context(relevant_memories(db, user.id, text))
@@ -954,6 +954,7 @@ Para abastecimentos, extraia full_tank=true de frases como "completei", "encheu"
 Se o usuario disser que quer adicionar um novo abastecimento e informar valor, cartao ou forma de pagamento, mas NAO existir action_type=fuel_fillup no contexto, isso ainda e uma nova despesa de combustivel: use preparar_despesa com description Gasolina/Etanol/Combustivel, amount, card e payment_method. Nunca use preparar_abastecimento antes de a despesa ser confirmada. Depois de confirmar_despesa, o backend criara o contexto de abastecimento e perguntara se ele deseja complementar os dados.
 Se o usuario disser "esqueca", "vamos adicionar outro" ou equivalente e ja trouxer os dados de uma nova despesa na mesma mensagem, escolha preparar_despesa diretamente; o backend encerrara o complemento opcional anterior. Nao desperdice o turno chamando apenas cancelamento.
 Quando houver despesa pendente e o usuario corrigir ou complementar descricao, area, categoria, pagamento ou cartao, use atualizar_despesa e envie todos os campos informados. A area padrao do usuario deve ser usada ao iniciar uma despesa; so troque a area se ele pedir explicitamente. Nunca apenas diga que atualizou.
+Consultas e lancamentos usam somente a area principal com escrita. Nao peça categoria em preparar_despesa se o usuario nao informou uma; quando o resumo ja trouxer categoria, nao ofereca outra lista.
 Quando o usuario pedir para procurar, escolher ou sugerir a categoria de uma despesa pendente, use sugerir_categoria_despesa. Nao devolva apenas uma lista se o backend conseguir recomendar uma categoria.
 Para registrar dinheiro recebido, inclusive PIX, use preparar_receita. Se faltarem dados, chame preparar_receita novamente com a resposta do usuario. Nunca escolha uma conta de destino sem informacao suficiente.
 Se o usuario pedir ajuda para escolher uma categoria de receita, use consultar_categorias_receita. Para PIX, a categoria PIX pode ser inferida automaticamente quando existir; para outras receitas, confirme uma categoria valida antes de registrar.

@@ -1102,6 +1102,9 @@ def prepare_expense(db: Session, context: UserAccessContext, args: dict) -> dict
             db, user, category=args.get("category"), payment_method=args.get("payment_method"),
             card=args.get("card"), transaction_date=transaction_date,
         )
+    if draft and draft.category_id and any(item in ("subcategoria", "categoria valida") for item in missing):
+        missing = [item for item in missing if item not in ("subcategoria", "categoria valida")]
+        category_options = []
     return {"status": "missing_information" if missing else "awaiting_confirmation",
             "missing_fields": missing, "category_options": category_options,
             "summary": format_draft(draft), "budget_impact": _draft_budget_impact(db, context, draft)}

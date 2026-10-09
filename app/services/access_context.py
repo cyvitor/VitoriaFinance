@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -58,4 +58,27 @@ def build_user_access_context(db: Session, user: User) -> UserAccessContext:
         writable_workspace_ids=writable_workspace_ids,
         default_person_id=user.default_person_id if user.default_person_id in person_ids else None,
         can_write=can_write,
+    )
+
+
+def scope_to_principal_area(context: UserAccessContext) -> UserAccessContext:
+    """O Telegram só consulta a área principal com leitura e escrita.
+
+    A área marcada como padrão vale quando o usuário pode lançar nela.
+    Se a padrão for somente leitura, fica a única área em que ele escreve.
+    Áreas somente leitura não entram nas consultas do bot.
+    """
+    writable = context.writable_person_ids
+    principal = context.default_person_id if context.default_person_id in writable else None
+    if principal is None and len(writable) == 1:
+        principal = writable[0]
+    if principal is None:
+        return replace(context, allowed_person_ids=(), writable_person_ids=(), can_write=False)
+    scoped = (principal,)
+    return replace(
+        context,
+        allowed_person_ids=scoped,
+        writable_person_ids=scoped,
+        default_person_id=principal,
+        can_write=context.can_write,
     )

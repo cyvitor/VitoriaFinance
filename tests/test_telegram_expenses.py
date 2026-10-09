@@ -6,12 +6,12 @@ from sqlalchemy import func, select
 from app.automation.telegram_bot import handle_message
 from app.database import SessionLocal
 from app.models import (
-    Account, AccountRole, AccountType, Card, Category, MonthlyBudget, Person, PersonType, SystemAccount, TelegramLink,
-    TelegramExpenseQueueItem, Transaction, TransactionType, User, Workspace, WorkspaceMember,
+    Account, AccountRole, AccountType, AreaAccessLevel, Card, Category, MonthlyBudget, Person, PersonType, SystemAccount, TelegramLink,
+    TelegramExpenseQueueItem, Transaction, TransactionStatus, TransactionType, User, UserPersonAccess, Workspace, WorkspaceMember,
 )
 from app.security import hash_password
-from app.services.access_context import build_user_access_context
-from app.services.financial_tools import execute_tool
+from app.services.access_context import build_user_access_context, scope_to_principal_area
+from app.services.financial_tools import ToolError, execute_tool
 from app.services.telegram_ai import AIResponseFormatError, AIUnavailableError
 
 
@@ -295,3 +295,96 @@ def test_invalid_structured_response_has_specific_message(monkeypatch):
         response = handle_message(db, message("quanto ainda posso gastar?"))
         assert "organizar essa consulta" in response
         assert "DeepInfra" not in response
+
+
+def test_inferred_category_wins_over_ambiguous_parent_sent_by_the_model():
+    with SessionLocal() as db:
+        user = setup_linked_user(db)
+        context = build_user_access_context(db, user)
+        person = db.get(Person, user.default_person_id)
+        account = Account(workspace_id=person.workspace_id, person_id=person.id, name="Santander",
+                          account_type=AccountType.checking)
+        db.add(account)
+        db.flush()
+        db.add_all([
+            Category(workspace_id=person.workspace_id, name="Medicamentos", parent_name="Saude",
+                     kind=TransactionType.expense),
+            Card(workspace_id=person.workspace_id, account_id=account.id, name="C6", closing_day=5, due_day=10),
+        ])
+        db.commit()
+        result = execute_tool(db, context, "preparar_despesa", {
+            "amount": 55.66, "description": "Pague Menos", "category": "Alimentacao",
+            "payment_method": "credit", "card": "C6",
+        })
+        assert result["status"] == "awaiting_confirmation"
+        assert result["category_options"] == []
+        assert result["missing_fields"] == []
+        assert "Categoria: Saude > Medicamentos" in result["summary"]
+        assert "Cartao: C6" in result["summary"]
+
+
+def test_telegram_card_query_uses_only_the_principal_writable_area():
+    with SessionLocal() as db:
+        account = SystemAccount(name="Casa")
+        db.add(account)
+        db.flush()
+        user = User(system_account_id=account.id, username="nana-bot", full_name="Ananaira",
+                    password_hash=hash_password("password123"), account_role=AccountRole.member)
+        workspace = Workspace(system_account_id=account.id, name="Familia")
+        db.add_all([user, workspace])
+        db.flush()
+        db.add(WorkspaceMember(user_id=user.id, workspace_id=workspace.id))
+        nana = Person(workspace_id=workspace.id, name="Nana", person_type=PersonType.personal)
+        vitor = Person(workspace_id=workspace.id, name="Vitor", person_type=PersonType.personal)
+        db.add_all([nana, vitor])
+        db.flush()
+        user.default_person_id = nana.id
+        db.add_all([
+            UserPersonAccess(user_id=user.id, person_id=nana.id, access_level=AreaAccessLevel.write),
+            UserPersonAccess(user_id=user.id, person_id=vitor.id, access_level=AreaAccessLevel.read),
+        ])
+        nana_account = Account(workspace_id=workspace.id, person_id=nana.id, name="Santander",
+                               account_type=AccountType.checking)
+        vitor_account = Account(workspace_id=workspace.id, person_id=vitor.id, name="Caixa",
+                                account_type=AccountType.checking)
+        db.add_all([nana_account, vitor_account])
+        db.flush()
+        nana_card = Card(workspace_id=workspace.id, account_id=nana_account.id, name="Nubank Nana",
+                         closing_day=1, due_day=10)
+        vitor_card = Card(workspace_id=workspace.id, account_id=vitor_account.id, name="C6",
+                          closing_day=5, due_day=10)
+        db.add_all([nana_card, vitor_card])
+        db.flush()
+        db.add_all([
+            Transaction(
+                workspace_id=workspace.id, person_id=nana.id, account_id=nana_account.id, card_id=nana_card.id,
+                transaction_type=TransactionType.expense, description="Farmacia da Nana", amount=Decimal("30.00"),
+                transaction_date=date(2026, 10, 4), competence_year=2026, competence_month=10,
+                status=TransactionStatus.pending, payment_method="Crédito", created_by_id=user.id,
+            ),
+            Transaction(
+                workspace_id=workspace.id, person_id=vitor.id, account_id=vitor_account.id, card_id=vitor_card.id,
+                transaction_type=TransactionType.expense, description="Splash bebidas", amount=Decimal("97.37"),
+                transaction_date=date(2026, 10, 4), competence_year=2026, competence_month=10,
+                status=TransactionStatus.pending, payment_method="Crédito", created_by_id=user.id,
+            ),
+        ])
+        db.commit()
+        broad = build_user_access_context(db, user)
+        assert nana.id in broad.allowed_person_ids and vitor.id in broad.allowed_person_ids
+        scoped = scope_to_principal_area(broad)
+        assert scoped.allowed_person_ids == (nana.id,)
+        result = execute_tool(db, scoped, "consultar_gastos_cartao", {
+            "start_date": "2026-10-01", "end_date": "2026-10-31",
+        })
+        assert result["cards"] == ["Nubank Nana"]
+        assert result["total"] == "30.00"
+        assert [item["description"] for item in result["items"]] == ["Farmacia da Nana"]
+        try:
+            execute_tool(db, scoped, "consultar_gastos_cartao", {
+                "card": "C6", "start_date": "2026-10-01", "end_date": "2026-10-31",
+            })
+        except ToolError as exc:
+            assert "nao encontrado" in str(exc).casefold() or "sem permissao" in str(exc).casefold()
+        else:
+            raise AssertionError("o cartao de outra area nao deveria aparecer")
