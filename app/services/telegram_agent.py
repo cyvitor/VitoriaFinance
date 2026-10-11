@@ -1,5 +1,6 @@
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
+from dataclasses import replace
 import json
 import re
 import unicodedata
@@ -12,6 +13,7 @@ from app.models import Account, FuelFillup, Person, SystemSetting, TelegramConve
 from app.logging_config import get_bot_logger
 from app.services.access_context import build_user_access_context, scope_to_principal_area
 from app.services.financial_tools import ToolError, execute_tool
+from app.services.llm_client import LLMConfig, LLMUnavailable, chat_completion, load_llm_config
 from app.services.telegram_ai import AIResponseFormatError, AIToolSelectionError, AIUnavailableError
 from app.services.telegram_expenses import get_active_draft
 from app.services.user_memory import format_memory_context, relevant_memories, store_candidates
@@ -70,34 +72,28 @@ def _json_from_model(content: str) -> dict:
     return json.loads(content)
 
 
-def _settings(db: Session) -> tuple[str, str]:
-    values = {item.key: item.value for item in db.scalars(select(SystemSetting).where(
-        SystemSetting.key.in_(["deepinfra_api_key", "deepinfra_model"])
-    )).all()}
-    if not values.get("deepinfra_api_key") or not values.get("deepinfra_model"):
+def _settings(db: Session) -> tuple[str, LLMConfig]:
+    """Le API key, modelo principal, fallbacks e regras de retry da tela de configuracoes."""
+    config = load_llm_config(db)
+    if config is None:
         raise AIUnavailableError("DeepInfra nao configurada")
-    return values["deepinfra_api_key"], values["deepinfra_model"]
+    return config.token, config
 
 
-def _complete(token: str, model: str, messages: list[dict], max_tokens: int = 500,
+def _complete(token: str, model, messages: list[dict], max_tokens: int = 500,
               json_mode: bool = False) -> str:
-    payload = {"model": model, "messages": messages, "temperature": 0, "max_tokens": max_tokens}
-    if json_mode:
-        payload["response_format"] = {"type": "json_object"}
+    """Chama a DeepInfra com retry por modelo e fallback para os proximos da lista.
+
+    ``model`` normalmente e o LLMConfig de _settings; uma string isolada continua aceita.
+    """
+    config = model if isinstance(model, LLMConfig) else LLMConfig(token=token, models=[str(model)])
     try:
-        response = httpx.post(
-            "https://api.deepinfra.com/v1/openai/chat/completions",
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-            json=payload,
-            timeout=35.0,
-        )
-        response.raise_for_status()
-        content = response.json()["choices"][0]["message"]["content"]
-        logger.debug("deepinfra_response model=%s json_mode=%s content=%r", model, json_mode, content)
-        return content
-    except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError) as exc:
-        logger.exception("deepinfra_request_failed model=%s json_mode=%s", model, json_mode)
+        content, used_model = chat_completion(config, messages, max_tokens, json_mode,
+                                              purpose="json" if json_mode else "text")
+    except LLMUnavailable as exc:
         raise AIUnavailableError(str(exc)) from exc
+    logger.debug("deepinfra_response model=%s json_mode=%s content=%r", used_model, json_mode, content)
+    return content
 
 
 def _requires_financial_tool(text: str) -> bool:
@@ -368,6 +364,42 @@ def _enforce_pending_description_intent(text: str, has_draft: bool, decision: di
         logger.info("agent_decision_corrected reason=pending_expense_description original=%s corrected=%s",
                     decision, corrected)
     return corrected
+
+
+CONFIRM_WORDS = {
+    "sim", "s", "ss", "pode", "pode sim", "sim pode", "ok", "okay", "certo", "confirmo", "confirmar",
+    "confirma", "confirmado", "yes", "isso", "correto", "pode registrar", "sim pode registrar",
+    "registra", "registrar", "pode confirmar", "sim confirmo", "beleza", "blz", "fechado",
+}
+CANCEL_WORDS = {
+    "nao", "n", "cancela", "cancelar", "cancele", "cancelado", "nao registra", "nao registrar",
+    "pode cancelar", "esquece", "esqueca", "deixa", "deixa pra la", "ignore", "ignora",
+}
+
+
+def _simple_reply_kind(text: str) -> str | None:
+    """Classifica respostas curtas de confirmacao/cancelamento sem usar o modelo."""
+    normalized = re.sub(r"[^a-z0-9 ]+", " ", _normalized_text(text))
+    normalized = " ".join(normalized.split())
+    if normalized in CONFIRM_WORDS:
+        return "confirm"
+    if normalized in CANCEL_WORDS:
+        return "cancel"
+    return None
+
+
+def _local_pending_decision(text: str, has_draft: bool,
+                            pending_action: TelegramPendingAction | None) -> dict | None:
+    kind = _simple_reply_kind(text)
+    if not kind:
+        return None
+    if has_draft:
+        tool = "confirmar_despesa" if kind == "confirm" else "cancelar_despesa"
+    elif pending_action and pending_action.status == "awaiting_confirmation":
+        tool = "confirmar_acao_pendente" if kind == "confirm" else "cancelar_acao_pendente"
+    else:
+        return None
+    return {"action": "tool", "tool": tool, "arguments": {}}
 
 
 def _enforce_pending_confirmation_intent(text: str, has_draft: bool, decision: dict) -> dict:
@@ -735,6 +767,24 @@ def _purchase_simulation_reply(result: dict) -> str:
     return "\n".join(lines)
 
 
+PAYMENT_LABELS = {"credit": "Crédito", "cash": "Débito/à vista", "debit": "Débito"}
+
+
+def _draft_fallback_reply(result: dict) -> str | None:
+    """Mostra o rascunho preparado pelo backend sem depender do modelo."""
+    summary = result.get("summary")
+    if not summary:
+        return None
+    text = str(summary)
+    for raw, label in PAYMENT_LABELS.items():
+        text = text.replace(f"Forma de pagamento: {raw}\n", f"Forma de pagamento: {label}\n")
+    if result.get("status") == "awaiting_confirmation" and "?" not in text[-60:]:
+        text = text.rstrip() + "\n\nPosso registrar? Responda *sim* para confirmar ou *não* para cancelar."
+    elif result.get("status") == "awaiting_confirmation":
+        text = text.rstrip() + "\n\nResponda *sim* para confirmar ou *não* para cancelar."
+    return text
+
+
 def _fallback_tool_reply(tool_name: str, result: dict) -> str:
     if tool_name == "simular_compra_cartao":
         return _purchase_simulation_reply(result)
@@ -782,6 +832,9 @@ def _fallback_tool_reply(tool_name: str, result: dict) -> str:
         )
     if "error" in result:
         return str(result["error"])
+    draft_reply = _draft_fallback_reply(result)
+    if draft_reply:
+        return draft_reply
     return "A consulta foi executada, mas nao consegui formatar a resposta agora. Tente novamente em instantes."
 
 
@@ -840,6 +893,8 @@ def _expense_tool_reply(tool_name: str, result: dict, model_reply: str) -> str:
             )
         summary = str(result.get("summary") or model_reply).replace("\n\nPosso registrar?", "").rstrip()
         return summary + "\n\n" + budget_text + "\n\nPosso registrar?"
+    if model_reply.startswith("A consulta foi executada, mas nao consegui formatar"):
+        return _draft_fallback_reply(result) or model_reply
     return model_reply
 
 
@@ -879,7 +934,9 @@ Memorize associacoes declaradas de estabelecimento, conta, cartao, categoria, ar
 Retorne SOMENTE JSON valido: {"candidates":[{"type":"merchant_alias|preferred_account|preferred_card|category_preference|financial_area_alias|financing_alias|user_preference|financial_goal","subject":"chave curta","value":{},"summary":"frase objetiva em pt-BR","confidence":0.4}]}
 Use confianca acima de 0.85 apenas quando o usuario declarou ou confirmou explicitamente. Se nao houver fato duravel, retorne {"candidates":[]}."""
     try:
-        content = _complete(token, model, [{"role": "system", "content": extractor_prompt}, *history], 450, json_mode=True)
+        # Memoria e complementar: uma tentativa por modelo, sem atrasar a conversa com backoff.
+        quick = replace(model, attempts=1) if isinstance(model, LLMConfig) else model
+        content = _complete(token, quick, [{"role": "system", "content": extractor_prompt}, *history], 450, json_mode=True)
         payload = _json_from_model(content)
         candidates = payload.get("candidates")
         if isinstance(candidates, list):
@@ -978,7 +1035,11 @@ Retorne SOMENTE JSON valido em um destes formatos:
         TelegramPendingAction.status.in_(["collecting", "awaiting_confirmation"]),
     ).order_by(TelegramPendingAction.id.desc()))
     selector_messages = [{"role": "system", "content": system}, *history, {"role": "user", "content": text}]
-    decision = _select_decision(token, model, selector_messages, text)
+    decision = _local_pending_decision(text, has_expense_draft, pending_action)
+    if decision:
+        logger.info("agent_decision_local user_id=%s tool=%s", user.id, decision["tool"])
+    else:
+        decision = _select_decision(token, model, selector_messages, text)
     db.add(TelegramConversationMessage(user_id=user.id, role="user", content=text[:4000]))
     if decision.get("action") == "respond":
         reply = str(decision.get("reply") or "Como posso ajudar com suas financas?")[:4000]

@@ -2238,16 +2238,40 @@ def system_settings(request: Request, db: Session = Depends(get_db), user: User 
     values = {item.key: item.value for item in db.scalars(select(SystemSetting)).all()}
     try: models = json.loads(values.get("deepinfra_models", "[]"))
     except json.JSONDecodeError: models = []
-    return render(request, "admin/system_settings.html", user=user, values=values, models=models)
+    from app.services import llm_client as llm
+    llm_defaults = {
+        "deepinfra_model": llm.DEFAULT_MODEL,
+        "deepinfra_fallback_models": ", ".join(llm.DEFAULT_FALLBACK_MODELS),
+        "llm_retry_attempts": llm.DEFAULT_RETRY_ATTEMPTS,
+        "llm_retry_base_delay_ms": llm.DEFAULT_RETRY_BASE_DELAY_MS,
+        "llm_retry_max_delay_ms": llm.DEFAULT_RETRY_MAX_DELAY_MS,
+        "llm_request_timeout_ms": llm.DEFAULT_REQUEST_TIMEOUT_MS,
+    }
+    return render(request, "admin/system_settings.html", user=user, values=values, models=models,
+                  llm_defaults=llm_defaults)
 
 
 @router.post("/system/settings")
 def system_settings_save(request: Request, deepinfra_api_key: str = Form(""), deepinfra_model: str = Form(""),
-        telegram_bot_token: str = Form(""),
+        telegram_bot_token: str = Form(""), deepinfra_fallback_models: str | None = Form(None),
+        llm_retry_attempts: str = Form(""), llm_retry_base_delay_ms: str = Form(""),
+        llm_retry_max_delay_ms: str = Form(""), llm_request_timeout_ms: str = Form(""),
         db: Session = Depends(get_db), user: User = Depends(current_user)):
     require_super_admin(user)
+    from app.services.llm_client import parse_model_list
     if deepinfra_api_key: set_system_setting(db, "deepinfra_api_key", deepinfra_api_key, True)
-    if deepinfra_model: set_system_setting(db, "deepinfra_model", deepinfra_model)
+    if deepinfra_model: set_system_setting(db, "deepinfra_model", deepinfra_model.strip())
+    if deepinfra_fallback_models is not None:
+        set_system_setting(db, "deepinfra_fallback_models", ", ".join(parse_model_list(deepinfra_fallback_models)))
+    numeric = {"llm_retry_attempts": (llm_retry_attempts, 1, 10), "llm_retry_base_delay_ms": (llm_retry_base_delay_ms, 0, 60000),
+               "llm_retry_max_delay_ms": (llm_retry_max_delay_ms, 0, 120000), "llm_request_timeout_ms": (llm_request_timeout_ms, 1000, 120000)}
+    for key, (raw, low, high) in numeric.items():
+        raw = (raw or "").strip()
+        if not raw: continue
+        if not raw.isdigit() or not (low <= int(raw) <= high):
+            flash(request, f"Valor inválido para {key}: use um inteiro entre {low} e {high}.", "danger")
+            db.rollback(); return redirect("/system/settings")
+        set_system_setting(db, key, raw)
     if telegram_bot_token: set_system_setting(db, "telegram_bot_token", telegram_bot_token, True)
     db.commit(); flash(request, "Configurações globais atualizadas.")
     return redirect("/system/settings")
@@ -2278,24 +2302,23 @@ def deepinfra_models_refresh(request: Request, db: Session = Depends(get_db), us
 @router.post("/system/deepinfra/test")
 def deepinfra_connection_test(request: Request, db: Session = Depends(get_db), user: User = Depends(current_user)):
     require_super_admin(user)
-    settings = {item.key: item.value for item in db.scalars(select(SystemSetting)).all()}
-    token, model = settings.get("deepinfra_api_key"), settings.get("deepinfra_model")
-    if not token or not model:
+    from dataclasses import replace
+    from app.services.llm_client import LLMUnavailable, chat_completion, load_llm_config
+    config = load_llm_config(db)
+    if config is None:
         flash(request, "Configure a API key e o modelo da DeepInfra antes do teste.", "danger")
         return redirect("/system/settings")
-    if looks_like_telegram_token(token):
+    if looks_like_telegram_token(config.token):
         flash(request, "O valor salvo como DeepInfra parece ser um token do Telegram.", "danger")
         return redirect("/system/settings")
-    try:
-        response = httpx.post("https://api.deepinfra.com/v1/openai/chat/completions",
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-            json={"model": model, "messages": [{"role": "user", "content": "Responda apenas OK."}], "max_tokens": 8},
-            timeout=30.0)
-        response.raise_for_status()
-        answer = response.json()["choices"][0]["message"]["content"].strip()[:100]
-        flash(request, f"DeepInfra conectada. Resposta do modelo: {answer}")
-    except (httpx.HTTPError, ValueError, KeyError, IndexError) as exc:
-        flash(request, f"Falha no teste da DeepInfra: {exc}", "danger")
+    # Testa cada modelo da lista isoladamente (sem retry) para mostrar qual esta disponivel.
+    for model in config.models:
+        try:
+            answer, _ = chat_completion(replace(config, models=[model], attempts=1),
+                                        [{"role": "user", "content": "Responda apenas OK."}], 8, purpose="admin_test")
+            flash(request, f"DeepInfra conectada com {model}. Resposta do modelo: {answer.strip()[:100]}")
+        except LLMUnavailable as exc:
+            flash(request, f"Falha no teste da DeepInfra com {model}: {exc}", "danger")
     return redirect("/system/settings")
 
 
