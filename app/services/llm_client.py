@@ -17,8 +17,11 @@ from sqlalchemy.orm import Session
 from app.models import SystemSetting
 
 DEEPINFRA_CHAT_URL = "https://api.deepinfra.com/v1/openai/chat/completions"
-DEFAULT_MODEL = "Qwen/Qwen3.6-35B-A3B"
-DEFAULT_FALLBACK_MODELS = ["deepseek-ai/DeepSeek-V4-Flash-0731"]
+# Qwen3.6 foi descartado: modelo de raciocinio, 40-55s por resposta na DeepInfra.
+# GLM-5.3-Flash retornou 429 (engine_overloaded) no teste de 2026-10-11; reserva fica vazia
+# por padrao e pode ser definida na tela Configuracoes do sistema.
+DEFAULT_MODEL = "deepseek-ai/DeepSeek-V4-Flash-0731"
+DEFAULT_FALLBACK_MODELS: list[str] = []
 DEFAULT_RETRY_ATTEMPTS = 3
 DEFAULT_RETRY_BASE_DELAY_MS = 1000
 DEFAULT_RETRY_MAX_DELAY_MS = 8000

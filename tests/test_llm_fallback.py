@@ -53,14 +53,14 @@ def seed_settings(db, **extra):
     db.commit()
 
 
-PRIMARY, FALLBACK = "Qwen/Qwen3.6-35B-A3B", "deepseek-ai/DeepSeek-V4-Flash-0731"
+PRIMARY, FALLBACK = "deepseek-ai/DeepSeek-V4-Flash-0731", "backup/Model-B"
 
 
 def test_defaults_when_settings_are_empty():
     with SessionLocal() as db:
         seed_settings(db)
         config = load_llm_config(db)
-    assert config.models == [PRIMARY, FALLBACK]
+    assert config.models == [PRIMARY]
     assert (config.attempts, config.base_delay_ms, config.max_delay_ms, config.timeout_ms) == (3, 1000, 8000, 20000)
 
 
@@ -78,7 +78,7 @@ def test_retry_then_fallback_model_on_429(monkeypatch):
     sleeps = []
     fake = FakeDeepInfra({PRIMARY: [busy()], FALLBACK: [ok("OK")]})
     patch_http(monkeypatch, fake, sleeps)
-    content, model = chat_completion(LLMConfig(token="t"), [{"role": "user", "content": "oi"}])
+    content, model = chat_completion(LLMConfig(token="t", models=[PRIMARY, FALLBACK]), [{"role": "user", "content": "oi"}])
     assert (content, model) == ("OK", FALLBACK)
     assert fake.calls == [PRIMARY, PRIMARY, PRIMARY, FALLBACK]
     assert len(sleeps) == 2 and 1.0 <= sleeps[0] <= 1.25 and 2.0 <= sleeps[1] <= 2.5
@@ -88,16 +88,16 @@ def test_retry_after_header_and_max_delay(monkeypatch):
     sleeps = []
     fake = FakeDeepInfra({PRIMARY: [busy({"Retry-After": "3"}), busy({"Retry-After": "60"}), ok("OK")]})
     patch_http(monkeypatch, fake, sleeps)
-    content, model = chat_completion(LLMConfig(token="t"), [{"role": "user", "content": "oi"}])
+    content, model = chat_completion(LLMConfig(token="t", models=[PRIMARY, FALLBACK]), [{"role": "user", "content": "oi"}])
     assert model == PRIMARY and sleeps == [3.0, 8.0]
-    assert backoff_delay(LLMConfig(token="t"), 3) <= 5.0
+    assert backoff_delay(LLMConfig(token="t", models=[PRIMARY, FALLBACK]), 3) <= 5.0
 
 
 def test_timeout_is_retried_and_all_failures_raise(monkeypatch):
     fake = FakeDeepInfra({PRIMARY: [httpx.ReadTimeout("lento")], FALLBACK: [busy()]})
     patch_http(monkeypatch, fake)
     try:
-        chat_completion(LLMConfig(token="t"), [{"role": "user", "content": "oi"}])
+        chat_completion(LLMConfig(token="t", models=[PRIMARY, FALLBACK]), [{"role": "user", "content": "oi"}])
         assert False, "deveria falhar"
     except LLMUnavailable:
         pass
@@ -111,7 +111,7 @@ def test_tool_selection_429_uses_fallback_model(monkeypatch):
     patch_http(monkeypatch, fake)
     with SessionLocal() as db:
         user, *_ = setup_financings(db)
-        seed_settings(db)
+        seed_settings(db, deepinfra_fallback_models=FALLBACK)
         reply = run_financial_agent(db, user, "68,43 Ifood")
     assert "Posso registrar" in reply
     assert FALLBACK in fake.calls
@@ -121,7 +121,7 @@ def test_tool_selection_429_on_every_model_raises_unavailable(monkeypatch):
     patch_http(monkeypatch, FakeDeepInfra({}))
     with SessionLocal() as db:
         user, *_ = setup_financings(db)
-        seed_settings(db)
+        seed_settings(db, deepinfra_fallback_models=FALLBACK)
         try:
             run_financial_agent(db, user, "68,43 Ifood")
             assert False
@@ -137,7 +137,7 @@ def test_synthesis_429_shows_draft_and_local_confirmation(monkeypatch):
     patch_http(monkeypatch, fake)
     with SessionLocal() as db:
         user, *_ = setup_financings(db)
-        seed_settings(db)
+        seed_settings(db, deepinfra_fallback_models=FALLBACK)
         reply = run_financial_agent(db, user, "68,43 Ifood")
         assert "nao consegui formatar" not in reply
         assert "Confirme este gasto" in reply and "68,43" in reply and "Ifood" in reply
@@ -161,7 +161,7 @@ def test_local_cancel_with_pending_draft(monkeypatch):
     patch_http(monkeypatch, fake)
     with SessionLocal() as db:
         user, *_ = setup_financings(db)
-        seed_settings(db)
+        seed_settings(db, deepinfra_fallback_models=FALLBACK)
         run_financial_agent(db, user, "10 padaria")
         run_financial_agent(db, user, "cancelar")
         assert db.scalar(select(Transaction)) is None
