@@ -683,9 +683,13 @@ def recurring_incomes(request: Request, db: Session = Depends(get_db), user: Use
 @router.post("/recurring-incomes")
 def recurring_income_create(request: Request, description: str = Form(), amount: Decimal = Form(),
         account_id: str | None = Form(None), person_id: str | None = Form(None),
-        category_id: str | None = Form(None), notes: str | None = Form(None),
+        category_id: str | None = Form(None), notes: str | None = Form(None), due_day: str | None = Form(None),
         db: Session = Depends(get_db), user: User = Depends(current_user)):
     wid = current_workspace_id(request, user, db)
+    due_day_value = optional_int(due_day)
+    if due_day_value is not None and not 1 <= due_day_value <= 31:
+        flash(request, "O dia de vencimento deve estar entre 1 e 31.", "danger")
+        return redirect("/fixed-expenses")
     person_id_value = optional_int(person_id) or active_area_id(request, user, wid, db)
     if not person_id_value:
         flash(request, "Selecione uma área financeira.", "danger")
@@ -778,9 +782,13 @@ def fixed_expenses(request: Request, db: Session = Depends(get_db), user: User =
 @router.post("/fixed-expenses")
 def fixed_expense_create(request: Request, description: str = Form(), amount: Decimal = Form(),
         account_id: str | None = Form(None), person_id: str | None = Form(None),
-        category_id: str | None = Form(None), notes: str | None = Form(None),
+        category_id: str | None = Form(None), notes: str | None = Form(None), due_day: str | None = Form(None),
         db: Session = Depends(get_db), user: User = Depends(current_user)):
     wid = current_workspace_id(request, user, db)
+    due_day_value = optional_int(due_day)
+    if due_day_value is not None and not 1 <= due_day_value <= 31:
+        flash(request, "O dia de vencimento deve estar entre 1 e 31.", "danger")
+        return redirect("/fixed-expenses")
     person_id_value = optional_int(person_id) or active_area_id(request, user, wid, db)
     if not person_id_value:
         flash(request, "Selecione uma área financeira.", "danger")
@@ -794,6 +802,7 @@ def fixed_expense_create(request: Request, description: str = Form(), amount: De
         workspace_id=wid, frequency="monthly", transaction_type=TransactionType.expense,
         description=description.strip(), amount=amount, account_id=optional_int(account_id),
         person_id=person_id_value, category_id=optional_int(category_id), notes=notes,
+        days_of_month=str(due_day_value) if due_day_value else None,
         created_by_id=user.id, is_active=True,
     ))
     db.commit()
@@ -803,7 +812,7 @@ def fixed_expense_create(request: Request, description: str = Form(), amount: De
 
 @router.post("/fixed-expenses/{rule_id}/edit")
 def fixed_expense_edit(rule_id: int, request: Request, description: str = Form(), amount: Decimal = Form(),
-                       category_id: str | None = Form(None),
+                       category_id: str | None = Form(None), due_day: str | None = Form(None),
                        db: Session = Depends(get_db), user: User = Depends(current_user)):
     wid = current_workspace_id(request, user, db)
     rule = db.scalar(select(RecurrenceRule).where(RecurrenceRule.id == rule_id,
@@ -819,7 +828,13 @@ def fixed_expense_edit(rule_id: int, request: Request, description: str = Form()
     )):
         flash(request, "Selecione uma categoria de despesa válida.", "danger")
         return redirect("/fixed-expenses")
+    due_day_value = optional_int(due_day)
+    if due_day_value is not None and not 1 <= due_day_value <= 31:
+        flash(request, "O dia de vencimento deve estar entre 1 e 31.", "danger")
+        return redirect("/fixed-expenses")
     rule.description, rule.amount, rule.category_id = description.strip(), amount, category_value
+    if due_day is not None:
+        rule.days_of_month = str(due_day_value) if due_day_value else None
     db.commit()
     flash(request, "Despesa fixa atualizada.")
     return redirect("/fixed-expenses")
@@ -1195,14 +1210,6 @@ def recurring_income_confirm(rule_id: int, request: Request, year: int = Form(),
     if confirmed_amount <= 0:
         flash(request, "O valor confirmado deve ser maior que zero.", "danger")
         return redirect(f"/month?year={year}&month={month}")
-    target_year, target_month = year, month
-    while db.scalar(select(AccountingPeriod.id).where(
-        AccountingPeriod.workspace_id == wid, AccountingPeriod.year == target_year,
-        AccountingPeriod.month == target_month, AccountingPeriod.is_closed.is_(True),
-    )):
-        target_month += 1
-        if target_month == 13:
-            target_month, target_year = 1, target_year + 1
     remaining_before = Decimal(existing.remaining_amount) if existing and existing.remaining_amount is not None else Decimal(rule.amount)
     is_partial = rule.transaction_type == TransactionType.expense and settlement_mode == "partial"
     if is_partial and confirmed_amount >= remaining_before:
@@ -1239,30 +1246,18 @@ def recurring_income_confirm(rule_id: int, request: Request, year: int = Form(),
         if not category:
             raise HTTPException(400)
         category_id = category.id
-    transaction = Transaction(
-        workspace_id=wid, transaction_type=rule.transaction_type, description=description,
-        amount=confirmed_amount, transaction_date=paid_on if is_partial and paid_on else date.today(), status=transaction_status,
-        account_id=account_id, card_id=card_id, person_id=rule.person_id, category_id=category_id,
-        payment_method=payment_method, notes=confirmed_notes if is_partial and confirmed_notes is not None else rule.notes, created_by_id=user.id,
-        recurrence_rule_id=rule.id, competence_year=target_year, competence_month=target_month,
-    )
-    db.add(transaction); db.flush()
-    if existing:
-        existing.status = "partial" if is_partial else "confirmed"
-        existing.remaining_amount = remaining_before - confirmed_amount if is_partial else Decimal(0)
-        existing.transaction_id = transaction.id
-    else:
-        db.add(RecurrenceOccurrence(recurrence_rule_id=rule.id, year=year, month=month,
-            status="partial" if is_partial else "confirmed", transaction_id=transaction.id,
-            remaining_amount=remaining_before - confirmed_amount if is_partial else Decimal(0)))
-    financing = db.scalar(select(Financing).where(Financing.recurrence_rule_id == rule.id))
-    if financing and not is_partial:
-        financing.paid_installments = min(financing.total_installments, financing.paid_installments + 1)
-        if financing.paid_installments >= financing.total_installments:
-            financing.status = "paid"
-            rule.is_active = False
-        else:
-            rule.description = f"{financing.description} - parcela {financing.paid_installments + 1}/{financing.total_installments}"
+    from app.services.recurrence_payments import RecurrenceAlreadyResolved, apply_recurrence_confirmation
+    try:
+        transaction, target_year, target_month = apply_recurrence_confirmation(
+            db, rule=rule, year=year, month=month, amount=confirmed_amount, created_by_id=user.id,
+            account_id=account_id, card_id=card_id, payment_method=payment_method,
+            transaction_status=transaction_status,
+            transaction_date=paid_on if is_partial and paid_on else date.today(), is_partial=is_partial,
+            description=description, category_id=category_id,
+            notes=confirmed_notes if is_partial and confirmed_notes is not None else rule.notes,
+        )
+    except RecurrenceAlreadyResolved:
+        raise HTTPException(404)
     db.commit()
     label = "Receita" if rule.transaction_type == TransactionType.income else "Despesa"
     flash(request, f"{label} confirmada na competência {target_month:02d}/{target_year}.")
@@ -2246,6 +2241,7 @@ def system_settings(request: Request, db: Session = Depends(get_db), user: User 
         "llm_retry_base_delay_ms": llm.DEFAULT_RETRY_BASE_DELAY_MS,
         "llm_retry_max_delay_ms": llm.DEFAULT_RETRY_MAX_DELAY_MS,
         "llm_request_timeout_ms": llm.DEFAULT_REQUEST_TIMEOUT_MS,
+        "bill_reminder_time": "08:00",
     }
     return render(request, "admin/system_settings.html", user=user, values=values, models=models,
                   llm_defaults=llm_defaults)
@@ -2256,6 +2252,7 @@ def system_settings_save(request: Request, deepinfra_api_key: str = Form(""), de
         telegram_bot_token: str = Form(""), deepinfra_fallback_models: str | None = Form(None),
         llm_retry_attempts: str = Form(""), llm_retry_base_delay_ms: str = Form(""),
         llm_retry_max_delay_ms: str = Form(""), llm_request_timeout_ms: str = Form(""),
+        bill_reminder_time: str = Form(""),
         db: Session = Depends(get_db), user: User = Depends(current_user)):
     require_super_admin(user)
     from app.services.llm_client import parse_model_list
@@ -2272,6 +2269,14 @@ def system_settings_save(request: Request, deepinfra_api_key: str = Form(""), de
             flash(request, f"Valor inválido para {key}: use um inteiro entre {low} e {high}.", "danger")
             db.rollback(); return redirect("/system/settings")
         set_system_setting(db, key, raw)
+    reminder = (bill_reminder_time or "").strip()
+    if reminder:
+        import re as _re
+        match = _re.fullmatch(r"(\d{1,2}):(\d{2})", reminder)
+        if not match or int(match.group(1)) > 23 or int(match.group(2)) > 59:
+            flash(request, "Horário do aviso de contas inválido: use HH:MM.", "danger")
+            db.rollback(); return redirect("/system/settings")
+        set_system_setting(db, "bill_reminder_time", f"{int(match.group(1)):02d}:{match.group(2)}")
     if telegram_bot_token: set_system_setting(db, "telegram_bot_token", telegram_bot_token, True)
     db.commit(); flash(request, "Configurações globais atualizadas.")
     return redirect("/system/settings")

@@ -143,6 +143,16 @@ class TelegramProcessedUpdate(Base):
     processed_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
+class TelegramBillReminder(Base):
+    """Marca o aviso diario de contas fixas ja enviado (um por usuario e dia)."""
+    __tablename__ = "telegram_bill_reminders"
+    __table_args__ = (UniqueConstraint("user_id", "reminder_date"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    reminder_date: Mapped[date] = mapped_column(Date)
+    sent_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 class TelegramConversationMessage(Base):
     __tablename__ = "telegram_conversation_messages"
     id: Mapped[int] = mapped_column(primary_key=True)

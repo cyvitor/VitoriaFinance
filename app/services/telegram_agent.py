@@ -26,6 +26,7 @@ WRITE_TOOLS = {
     "atualizar_despesa", "preparar_despesas", "sugerir_categoria_despesa",
     "preparar_abastecimento",
     "preparar_correcao_abastecimento",
+    "preparar_pagamento_conta_fixa", "definir_vencimento_conta_fixa",
 }
 
 
@@ -56,6 +57,9 @@ Ferramentas permitidas e argumentos:
 - confirmar_despesa: {}
 - cancelar_despesa: {}
 - preparar_abastecimento: {"vehicle":texto opcional,"odometer_km":numero opcional,"liters":numero opcional,"price_per_liter":numero opcional,"full_tank":booleano opcional}. Use somente quando o contexto indicar action_type=fuel_fillup. Com total conhecido, quilometragem e apenas um entre liters/price_per_liter bastam. Pergunte se encheu o tanque quando full_tank ainda nao foi informado.
+- listar_contas_fixas_pendentes: {"area": texto opcional}. Lista contas fixas/recorrentes (luz, agua, internet, escola, condominio...) ainda nao confirmadas.
+- preparar_pagamento_conta_fixa: {"bill": texto com o nome da conta, "area": texto opcional, "amount": numero opcional (valor efetivamente pago), "paid_date": "YYYY-MM-DD" opcional, "competence": "YYYY-MM" ou "atual" opcional, "account": texto opcional}. Prepara a confirmacao do pagamento de uma conta fixa; nao grava nada ate o usuario confirmar.
+- definir_vencimento_conta_fixa: {"bill": texto, "area": texto opcional, "due_day": inteiro 1-31}
 - preparar_correcao_abastecimento: {"vehicle":texto opcional,"new_odometer_km":numero opcional,"new_liters":numero opcional,"new_price_per_liter":numero opcional,"new_full_tank":booleano opcional}. Corrige o abastecimento mais recente e sempre exige confirmacao posterior.
 """
 
@@ -464,6 +468,24 @@ def _enforce_pending_income_collection_intent(
     }
     logger.info("agent_decision_corrected reason=pending_income_account original=%s corrected=%s",
                 decision, corrected)
+    return corrected
+
+
+def _enforce_fixed_bill_intent(db: Session, user: User, text: str, decision: dict) -> dict:
+    """'Paguei a luz' e pagamento de conta fixa, mesmo se o modelo escolher preparar_despesa."""
+    if decision.get("action") != "tool" or decision.get("tool") != "preparar_despesa":
+        return decision
+    if not re.search(r"\bpag(uei|o|a|amos|amento)\b", _normalized_text(text)):
+        return decision
+    from app.services.fixed_bills import mentioned_rule
+    rule = mentioned_rule(db, user.id, text)
+    if not rule:
+        return decision
+    arguments = dict(decision.get("arguments") or {})
+    corrected = {"action": "tool", "tool": "preparar_pagamento_conta_fixa", "arguments": {
+        "bill": text, "amount": arguments.get("amount"), "paid_date": arguments.get("transaction_date"),
+    }}
+    logger.info("agent_decision_corrected reason=fixed_bill_payment rule_id=%s original=%s", rule.id, decision)
     return corrected
 
 
@@ -1022,6 +1044,8 @@ Converta datas relativas como hoje, ontem e anteontem para YYYY-MM-DD usando a d
 Em perguntas sobre dinheiro disponivel agora, use consultar_saldo_livre com payment_method cash.
 Em perguntas sobre fechar o mes, salarios futuros ou uma consulta generica sobre credito sem intencao concreta de compra, use consultar_saldo_livre com payment_method credit quando aplicavel. Para avaliar uma compra antes de realiza-la, prefira sempre simular_compra_cartao. Reaproveite valores mencionados nos turnos recentes.
 Para amortizacao incompleta, chame preparar_amortizacao_financiamento novamente com os novos dados fornecidos.
+Quando o usuario disser que pagou uma conta fixa cadastrada (luz, agua, internet, aluguel, condominio, escola, telefone, plano de saude, financiamento...), use preparar_pagamento_conta_fixa, nunca preparar_despesa. Informe bill com o nome da conta, area se ele citar a pessoa ("claro da nana" -> bill Claro, area Nana), amount somente se ele disse o valor, paid_date convertendo datas relativas e competence somente se ele indicar o mes ("e do mes atual" -> "atual"). Se a ferramenta disser que ha mais de uma conta, chame-a de novo com a area escolhida. A confirmacao usa confirmar_acao_pendente.
+Para perguntas sobre contas fixas pendentes ou a pagar, use listar_contas_fixas_pendentes. Para "a luz vence dia 10", use definir_vencimento_conta_fixa.
 Se precisar consultar dados, use uma ferramenta. Se for apenas conversa sem necessidade de dados, responda diretamente.
 Retorne SOMENTE JSON valido em um destes formatos:
 {{"action":"tool","tool":"nome","arguments":{{}}}}
@@ -1035,11 +1059,14 @@ Retorne SOMENTE JSON valido em um destes formatos:
         TelegramPendingAction.status.in_(["collecting", "awaiting_confirmation"]),
     ).order_by(TelegramPendingAction.id.desc()))
     selector_messages = [{"role": "system", "content": system}, *history, {"role": "user", "content": text}]
-    decision = _local_pending_decision(text, has_expense_draft, pending_action)
+    prefer_bill_action = bool(pending_action and pending_action.action_type == "fixed_bill_payment"
+                              and pending_action.status == "awaiting_confirmation")
+    decision = _local_pending_decision(text, has_expense_draft and not prefer_bill_action, pending_action)
     if decision:
         logger.info("agent_decision_local user_id=%s tool=%s", user.id, decision["tool"])
     else:
         decision = _select_decision(token, model, selector_messages, text)
+        decision = _enforce_fixed_bill_intent(db, user, text, decision)
     db.add(TelegramConversationMessage(user_id=user.id, role="user", content=text[:4000]))
     if decision.get("action") == "respond":
         reply = str(decision.get("reply") or "Como posso ajudar com suas financas?")[:4000]
@@ -1100,7 +1127,9 @@ apresente o saldo livre e a projecao mensal e pergunte o valor aproximado e como
         result_message = json.dumps(
             {"user_question": text, "tool": tool_name, "result": result}, ensure_ascii=False,
         )
-        if tool_name == "consultar_gastos_cartao" and "items" in result:
+        if result.get("fixed_bill"):
+            reply = str(result.get("message") or "")[:4000]
+        elif tool_name == "consultar_gastos_cartao" and "items" in result:
             reply = _card_spending_reply(result)
         else:
             try:

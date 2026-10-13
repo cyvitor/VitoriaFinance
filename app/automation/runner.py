@@ -1,9 +1,12 @@
+from datetime import datetime
 import time
+from zoneinfo import ZoneInfo
 
 import httpx
 from sqlalchemy import select
 
-from app.automation.telegram_bot import handle_message
+from app.automation.telegram_bot import handle_callback, handle_message
+from app.services.fixed_bills import send_daily_reminders
 from app.database import SessionLocal
 from app.integrations.telegram import TelegramClient
 from app.logging_config import configure_bot_logging
@@ -17,6 +20,23 @@ def load_telegram_token() -> str | None:
         return db.scalar(select(SystemSetting.value).where(SystemSetting.key == "telegram_bot_token"))
 
 
+def process_callback(client: TelegramClient, update: dict, callback: dict) -> None:
+    update_key = str(update["update_id"])
+    with SessionLocal() as db:
+        if db.scalar(select(TelegramProcessedUpdate.id).where(TelegramProcessedUpdate.update_id == update_key)):
+            return
+        reply = handle_callback(db, callback)
+        db.add(TelegramProcessedUpdate(update_id=update_key))
+        db.commit()
+    try:
+        client.answer_callback_query(callback["id"])
+    except Exception:
+        logger.warning("telegram_answer_callback_failed update_id=%s", update_key)
+    chat_id = ((callback.get("message") or {}).get("chat") or {}).get("id") or (callback.get("from") or {}).get("id")
+    if chat_id and reply:
+        client.send_reply(chat_id, reply)
+
+
 def run() -> None:
     token = load_telegram_token()
     if not token:
@@ -26,8 +46,17 @@ def run() -> None:
     logger.info("Worker de automacao iniciado; aguardando mensagens do Telegram.")
     while True:
         try:
+            try:
+                with SessionLocal() as db:
+                    send_daily_reminders(db, client.send_reply, datetime.now(ZoneInfo("America/Sao_Paulo")))
+            except Exception:
+                logger.exception("bill_reminder_cycle_failed")
             for update in client.get_updates(offset=offset):
                 offset = update["update_id"] + 1
+                callback = update.get("callback_query")
+                if callback:
+                    process_callback(client, update, callback)
+                    continue
                 message = update.get("message")
                 if not message:
                     continue
@@ -42,7 +71,7 @@ def run() -> None:
                     db.commit()
                 logger.debug("telegram_message_reply update_id=%s telegram_user_id=%s reply=%r",
                              update.get("update_id"), (message.get("from") or {}).get("id"), response)
-                client.send_message(message["chat"]["id"], response)
+                client.send_reply(message["chat"]["id"], response)
         except KeyboardInterrupt:
             logger.info("Worker encerrado.")
             return

@@ -10,11 +10,48 @@ from app.logging_config import get_bot_logger
 from app.services.telegram_auth import consume_pairing_code
 from app.services.telegram_ai import AIResponseFormatError, AIToolSelectionError, AIUnavailableError
 from app.services.telegram_agent import run_financial_agent
+from app.services.fixed_bills import BotReply, handle_bill_callback, handle_bill_text
 
 logger = get_bot_logger()
 
 
-def handle_message(db: Session, message: dict) -> str:
+def _linked_user(db: Session, sender: dict) -> User | None:
+    link = db.scalar(select(TelegramLink).where(TelegramLink.telegram_user_id == str(sender.get("id"))))
+    user = db.get(User, link.user_id) if link else None
+    if not user or not user.is_active or (user.system_account and not user.system_account.is_active):
+        return None
+    return user
+
+
+def handle_callback(db: Session, callback: dict) -> BotReply:
+    """Botoes inline de contas fixas: tratados sem LLM e somente para o usuario vinculado."""
+    sender = callback.get("from") or {}
+    chat = (callback.get("message") or {}).get("chat") or {}
+    if chat.get("type") not in (None, "private"):
+        return BotReply("Por seguranca, use os botoes somente na conversa privada com o bot.")
+    user = _linked_user(db, sender) if sender.get("id") else None
+    if not user:
+        logger.warning("telegram_callback_unlinked telegram_user_id=%s", sender.get("id"))
+        return BotReply("Seu Telegram ainda nao esta associado. Gere um codigo em Meu perfil e envie /start CODIGO.")
+    try:
+        return handle_bill_callback(db, user, str(callback.get("data") or ""), _message_date(callback.get("message") or {}, user))
+    except Exception:
+        logger.exception("telegram_callback_failed user_id=%s data=%r", user.id, callback.get("data"))
+        db.rollback()
+        return BotReply("Nao consegui concluir essa acao agora. Nada foi registrado; tente novamente.")
+
+
+def _message_date(message: dict, user: User):
+    if message.get("date") is None:
+        return None
+    try:
+        return datetime.fromtimestamp(int(message["date"]), tz=ZoneInfo("America/Sao_Paulo")).date()
+    except (TypeError, ValueError, OSError):
+        logger.warning("telegram_message_invalid_date user_id=%s date=%r", user.id, message.get("date"))
+        return None
+
+
+def handle_message(db: Session, message: dict) -> str | BotReply:
     text = (message.get("text") or "").strip()
     sender = message.get("from") or {}
     chat = message.get("chat") or {}
@@ -47,6 +84,9 @@ def handle_message(db: Session, message: dict) -> str:
                 ).date()
             except (TypeError, ValueError, OSError):
                 logger.warning("telegram_message_invalid_date user_id=%s date=%r", user.id, message.get("date"))
+        bill_reply = handle_bill_text(db, user, text, message_date)
+        if bill_reply is not None:
+            return bill_reply
         return run_financial_agent(db, user, text, reference_date=message_date)
     except (AIResponseFormatError, AIToolSelectionError) as exc:
         logger.error("agent_structured_response_failed user_id=%s error=%s", user.id, exc)

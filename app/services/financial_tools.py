@@ -14,6 +14,7 @@ from app.services.access_context import UserAccessContext
 from app.services.card_billing import card_invoice_is_closed, card_purchase_competence
 from app.services.monthly_projection import monthly_budget_positions, projection_budget_remaining
 from app.services.purchase_advisor import simulate_credit_purchase
+from app.services import fixed_bills
 from app.services.telegram_expenses import (
     ExpenseInput, cancel_expense_draft, confirm_expense_draft, create_expense_draft,
     finish_processing_queue_item, format_draft, get_active_draft,
@@ -853,6 +854,8 @@ def confirm_pending_action(db: Session, context: UserAccessContext, args: dict) 
     action = _active_action(db, context.user_id)
     if not action or action.status != "awaiting_confirmation":
         raise ToolError("Nao ha alteracao completa aguardando confirmacao")
+    if action.action_type == fixed_bills.ACTION_TYPE:
+        return fixed_bills.confirm_payment(db, context.user_id, action.id)
     if action.action_type == "fuel_fillup":
         payload = json.loads(action.payload)
         transaction = db.scalar(select(Transaction).where(
@@ -1045,6 +1048,8 @@ def cancel_pending_action(db: Session, context: UserAccessContext, args: dict) -
     action = _active_action(db, context.user_id)
     if not action:
         return {"cancelled": False, "message": "Nenhuma alteracao pendente"}
+    if action.action_type == fixed_bills.ACTION_TYPE:
+        return fixed_bills.cancel_payment(db, context.user_id, action.id)
     action.status = "cancelled"; action.resolved_at = datetime.utcnow(); db.commit()
     return {"cancelled": True}
 
@@ -1477,6 +1482,16 @@ TOOLS = {
     "cancelar_despesa": cancel_expense,
     "preparar_abastecimento": prepare_fuel_fillup,
     "preparar_correcao_abastecimento": prepare_fuel_fillup_update,
+    # Contas fixas usam todas as areas com escrita do usuario (ex.: "Claro da Nana"),
+    # nao apenas a area principal, e sempre devolvem texto deterministico em "message".
+    "listar_contas_fixas_pendentes": lambda db, context, args: fixed_bills.list_pending_tool(db, context.user_id, args),
+    "preparar_pagamento_conta_fixa": lambda db, context, args: fixed_bills.prepare_payment(
+        db, context.user_id, bill=args.get("bill"), area=args.get("area"), amount=args.get("amount"),
+        paid_date=args.get("paid_date"), competence=args.get("competence"), account=args.get("account"),
+    ),
+    "definir_vencimento_conta_fixa": lambda db, context, args: fixed_bills.set_due_day(
+        db, context.user_id, bill=args.get("bill"), area=args.get("area"), due_day=args.get("due_day"),
+    ),
 }
 
 
