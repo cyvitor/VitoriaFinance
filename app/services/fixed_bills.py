@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 
 from app.logging_config import get_bot_logger
 from app.models import (
-    Account, Person, RecurrenceRule, SystemSetting, TelegramBillReminder, TelegramLink,
+    Account, Card, Person, RecurrenceRule, SystemSetting, TelegramBillReminder, TelegramLink,
     TelegramPendingAction, TransactionType, User,
 )
 from app.services.access_context import UserAccessContext, build_user_access_context
@@ -35,7 +35,10 @@ STOPWORDS = {
     "conta", "contas", "fixa", "fixas", "paguei", "pago", "paga", "pagar", "pagamento", "pagei", "hoje",
     "ontem", "mes", "atual", "valor", "reais", "r", "rs", "foi", "eu", "ja", "que", "com", "pela", "pelo",
     "vence", "vencimento", "dia", "todo", "sempre", "boleto", "fatura", "referente", "competencia",
+    "credito", "debito", "cartao", "pix", "via", "usando", "pelo", "pela",
 }
+CARD_WORDS = {"credito", "cartao"}
+ACCOUNT_WORDS = {"debito", "pix", "transferencia"}
 CURRENT_MONTH_TERMS = {"atual", "current", "mes atual", "este mes", "esse mes", "deste mes", "desse mes"}
 
 
@@ -190,21 +193,62 @@ def _accounts(db: Session, rule: RecurrenceRule) -> list[Account]:
     ).order_by(Account.name)).all()
 
 
-def _resolve_account(db: Session, rule: RecurrenceRule, name: str | None) -> tuple[Account | None, list[Account]]:
-    accounts = _accounts(db, rule)
-    if name:
-        wanted = _norm(name)
-        exact = [item for item in accounts if _norm(item.name) == wanted]
-        partial = exact or [item for item in accounts if wanted in _norm(item.name) or _norm(item.name) in wanted]
-        if len(partial) == 1:
-            return partial[0], accounts
-        return None, accounts
-    preferred = next((item for item in accounts if item.id == rule.account_id), None)
-    if preferred:
-        return preferred, accounts
-    if len(accounts) == 1:
-        return accounts[0], accounts
-    return None, accounts
+def _sources(db: Session, rule: RecurrenceRule) -> list[tuple[str, object]]:
+    """Contas bancarias (debito) e cartoes de credito ativos da area da regra."""
+    cards = db.scalars(select(Card).join(Account, Card.account_id == Account.id).where(
+        Card.workspace_id == rule.workspace_id, Card.is_active.is_(True),
+        Account.person_id == rule.person_id, Account.is_active.is_(True),
+    ).order_by(Card.name)).all()
+    return [("account", item) for item in _accounts(db, rule)] + [("card", item) for item in cards]
+
+
+def source_key(kind: str, obj) -> str:
+    return f"{kind}:{obj.id}"
+
+
+def source_label(kind: str, obj) -> str:
+    return f"Cartão {obj.name} (crédito)" if kind == "card" else f"Conta {obj.name} (débito)"
+
+
+def _find_source(sources, key: str | None):
+    return next(((kind, obj) for kind, obj in sources if source_key(kind, obj) == key), None) if key else None
+
+
+def match_source(sources, text: str | None, require_keyword: bool = False):
+    """Resolve 'c6 credito', 'debito', 'caixa'... para uma unica forma de pagamento."""
+    normalized = _norm(text)
+    if not normalized:
+        return None
+    words = set(re.findall(r"[a-z0-9]+", normalized))
+    wants_card, wants_account = bool(words & CARD_WORDS), bool(words & ACCOUNT_WORDS)
+    if require_keyword and not (wants_card or wants_account):
+        return None
+    hits = [item for item in sources
+            if re.search(rf"\b{re.escape(_norm(item[1].name))}\b", normalized)]
+    for wanted, flag, other in (("card", wants_card, wants_account), ("account", wants_account, wants_card)):
+        if flag and not other:
+            same = [item for item in hits if item[0] == wanted]
+            if not same and not hits:
+                pool = [item for item in sources if item[0] == wanted]
+                same = pool if len(pool) == 1 else []
+            hits = same
+    return hits[0] if len(hits) == 1 else None
+
+
+def default_source(rule: RecurrenceRule, sources):
+    return next(((kind, obj) for kind, obj in sources if kind == "account" and obj.id == rule.account_id), None)
+
+
+def method_keyboard(action_id: int, sources, suggested_key: str | None) -> list[list[dict]]:
+    ordered = sorted(sources, key=lambda item: source_key(*item) != suggested_key)
+    rows = []
+    for kind, obj in ordered[:8]:
+        star = "⭐ " if source_key(kind, obj) == suggested_key else ""
+        icon = "💳" if kind == "card" else "🏦"
+        code = ("c" if kind == "card" else "a") + str(obj.id)
+        rows.append([{"text": f"{star}{icon} {source_label(kind, obj)}"[:60], "callback_data": f"fb:s:{action_id}:{code}"}])
+    rows.append([{"text": "❌ Cancelar", "callback_data": f"fb:x:{action_id}"}])
+    return rows
 
 
 def _parse_competence(value, today: date) -> tuple[int, int] | None:
@@ -243,7 +287,7 @@ def _open_bills(db: Session, context: UserAccessContext, rule: RecurrenceRule, t
                                through=limit, rule_ids=[rule.id])
 
 
-def _confirmation_text(rule: RecurrenceRule, people, payload: dict, account: Account | None,
+def _confirmation_text(rule: RecurrenceRule, people, payload: dict, source,
                        other_open: list[PendingBill]) -> str:
     amount, expected = Decimal(payload["amount"]), Decimal(payload["expected"])
     paid_on = date.fromisoformat(payload["paid_on"])
@@ -254,8 +298,10 @@ def _confirmation_text(rule: RecurrenceRule, people, payload: dict, account: Acc
         f"Valor previsto: {format_brl(expected)}",
         f"Valor pago: **{format_brl(amount)}**" + (" (diferente do previsto)" if amount != expected else ""),
         f"Data do pagamento: {paid_on.strftime('%d/%m/%Y')}",
-        f"Pago pela conta: {account.name if account else 'não informada'}",
+        f"Forma de pagamento: **{source_label(*source) if source else 'não informada'}**",
     ]
+    if source and source[0] == "card":
+        lines.append("No cartão, o valor entra como despesa pendente na fatura, igual à tela web.")
     others = [item.competence for item in other_open
               if (item.year, item.month) != (payload["year"], payload["month"])]
     if others:
@@ -288,7 +334,7 @@ def confirmation_keyboard(action_id: int) -> list[list[dict]]:
 
 def prepare_payment(db: Session, user_id: int, *, today: date | None = None, rule_id=None, bill=None,
                     area=None, amount=None, paid_date=None, competence=None, account=None,
-                    ask_amount: bool = False) -> dict:
+                    ask_amount: bool = False, source=None, hint=None) -> dict:
     today = today or today_sp()
     context = _context(db, user_id)
     if not context or not context.writable_person_ids:
@@ -320,17 +366,25 @@ def prepare_payment(db: Session, user_id: int, *, today: date | None = None, rul
             paid_amount = parse_amount(str(amount))
         if paid_amount is not None and paid_amount <= 0:
             paid_amount = None
-    selected_account, accounts = _resolve_account(db, rule, account)
-    if not accounts:
+    sources = _sources(db, rule)
+    if not sources:
         return {"fixed_bill": True, "status": "no_account",
-                "message": (f"Não há conta bancária ativa na área de **{_label(rule, people)}**. "
-                            "Cadastre uma conta na interface web antes de confirmar.")}
-    phase = "amount" if ask_amount and paid_amount is None else ("account" if not selected_account else None)
+                "message": (f"Não há conta bancária nem cartão ativo na área de **{_label(rule, people)}**. "
+                            "Cadastre na interface web antes de confirmar.")}
+    selected = _find_source(sources, source) if isinstance(source, str) else None
+    if not selected and account:
+        selected = match_source(sources, account)
+    for text in (hint, bill):
+        if not selected and text:
+            selected = match_source(sources, text, require_keyword=True)
+    suggested = default_source(rule, sources)
+    phase = "amount" if ask_amount and paid_amount is None else ("method" if not selected else None)
     payload = {
         "rule_id": rule.id, "year": chosen.year, "month": chosen.month,
         "expected": str(chosen.amount), "amount": str(paid_amount or chosen.amount),
         "paid_on": _parse_date(paid_date, today).isoformat(),
-        "account_id": selected_account.id if selected_account else None, "phase": phase,
+        "source": source_key(*selected) if selected else None,
+        "suggested": source_key(*suggested) if suggested else None, "phase": phase,
     }
     action = None
     for item in _active_actions(db, user_id):
@@ -348,20 +402,52 @@ def prepare_payment(db: Session, user_id: int, *, today: date | None = None, rul
     action.status = "collecting" if phase else "awaiting_confirmation"
     action.expires_at = datetime.utcnow() + EXPIRATION
     db.commit()
-    logger.info("fixed_bill_prepared user_id=%s rule_id=%s competence=%s-%02d phase=%s action_id=%s",
-                user_id, rule.id, chosen.year, chosen.month, phase, action.id)
+    logger.info("fixed_bill_prepared user_id=%s rule_id=%s competence=%s-%02d phase=%s source=%s action_id=%s",
+                user_id, rule.id, chosen.year, chosen.month, phase, payload["source"], action.id)
     base = {"fixed_bill": True, "action_id": action.id, "rule_id": rule.id,
             "competence": f"{chosen.year}-{chosen.month:02d}", "amount": payload["amount"]}
     if phase == "amount":
         return {**base, "status": "missing_amount",
                 "message": (f"Qual foi o valor pago de **{_label(rule, people)}** "
                             f"(competência {chosen.competence})? Previsto: {format_brl(chosen.amount)}.")}
-    if phase == "account":
-        options = "\n".join(f"- {item.name}" for item in accounts)
-        return {**base, "status": "missing_account", "account_options": [item.name for item in accounts],
-                "message": (f"De qual conta saiu o pagamento de **{_label(rule, people)}**?\n\n{options}")}
-    return {**base, "status": "awaiting_confirmation",
-            "message": _confirmation_text(rule, people, payload, selected_account, open_bills)}
+    if phase == "method":
+        options = "\n".join(f"- {'⭐ ' if suggested and source_key(*item) == payload['suggested'] else ''}"
+                            f"{source_label(*item)}" for item in sources)
+        hint = f"\n\n⭐ = forma cadastrada na conta fixa." if suggested else ""
+        return {**base, "status": "missing_method",
+                "source_options": [source_label(*item) for item in sources],
+                "keyboard": method_keyboard(action.id, sources, payload["suggested"]),
+                "message": (f"Pagou como **{_label(rule, people)}** ({chosen.competence}, "
+                            f"{format_brl(payload['amount'])})?\n\n{options}{hint}\n\n"
+                            "Toque em uma opção ou responda, por exemplo, \"débito\" ou \"c6 crédito\".")}
+    return {**base, "status": "awaiting_confirmation", "keyboard": confirmation_keyboard(action.id),
+            "message": _confirmation_text(rule, people, payload, selected, open_bills)}
+
+
+def set_payment_source(db: Session, user_id: int, action_id: int, code: str) -> dict:
+    action = db.get(TelegramPendingAction, int(action_id))
+    if not action or action.user_id != user_id or action.action_type != ACTION_TYPE:
+        return {"fixed_bill": True, "status": "not_found", "message": "Esse pedido não pertence a você ou não existe mais."}
+    if action.status == "confirmed":
+        return {"fixed_bill": True, "status": "already_registered", "message": "Esse pagamento já foi registrado."}
+    if action.status not in ("collecting", "awaiting_confirmation") or action.expires_at < datetime.utcnow():
+        return {"fixed_bill": True, "status": action.status,
+                "message": "Esse pedido não está mais ativo. Envie /contas para começar de novo."}
+    payload = json.loads(action.payload)
+    key = ("card:" if code.startswith("c") else "account:") + code[1:]
+    return prepare_payment(db, user_id, rule_id=payload["rule_id"], amount=payload["amount"],
+                           competence=(payload["year"], payload["month"]), paid_date=payload.get("paid_on"),
+                           source=key)
+
+
+def payment_fields(kind: str, obj) -> dict:
+    """Mesmos campos que a tela web grava para conta bancaria ou cartao de credito."""
+    from app.models import TransactionStatus
+    if kind == "card":
+        return {"account_id": obj.account_id, "card_id": obj.id, "payment_method": "Crédito",
+                "transaction_status": TransactionStatus.pending}
+    return {"account_id": obj.id, "card_id": None, "payment_method": "Conta bancária",
+            "transaction_status": TransactionStatus.paid}
 
 
 def confirm_payment(db: Session, user_id: int, action_id: int | None = None) -> dict:
@@ -389,8 +475,10 @@ def confirm_payment(db: Session, user_id: int, action_id: int | None = None) -> 
     payload = json.loads(action.payload)
     context = _context(db, user_id)
     rule = next((item for item in _rules(db, context) if item.id == payload["rule_id"]), None) if context else None
-    account = db.get(Account, payload.get("account_id")) if payload.get("account_id") else None
-    if not rule or not account or not account.is_active or account.person_id != rule.person_id:
+    source = _find_source(_sources(db, rule), payload.get("source")) if rule else None
+    if not source and rule and payload.get("account_id"):
+        source = _find_source(_sources(db, rule), f"account:{payload['account_id']}")
+    if not rule or not source:
         action.status = "cancelled"; action.resolved_at = datetime.utcnow(); db.commit()
         return {"fixed_bill": True, "status": "cancelled",
                 "message": "A conta fixa ou a conta de pagamento mudou desde o resumo. Nada foi registrado."}
@@ -401,8 +489,7 @@ def confirm_payment(db: Session, user_id: int, action_id: int | None = None) -> 
     try:
         transaction, target_year, target_month = apply_recurrence_confirmation(
             db, rule=rule, year=payload["year"], month=payload["month"], amount=amount,
-            created_by_id=user_id, account_id=account.id, payment_method="Conta bancária",
-            transaction_date=paid_on, source="telegram",
+            created_by_id=user_id, source="telegram", transaction_date=paid_on, **payment_fields(*source),
         )
         action.status = "confirmed"; action.resolved_at = datetime.utcnow()
         db.commit()
@@ -424,7 +511,7 @@ def confirm_payment(db: Session, user_id: int, action_id: int | None = None) -> 
         note = f" Lançado na competência {target_month:02d}/{target_year} porque o mês estava fechado."
     return {"fixed_bill": True, "status": "registered", "registered": True, "transaction_id": transaction.id,
             "message": (f"Pagamento registrado: **{label}**, competência {payload['month']:02d}/{payload['year']}, "
-                        f"{format_brl(amount)} em {paid_on.strftime('%d/%m/%Y')} pela conta {account.name}.{note}")}
+                        f"{format_brl(amount)} em {paid_on.strftime('%d/%m/%Y')} — {source_label(*source)}.{note}")}
 
 
 def cancel_payment(db: Session, user_id: int, action_id: int | None = None) -> dict:
@@ -550,18 +637,18 @@ def handle_bill_text(db: Session, user: User, text: str, today: date | None = No
             action.status = "cancelled"; action.resolved_at = datetime.utcnow(); db.commit()
             return None
         result = prepare_payment(db, user.id, today=today, rule_id=payload["rule_id"], amount=amount,
-                                 competence=(payload["year"], payload["month"]), paid_date=payload.get("paid_on"))
-    elif payload.get("phase") == "account":
+                                 competence=(payload["year"], payload["month"]), paid_date=payload.get("paid_on"),
+                                 source=payload.get("source"))
+    elif payload.get("phase") in ("method", "account"):
         result = prepare_payment(db, user.id, today=today, rule_id=payload["rule_id"], amount=payload["amount"],
                                  competence=(payload["year"], payload["month"]), paid_date=payload.get("paid_on"),
                                  account=text)
-        if result.get("status") == "missing_account" and len(normalized.split()) > 4:
+        if result.get("status") == "missing_method" and len(normalized.split()) > 4:
             cancel_payment(db, user.id, result.get("action_id"))
             return None
     else:
         return None
-    keyboard = confirmation_keyboard(result["action_id"]) if result.get("status") == "awaiting_confirmation" else None
-    return BotReply(result["message"], keyboard)
+    return BotReply(result["message"], result.get("keyboard"))
 
 
 def handle_bill_callback(db: Session, user: User, data: str, today: date | None = None) -> BotReply:
@@ -579,6 +666,8 @@ def handle_bill_callback(db: Session, user: User, data: str, today: date | None 
         elif kind == "m":
             result = prepare_payment(db, user.id, today=today, rule_id=int(parts[2]),
                                      competence=(today.year, today.month))
+        elif kind == "s":
+            result = set_payment_source(db, user.id, int(parts[2]), parts[3])
         elif kind == "c":
             result = confirm_payment(db, user.id, int(parts[2]))
         elif kind == "x":
@@ -587,8 +676,22 @@ def handle_bill_callback(db: Session, user: User, data: str, today: date | None 
             raise ValueError
     except (ValueError, IndexError):
         return BotReply("Não reconheci esse botão. Envie /contas para ver as contas pendentes.")
-    keyboard = confirmation_keyboard(result["action_id"]) if result.get("status") == "awaiting_confirmation" else None
-    return BotReply(result["message"], keyboard)
+    return BotReply(result["message"], result.get("keyboard"))
+
+
+def keyboard_for_recent_action(db: Session, user_id: int, since: datetime) -> list[list[dict]] | None:
+    """Botoes para a resposta do agente quando ele acabou de preparar um pagamento de conta fixa."""
+    for action in _active_actions(db, user_id):
+        if action.expires_at < since + EXPIRATION:
+            return None
+        payload = json.loads(action.payload)
+        if action.status == "awaiting_confirmation":
+            return confirmation_keyboard(action.id)
+        if payload.get("phase") in ("method", "account"):
+            rule = db.get(RecurrenceRule, payload["rule_id"])
+            return method_keyboard(action.id, _sources(db, rule), payload.get("suggested")) if rule else None
+        return None
+    return None
 
 
 def reminder_time(db: Session) -> time:

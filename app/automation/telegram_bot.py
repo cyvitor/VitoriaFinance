@@ -10,7 +10,7 @@ from app.logging_config import get_bot_logger
 from app.services.telegram_auth import consume_pairing_code
 from app.services.telegram_ai import AIResponseFormatError, AIToolSelectionError, AIUnavailableError
 from app.services.telegram_agent import run_financial_agent
-from app.services.fixed_bills import BotReply, handle_bill_callback, handle_bill_text
+from app.services.fixed_bills import BotReply, handle_bill_callback, handle_bill_text, keyboard_for_recent_action
 
 logger = get_bot_logger()
 
@@ -87,7 +87,10 @@ def handle_message(db: Session, message: dict) -> str | BotReply:
         bill_reply = handle_bill_text(db, user, text, message_date)
         if bill_reply is not None:
             return bill_reply
-        return run_financial_agent(db, user, text, reference_date=message_date)
+        started = datetime.utcnow()
+        reply = run_financial_agent(db, user, text, reference_date=message_date)
+        keyboard = keyboard_for_recent_action(db, user.id, started)
+        return BotReply(reply, keyboard) if keyboard else reply
     except (AIResponseFormatError, AIToolSelectionError) as exc:
         logger.error("agent_structured_response_failed user_id=%s error=%s", user.id, exc)
         return "Não consegui organizar essa consulta com segurança agora. Nenhum lançamento foi feito; tente novamente em instantes."

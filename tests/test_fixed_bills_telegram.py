@@ -7,7 +7,7 @@ from sqlalchemy import func, select
 from app.automation.telegram_bot import handle_callback, handle_message
 from app.database import SessionLocal
 from app.models import (
-    Account, AccountType, Person, RecurrenceOccurrence, RecurrenceRule, SystemSetting, TelegramLink,
+    Account, AccountType, Card, Person, RecurrenceOccurrence, RecurrenceRule, SystemSetting, TelegramLink,
     TelegramPendingAction, Transaction, TransactionStatus, TransactionType,
 )
 from app.services import fixed_bills
@@ -29,7 +29,10 @@ def seed(db):
                     account_type=AccountType.checking, initial_balance=Decimal("1000"))
     santander = Account(workspace_id=vitor.workspace_id, person_id=esposa.id, name="Santander",
                         account_type=AccountType.checking, initial_balance=Decimal("1000"))
-    db.add_all([caixa, santander]); db.flush()
+    c6 = Account(workspace_id=vitor.workspace_id, person_id=vitor.id, name="C6",
+                 account_type=AccountType.checking, initial_balance=Decimal("500"))
+    db.add_all([caixa, santander, c6]); db.flush()
+    db.add(Card(workspace_id=vitor.workspace_id, account_id=c6.id, name="C6", closing_day=5, due_day=12))
     created = datetime(2026, 9, 1, 12, 0)
 
     def rule(description, amount, person, account):
@@ -68,6 +71,11 @@ def llm(monkeypatch, *decisions):
     monkeypatch.setattr(fixed_bills, "today_sp", lambda: TODAY)
 
 
+def pick(reply, label):
+    """Toca no botao de 'Pagou como?' cujo texto contem label."""
+    return next(b["callback_data"] for row in reply.keyboard for b in row if label in b["text"])
+
+
 def payments(db, rule_id):
     return db.scalar(select(func.count(Transaction.id)).where(Transaction.recurrence_rule_id == rule_id))
 
@@ -90,7 +98,10 @@ def test_natural_payment_with_different_amount_and_local_confirmation(monkeypatc
                       "arguments": {"bill": "luz", "amount": 287.40}})
     with SessionLocal() as db:
         user, luz, *_ = seed(db)
-        reply = run_financial_agent(db, user, "paguei luz 287,40 hoje", reference_date=TODAY)
+        ask = run_financial_agent(db, user, "paguei luz 287,40 hoje", reference_date=TODAY)
+        assert "Pagou como" in ask and "⭐ Conta Caixa (débito)" in ask and "Cartão C6 (crédito)" in ask
+        reply = handle_message(db, message("débito caixa")).text
+        assert "Forma de pagamento: **Conta Caixa (débito)**" in reply
         assert "Competência: **09/2026**" in reply
         assert "R$ 287,40" in reply and "diferente do previsto" in reply and "10/2026" in reply
         assert payments(db, luz.id) == 0
@@ -110,8 +121,8 @@ def test_model_choosing_generic_expense_is_corrected_to_fixed_bill(monkeypatch):
     with SessionLocal() as db:
         user, luz, *_ = seed(db)
         reply = run_financial_agent(db, user, "paguei a luz", reference_date=TODAY)
-        assert "Confirme o pagamento da conta fixa" in reply and "Luz (Vitor)" in reply
-        cancelled = run_financial_agent(db, user, "não", reference_date=TODAY)
+        assert "Pagou como" in reply and "Luz (Vitor)" in reply
+        cancelled = handle_message(db, message("não")).text
         assert "Nada foi registrado" in cancelled and payments(db, luz.id) == 0
 
 
@@ -124,7 +135,8 @@ def test_ambiguous_name_asks_which_area(monkeypatch):
         assert result["options"] == ["Claro (Vitor)", "Claro (Esposa)"] or set(result["options"]) == {
             "Claro (Vitor)", "Claro (Esposa)"}
         chosen = prepare_payment(db, user.id, today=TODAY, bill="claro da esposa")
-        assert chosen["status"] == "awaiting_confirmation" and chosen["rule_id"] == claro_e.id
+        assert chosen["status"] == "missing_method" and chosen["rule_id"] == claro_e.id
+        assert chosen["source_options"] == ["Conta Santander (débito)"]
         assert "Santander" in chosen["message"]
 
 
@@ -134,7 +146,8 @@ def test_current_month_competence_by_text_and_button(monkeypatch):
         user, luz, *_ = seed(db)
         result = prepare_payment(db, user.id, today=TODAY, bill="luz", competence="atual")
         assert result["competence"] == "2026-10"
-        reply = handle_callback(db, callback(f"fb:m:{luz.id}"))
+        ask = handle_callback(db, callback(f"fb:m:{luz.id}"))
+        reply = handle_callback(db, callback(pick(ask, "Caixa")))
         assert "Competência: **10/2026**" in reply.text
         handle_callback(db, callback(reply.keyboard[0][0]["callback_data"]))
         occurrence = db.scalar(select(RecurrenceOccurrence).where(RecurrenceOccurrence.recurrence_rule_id == luz.id))
@@ -147,9 +160,12 @@ def test_callbacks_are_idempotent_and_validate_user(monkeypatch):
     llm(monkeypatch)
     with SessionLocal() as db:
         user, luz, *_ = seed(db)
-        first = handle_callback(db, callback(f"fb:p:{luz.id}:202609"))
-        second = handle_callback(db, callback(f"fb:p:{luz.id}:202609"))
-        assert first.keyboard == second.keyboard  # clique duplo reaproveita o mesmo rascunho
+        ask1 = handle_callback(db, callback(f"fb:p:{luz.id}:202609"))
+        ask2 = handle_callback(db, callback(f"fb:p:{luz.id}:202609"))
+        assert ask1.keyboard == ask2.keyboard  # clique duplo reaproveita o mesmo rascunho
+        first = handle_callback(db, callback(pick(ask1, "Caixa")))
+        again = handle_callback(db, callback(pick(ask1, "Caixa")))
+        assert first.keyboard == again.keyboard
         confirm = first.keyboard[0][0]["callback_data"]
         stranger = handle_callback(db, callback(confirm, sender=999))
         assert "nao esta associado" in stranger.text and payments(db, luz.id) == 0
@@ -168,8 +184,10 @@ def test_other_value_button_asks_amount(monkeypatch):
         user, luz, *_ = seed(db)
         ask = handle_callback(db, callback(f"fb:v:{luz.id}:202609"))
         assert "Qual foi o valor pago" in ask.text and ask.keyboard is None
-        summary = handle_message(db, message("250,90"))
-        assert isinstance(summary, BotReply) and "R$ 250,90" in summary.text
+        method = handle_message(db, message("250,90"))
+        assert isinstance(method, BotReply) and "Pagou como" in method.text and "R$ 250,90" in method.text
+        summary = handle_callback(db, callback(pick(method, "Caixa")))
+        assert "R$ 250,90" in summary.text
         handle_callback(db, callback(summary.keyboard[0][0]["callback_data"]))
         transaction = db.scalar(select(Transaction).where(Transaction.recurrence_rule_id == luz.id))
         assert transaction.amount == Decimal("250.90")
@@ -222,3 +240,46 @@ def test_admin_fixed_expense_due_day_and_reminder_time(client):
     with SessionLocal() as db:
         assert db.scalar(select(SystemSetting.value).where(SystemSetting.key == "bill_reminder_time")) == "07:45"
     assert 'name="bill_reminder_time"' in client.get("/system/settings").text
+
+def test_card_payment_by_button_goes_to_invoice_like_web(monkeypatch):
+    llm(monkeypatch)
+    with SessionLocal() as db:
+        user, luz, *_ = seed(db)
+        ask = handle_callback(db, callback(f"fb:p:{luz.id}:202609"))
+        assert ask.keyboard[0][0]["text"].startswith("⭐")  # forma cadastrada na regra vem primeiro
+        summary = handle_callback(db, callback(pick(ask, "Cartão C6")))
+        assert "Forma de pagamento: **Cartão C6 (crédito)**" in summary.text and "fatura" in summary.text
+        confirm = summary.keyboard[0][0]["callback_data"]
+        done = handle_callback(db, callback(confirm))
+        assert "Cartão C6 (crédito)" in done.text
+        assert "já foi registrado" in handle_callback(db, callback(confirm)).text
+        transaction = db.scalar(select(Transaction).where(Transaction.recurrence_rule_id == luz.id))
+        card = db.scalar(select(Card).where(Card.name == "C6"))
+        assert transaction.card_id == card.id and transaction.account_id == card.account_id
+        assert transaction.payment_method == "Crédito" and transaction.status == TransactionStatus.pending
+        occurrence = db.scalar(select(RecurrenceOccurrence).where(RecurrenceOccurrence.recurrence_rule_id == luz.id))
+        assert (occurrence.year, occurrence.month, occurrence.status) == (2026, 9, "confirmed")
+        assert payments(db, luz.id) == 1
+
+
+def test_card_payment_by_natural_text_resolves_method(monkeypatch):
+    llm(monkeypatch, {"action": "tool", "tool": "preparar_pagamento_conta_fixa", "arguments": {"bill": "luz"}})
+    with SessionLocal() as db:
+        user, luz, *_ = seed(db)
+        reply = handle_message(db, message("paguei luz no c6 credito"))
+        assert isinstance(reply, BotReply) and reply.keyboard  # botoes Confirmar/Cancelar
+        assert "Pagou como" not in reply.text and "Forma de pagamento: **Cartão C6 (crédito)**" in reply.text
+        assert "Pagamento registrado" in run_financial_agent(db, user, "sim", reference_date=TODAY)
+        transaction = db.scalar(select(Transaction).where(Transaction.recurrence_rule_id == luz.id))
+        assert transaction.card_id is not None and transaction.status == TransactionStatus.pending
+
+
+def test_ambiguous_method_name_asks_again(monkeypatch):
+    llm(monkeypatch)
+    with SessionLocal() as db:
+        user, luz, *_ = seed(db)
+        handle_callback(db, callback(f"fb:p:{luz.id}:202609"))
+        again = handle_message(db, message("c6"))  # conta C6 e cartao C6
+        assert "Pagou como" in again.text and payments(db, luz.id) == 0
+        debit = handle_message(db, message("c6 débito"))
+        assert "Conta C6 (débito)" in debit.text

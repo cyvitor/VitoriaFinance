@@ -58,7 +58,7 @@ Ferramentas permitidas e argumentos:
 - cancelar_despesa: {}
 - preparar_abastecimento: {"vehicle":texto opcional,"odometer_km":numero opcional,"liters":numero opcional,"price_per_liter":numero opcional,"full_tank":booleano opcional}. Use somente quando o contexto indicar action_type=fuel_fillup. Com total conhecido, quilometragem e apenas um entre liters/price_per_liter bastam. Pergunte se encheu o tanque quando full_tank ainda nao foi informado.
 - listar_contas_fixas_pendentes: {"area": texto opcional}. Lista contas fixas/recorrentes (luz, agua, internet, escola, condominio...) ainda nao confirmadas.
-- preparar_pagamento_conta_fixa: {"bill": texto com o nome da conta, "area": texto opcional, "amount": numero opcional (valor efetivamente pago), "paid_date": "YYYY-MM-DD" opcional, "competence": "YYYY-MM" ou "atual" opcional, "account": texto opcional}. Prepara a confirmacao do pagamento de uma conta fixa; nao grava nada ate o usuario confirmar.
+- preparar_pagamento_conta_fixa: {"bill": texto com o nome da conta, "area": texto opcional, "amount": numero opcional (valor efetivamente pago), "paid_date": "YYYY-MM-DD" opcional, "competence": "YYYY-MM" ou "atual" opcional, "account": texto opcional com a forma de pagamento dita pelo usuario, ex. "c6 credito" ou "debito caixa"}. Prepara a confirmacao do pagamento de uma conta fixa; nao grava nada ate o usuario confirmar.
 - definir_vencimento_conta_fixa: {"bill": texto, "area": texto opcional, "due_day": inteiro 1-31}
 - preparar_correcao_abastecimento: {"vehicle":texto opcional,"new_odometer_km":numero opcional,"new_liters":numero opcional,"new_price_per_liter":numero opcional,"new_full_tank":booleano opcional}. Corrige o abastecimento mais recente e sempre exige confirmacao posterior.
 """
@@ -1073,8 +1073,11 @@ Retorne SOMENTE JSON valido em um destes formatos:
     elif decision.get("action") == "tool":
         tool_name = str(decision.get("tool") or "")
         logger.debug("tool_call user_id=%s tool=%s arguments=%s", user.id, tool_name, decision.get("arguments") or {})
+        arguments = dict(decision.get("arguments") or {})
+        if tool_name == "preparar_pagamento_conta_fixa":
+            arguments["_hint"] = text  # "paguei gforce no c6 credito" resolve a forma sem depender do modelo
         try:
-            result = execute_tool(db, context, tool_name, decision.get("arguments") or {})
+            result = execute_tool(db, context, tool_name, arguments)
         except ToolError as exc:
             result = {"error": str(exc)}
             logger.warning("tool_error user_id=%s tool=%s error=%s", user.id, tool_name, exc)
