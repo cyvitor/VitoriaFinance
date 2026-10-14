@@ -11,6 +11,7 @@ from app.services.telegram_auth import consume_pairing_code
 from app.services.telegram_ai import AIResponseFormatError, AIToolSelectionError, AIUnavailableError
 from app.services.telegram_agent import run_financial_agent
 from app.services.fixed_bills import BotReply, handle_bill_callback, handle_bill_text, keyboard_for_recent_action
+from app.services import bot_confirmations
 
 logger = get_bot_logger()
 
@@ -34,7 +35,11 @@ def handle_callback(db: Session, callback: dict) -> BotReply:
         logger.warning("telegram_callback_unlinked telegram_user_id=%s", sender.get("id"))
         return BotReply("Seu Telegram ainda nao esta associado. Gere um codigo em Meu perfil e envie /start CODIGO.")
     try:
-        return handle_bill_callback(db, user, str(callback.get("data") or ""), _message_date(callback.get("message") or {}, user))
+        data = str(callback.get("data") or "")
+        reply = bot_confirmations.handle_callback(db, user, data)
+        if reply is not None:
+            return reply
+        return handle_bill_callback(db, user, data, _message_date(callback.get("message") or {}, user))
     except Exception:
         logger.exception("telegram_callback_failed user_id=%s data=%r", user.id, callback.get("data"))
         db.rollback()
@@ -49,6 +54,20 @@ def _message_date(message: dict, user: User):
     except (TypeError, ValueError, OSError):
         logger.warning("telegram_message_invalid_date user_id=%s date=%r", user.id, message.get("date"))
         return None
+
+
+def _choice_keyboard(db: Session, user_id: int):
+    from sqlalchemy import select
+    from app.models import TelegramPendingAction
+    action = db.scalar(select(TelegramPendingAction).where(
+        TelegramPendingAction.user_id == user_id,
+        TelegramPendingAction.action_type == bot_confirmations.CHOICE_TYPE,
+        TelegramPendingAction.status == "collecting",
+    ).order_by(TelegramPendingAction.id.desc()))
+    if not action or action.expires_at < datetime.utcnow():
+        return None
+    return [[{"text": "🧾 Conta fixa", "callback_data": f"ec:b:{action.id}"},
+             {"text": "🆕 Despesa nova", "callback_data": f"ec:n:{action.id}"}]]
 
 
 def handle_message(db: Session, message: dict) -> str | BotReply:
@@ -89,7 +108,9 @@ def handle_message(db: Session, message: dict) -> str | BotReply:
             return bill_reply
         started = datetime.utcnow()
         reply = run_financial_agent(db, user, text, reference_date=message_date)
-        keyboard = keyboard_for_recent_action(db, user.id, started)
+        keyboard = (keyboard_for_recent_action(db, user.id, started)
+                    or bot_confirmations.keyboard_for_pending(db, user.id)
+                    or _choice_keyboard(db, user.id))
         return BotReply(reply, keyboard) if keyboard else reply
     except (AIResponseFormatError, AIToolSelectionError) as exc:
         logger.error("agent_structured_response_failed user_id=%s error=%s", user.id, exc)

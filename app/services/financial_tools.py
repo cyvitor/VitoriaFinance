@@ -1486,7 +1486,8 @@ TOOLS = {
     # nao apenas a area principal, e sempre devolvem texto deterministico em "message".
     "listar_contas_fixas_pendentes": lambda db, context, args: fixed_bills.list_pending_tool(db, context.user_id, args),
     "preparar_pagamento_conta_fixa": lambda db, context, args: fixed_bills.prepare_payment(
-        db, context.user_id, bill=args.get("bill"), area=args.get("area"), amount=args.get("amount"),
+        db, context.user_id, rule_id=args.get("rule_id"), bill=args.get("bill"), area=args.get("area"),
+        amount=args.get("amount"),
         paid_date=args.get("paid_date"), competence=args.get("competence"),
         account=args.get("account") or args.get("payment_method"), hint=args.get("_hint"),
     ),

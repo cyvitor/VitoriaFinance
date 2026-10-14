@@ -472,21 +472,26 @@ def _enforce_pending_income_collection_intent(
 
 
 def _enforce_fixed_bill_intent(db: Session, user: User, text: str, decision: dict) -> dict:
-    """'Paguei a luz' e pagamento de conta fixa, mesmo se o modelo escolher preparar_despesa."""
+    """Palavras-chave e match de conta fixa em aberto redirecionam preparar_despesa."""
     if decision.get("action") != "tool" or decision.get("tool") != "preparar_despesa":
         return decision
-    if not re.search(r"\bpag(uei|o|a|amos|amento)\b", _normalized_text(text)):
+    from app.services import bot_confirmations
+    intent = bot_confirmations.intent_keyword(text)
+    if intent == "new":
+        return decision  # gastei/comprei: despesa nova direto
+    match = bot_confirmations.open_rule_match(db, user.id, text)
+    if not match:
         return decision
-    from app.services.fixed_bills import mentioned_rule
-    rule = mentioned_rule(db, user.id, text)
-    if not rule:
-        return decision
+    rule, bill = match
     arguments = dict(decision.get("arguments") or {})
-    corrected = {"action": "tool", "tool": "preparar_pagamento_conta_fixa", "arguments": {
-        "bill": text, "amount": arguments.get("amount"), "paid_date": arguments.get("transaction_date"),
-    }}
-    logger.info("agent_decision_corrected reason=fixed_bill_payment rule_id=%s original=%s", rule.id, decision)
-    return corrected
+    if intent == "fixed":
+        corrected = {"action": "tool", "tool": "preparar_pagamento_conta_fixa",
+                     "arguments": bot_confirmations.fixed_bill_arguments(rule, arguments)}
+        logger.info("agent_decision_corrected reason=fixed_bill_keyword rule_id=%s original=%s", rule.id, decision)
+        return corrected
+    # Sem palavra-chave clara: pergunta conta fixa x despesa nova (sem LLM no callback)
+    reply, keyboard = bot_confirmations.ask_choice(db, user, text, arguments, rule, bill)
+    return {"action": "ask_choice", "reply": reply, "keyboard": keyboard, "rule_id": rule.id}
 
 
 def _select_decision(token: str, model: str, messages: list[dict], text: str) -> dict:
@@ -1068,6 +1073,11 @@ Retorne SOMENTE JSON valido em um destes formatos:
         decision = _select_decision(token, model, selector_messages, text)
         decision = _enforce_fixed_bill_intent(db, user, text, decision)
     db.add(TelegramConversationMessage(user_id=user.id, role="user", content=text[:4000]))
+    if decision.get("action") == "ask_choice":
+        reply = str(decision.get("reply") or "")[:4000]
+        db.add(TelegramConversationMessage(user_id=user.id, role="assistant", content=reply))
+        db.commit()
+        return reply
     if decision.get("action") == "respond":
         reply = str(decision.get("reply") or "Como posso ajudar com suas financas?")[:4000]
     elif decision.get("action") == "tool":
