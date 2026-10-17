@@ -50,13 +50,13 @@ Ferramentas permitidas e argumentos:
 - preparar_amortizacao_financiamento: {"financing":texto opcional,"new_outstanding_balance":numero opcional,"remaining_installments":inteiro opcional,"new_installment_amount":numero opcional,"amortized_amount":numero opcional,"strategy":"reduce_term|reduce_installment|reduce_both" opcional,"amortization_date":"YYYY-MM-DD" opcional,"notes":texto opcional}
 - confirmar_acao_pendente: {}
 - cancelar_acao_pendente: {}
-- preparar_despesa: {"amount":numero,"description":texto,"transaction_date":"YYYY-MM-DD" opcional,"category":texto opcional,"payment_method":"cash|credit" opcional,"card":texto opcional}. Omita category quando o usuario nao disse a categoria; o backend identifica pelo estabelecimento.
+- preparar_despesa: {"amount":numero,"description":texto,"transaction_date":"YYYY-MM-DD" opcional,"category":texto opcional,"payment_method":"cash|credit" opcional,"card":texto opcional,"liters":numero opcional,"odometer_km":numero opcional,"price_per_liter":numero opcional,"full_tank":booleano opcional}. Em combustivel, envie litros/quilometragem/preco por litro/tanque cheio se o usuario ja informou ("100 gasolina, 14,51 litros" -> liters 14.51). Omita category quando o usuario nao disse a categoria; o backend identifica pelo estabelecimento.
 - preparar_despesas: {"expenses":[objetos com os mesmos campos de preparar_despesa, um para cada gasto]}
 - atualizar_despesa: {"description":texto opcional,"transaction_date":"YYYY-MM-DD" opcional,"area":texto opcional,"category":texto opcional,"payment_method":"cash|credit" opcional,"card":texto opcional}
 - sugerir_categoria_despesa: {}
 - confirmar_despesa: {}
 - cancelar_despesa: {}
-- preparar_abastecimento: {"vehicle":texto opcional,"odometer_km":numero opcional,"liters":numero opcional,"price_per_liter":numero opcional,"full_tank":booleano opcional}. Use somente quando o contexto indicar action_type=fuel_fillup. Com total conhecido, quilometragem e apenas um entre liters/price_per_liter bastam. Pergunte se encheu o tanque quando full_tank ainda nao foi informado.
+- preparar_abastecimento: {"vehicle":texto opcional,"odometer_km":numero opcional,"liters":numero opcional,"price_per_liter":numero opcional,"full_tank":booleano opcional}. Use quando o contexto indicar action_type=fuel_fillup ou quando o usuario pedir para registrar o abastecimento de um gasto de combustivel ja registrado; sem acao pendente, o backend vincula a ultima despesa de combustivel sem abastecimento dos ultimos 7 dias (ou pergunta qual, se houver varias). Com total conhecido, quilometragem e apenas um entre liters/price_per_liter bastam. Pergunte se encheu o tanque quando full_tank ainda nao foi informado.
 - listar_contas_fixas_pendentes: {"area": texto opcional}. Lista contas fixas/recorrentes (luz, agua, internet, escola, condominio...) ainda nao confirmadas.
 - preparar_pagamento_conta_fixa: {"bill": texto com o nome da conta, "area": texto opcional, "amount": numero opcional (valor efetivamente pago), "paid_date": "YYYY-MM-DD" opcional, "competence": "YYYY-MM" ou "atual" opcional, "account": texto opcional com a forma de pagamento dita pelo usuario, ex. "c6 credito" ou "debito caixa"}. Prepara a confirmacao do pagamento de uma conta fixa; nao grava nada ate o usuario confirmar.
 - definir_vencimento_conta_fixa: {"bill": texto, "area": texto opcional, "due_day": inteiro 1-31}
@@ -866,6 +866,14 @@ def _fallback_tool_reply(tool_name: str, result: dict) -> str:
 
 
 def _expense_tool_reply(tool_name: str, result: dict, model_reply: str) -> str:
+    reply = _expense_tool_reply_base(tool_name, result, model_reply)
+    if result.get("possible_duplicate") and "Possível duplicata" not in reply:
+        reply = (reply + f"\n\n⚠️ Possível duplicata: já existe **{result['possible_duplicate']}**. "
+                 "É a mesma despesa? Se for, posso só registrar o abastecimento nela.")
+    return reply
+
+
+def _expense_tool_reply_base(tool_name: str, result: dict, model_reply: str) -> str:
     expense_tools = {
         "preparar_despesa", "preparar_despesas", "atualizar_despesa",
         "confirmar_despesa", "cancelar_despesa", "sugerir_categoria_despesa",
@@ -893,6 +901,9 @@ def _expense_tool_reply(tool_name: str, result: dict, model_reply: str) -> str:
             + (f" — {_format_brl(result.get('amount'))}" if result.get("amount") else "")
             + "."
         )
+        if result.get("fuel_followup") and result.get("fuel_prefilled"):
+            prefilled = result["fuel_prefilled"]
+            return reply + "\n\n" + (_fuel_tool_reply(prefilled, "") or str(prefilled.get("message") or ""))
         if result.get("fuel_followup"):
             return reply + "\n\nDeseja registrar também os dados deste abastecimento no veículo?"
         return reply + "\n\nSe quiser, posso mostrar o resumo de hoje ou consultar seu saldo disponível."
@@ -926,6 +937,20 @@ def _expense_tool_reply(tool_name: str, result: dict, model_reply: str) -> str:
 
 
 def _fuel_tool_reply(result: dict, model_reply: str) -> str:
+    if result.get("fuel_fillup") and result.get("status") == "missing_information":
+        lines = []
+        if result.get("linked_expense"):
+            lines.append(f"Vou completar o abastecimento da despesa **{result['linked_expense']}**.")
+        if result.get("known_values"):
+            lines.append(f"Já anotei: {result['known_values']}.")
+        missing = ", ".join(result.get("missing_fields") or [])
+        if result.get("vehicle_options") and "veiculo" in missing:
+            lines.append("Veículos: " + ", ".join(result["vehicle_options"]) + ".")
+        lines.append(f"Falta informar: **{missing}**. Exemplo: `178640 km, completei`.")
+        return "\n".join(lines)
+    if result.get("linked_expense") and result.get("fuel_fillup") and result.get("status") == "awaiting_confirmation":
+        return (f"Vinculei à despesa **{result['linked_expense']}**.\n\n"
+                + _fuel_tool_reply({**result, "linked_expense": None}, model_reply))
     if result.get("already_registered"):
         return "Esse abastecimento já foi registrado. Se algum dado estiver incorreto, posso preparar uma correção."
     if result.get("fuel_fillup") and result.get("status") == "awaiting_confirmation":
@@ -1014,6 +1039,14 @@ def run_financial_agent(db: Session, user: User, text: str, reference_date: date
         db.commit()
         logger.info("explicit_user_preference_stored user_id=%s subject=data_padrao_dos_gastos", user.id)
         return explicit_preference_reply
+    from app.services import fuel_followup
+    fuel_reply = fuel_followup.local_text_reply(db, user, text)
+    if fuel_reply:
+        db.add_all([TelegramConversationMessage(user_id=user.id, role="user", content=text[:4000]),
+                    TelegramConversationMessage(user_id=user.id, role="assistant", content=fuel_reply[:4000])])
+        db.commit()
+        logger.info("fuel_followup_local_reply user_id=%s", user.id)
+        return fuel_reply
     token, model = _settings(db)
     context = scope_to_principal_area(build_user_access_context(db, user))
     areas = db.scalars(select(Person.name).where(Person.id.in_(context.allowed_person_ids))).all() if context.allowed_person_ids else []
@@ -1035,7 +1068,7 @@ Quando houver acao aguardando confirmacao, interprete confirmacao ou cancelament
 Uma confirmacao de despesa usa confirmar_despesa; receita, amortizacao, abastecimento e correcao de abastecimento usam confirmar_acao_pendente.
 Quando houver abastecimento pendente em collecting, use preparar_abastecimento para aceitar os dados informados de forma livre. O valor total ja esta no contexto; quilometragem e pelo menos litros ou preco por litro bastam, pois o backend calcula o outro. Em respostas como "sim, 155000, 6,00l" durante a pergunta do abastecimento, interprete o primeiro numero como odometer_km e o segundo como price_per_liter, porque o total pago ja e conhecido; nao interprete 155000 como dinheiro. Se litros forem declarados explicitamente como quantidade abastecida, use liters. A ferramenta apenas prepara um resumo; depois use confirmar_acao_pendente quando o usuario confirmar. Se ele corrigir os dados antes da confirmacao, chame preparar_abastecimento novamente com a correcao. Se o abastecimento ja foi gravado e o usuario disser "na verdade" ou pedir correcao, use preparar_correcao_abastecimento. Se o usuario mudar de assunto, atenda ao novo pedido normalmente; nao force a continuacao do abastecimento.
 Para abastecimentos, extraia full_tank=true de frases como "completei", "encheu", "tanque cheio" ou "ate completar"; use full_tank=false para "parcial", "nao encheu" ou "nao completei". Se a informacao nao foi dada, a ferramenta retornara o campo ausente e voce deve perguntar de forma objetiva antes de apresentar a confirmacao final.
-Se o usuario disser que quer adicionar um novo abastecimento e informar valor, cartao ou forma de pagamento, mas NAO existir action_type=fuel_fillup no contexto, isso ainda e uma nova despesa de combustivel: use preparar_despesa com description Gasolina/Etanol/Combustivel, amount, card e payment_method. Nunca use preparar_abastecimento antes de a despesa ser confirmada. Depois de confirmar_despesa, o backend criara o contexto de abastecimento e perguntara se ele deseja complementar os dados.
+Se o usuario disser que quer adicionar um novo abastecimento e informar valor, cartao ou forma de pagamento, mas NAO existir action_type=fuel_fillup no contexto, isso ainda e uma nova despesa de combustivel: use preparar_despesa com description Gasolina/Etanol/Combustivel, amount, card e payment_method. Nunca use preparar_abastecimento antes de a despesa ser confirmada. Porem, se o usuario disser que o gasto ja foi registrado, pedir "registre o abastecimento" ou informar so dados do abastecimento sem dizer que e um novo gasto, use preparar_abastecimento (o backend vincula a despesa ja registrada) em vez de preparar_despesa. Depois de confirmar_despesa, o backend criara o contexto de abastecimento e perguntara se ele deseja complementar os dados.
 Se o usuario disser "esqueca", "vamos adicionar outro" ou equivalente e ja trouxer os dados de uma nova despesa na mesma mensagem, escolha preparar_despesa diretamente; o backend encerrara o complemento opcional anterior. Nao desperdice o turno chamando apenas cancelamento.
 Quando houver despesa pendente e o usuario corrigir ou complementar descricao, area, categoria, pagamento ou cartao, use atualizar_despesa e envie todos os campos informados. A area padrao do usuario deve ser usada ao iniciar uma despesa; so troque a area se ele pedir explicitamente. Nunca apenas diga que atualizou.
 Consultas e lancamentos usam somente a area principal com escrita. Nao peça categoria em preparar_despesa se o usuario nao informou uma; quando o resumo ja trouxer categoria, nao ofereca outra lista.
@@ -1075,6 +1108,7 @@ Retorne SOMENTE JSON valido em um destes formatos:
     db.add(TelegramConversationMessage(user_id=user.id, role="user", content=text[:4000]))
     if decision.get("action") == "ask_choice":
         reply = str(decision.get("reply") or "")[:4000]
+        db.info["bot_keyboard"] = decision.get("keyboard")
         db.add(TelegramConversationMessage(user_id=user.id, role="assistant", content=reply))
         db.commit()
         return reply
@@ -1084,7 +1118,7 @@ Retorne SOMENTE JSON valido em um destes formatos:
         tool_name = str(decision.get("tool") or "")
         logger.debug("tool_call user_id=%s tool=%s arguments=%s", user.id, tool_name, decision.get("arguments") or {})
         arguments = dict(decision.get("arguments") or {})
-        if tool_name == "preparar_pagamento_conta_fixa":
+        if tool_name in ("preparar_pagamento_conta_fixa", "preparar_despesa", "preparar_abastecimento"):
             arguments["_hint"] = text  # "paguei gforce no c6 credito" resolve a forma sem depender do modelo
         try:
             result = execute_tool(db, context, tool_name, arguments)
@@ -1140,7 +1174,7 @@ apresente o saldo livre e a projecao mensal e pergunte o valor aproximado e como
         result_message = json.dumps(
             {"user_question": text, "tool": tool_name, "result": result}, ensure_ascii=False,
         )
-        if result.get("fixed_bill"):
+        if result.get("fixed_bill") or result.get("deterministic"):
             reply = str(result.get("message") or "")[:4000]
         elif tool_name == "consultar_gastos_cartao" and "items" in result:
             reply = _card_spending_reply(result)
@@ -1154,6 +1188,8 @@ apresente o saldo livre e a projecao mensal e pergunte o valor aproximado e como
                 reply = _fallback_tool_reply(tool_name, result)
         reply = _expense_tool_reply(tool_name, result, reply)[:4000]
         reply = _fuel_tool_reply(result, reply)[:4000]
+        from app.services.bot_confirmations import keyboard_after_tool
+        db.info["bot_keyboard"] = keyboard_after_tool(db, user.id, tool_name, result)
         if (tool_name == "consultar_saldo_livre" and "error" not in result
                 and "free_balance" in result and _asks_spending_feasibility(text)
                 and Decimal(str(result.get("planned_spending") or 0)) == 0):

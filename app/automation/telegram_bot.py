@@ -11,7 +11,33 @@ from app.services.telegram_auth import consume_pairing_code
 from app.services.telegram_ai import AIResponseFormatError, AIToolSelectionError, AIUnavailableError
 from app.services.telegram_agent import run_financial_agent
 from app.services.fixed_bills import BotReply, handle_bill_callback, handle_bill_text, keyboard_for_recent_action
-from app.services import bot_confirmations
+from app.services import bot_confirmations, fuel_followup
+from app.models import TelegramConversationMessage
+
+BUTTON_ECHO = {
+    "ok:c": "✅ Confirmado por você.", "ok:x": "❌ Cancelado por você.",
+    "fb:c": "✅ Confirmado por você.", "fb:x": "❌ Cancelado por você.",
+    "fu:y": "✅ Sim, registrar o abastecimento.", "fu:n": "❌ Não registrar o abastecimento.",
+    "ec:b": "🧾 Você escolheu: conta fixa.", "ec:n": "🆕 Você escolheu: despesa nova.",
+}
+BUTTON_LABEL = {
+    "ok:c": "Confirmar", "ok:x": "Cancelar", "fb:c": "Confirmar pagamento", "fb:x": "Cancelar pagamento",
+    "fb:p": "Paguei", "fb:v": "Outro valor", "fb:m": "Mes atual", "fb:s": "Forma de pagamento",
+    "fu:y": "Sim (abastecimento)", "fu:n": "Nao (abastecimento)", "ec:b": "Conta fixa", "ec:n": "Despesa nova",
+    "fl": "Registrar abastecimento nesta despesa",
+}
+REFUSALS = ("já foi", "não está mais", "não pertence", "não existe", "não reconheci", "expirou",
+            "não está disponível", "nao esta associado")
+
+
+def removes_keyboard(data: str) -> bool:
+    """Botoes de decisao somem apos o clique; listas (/contas) continuam utilizaveis."""
+    return data.startswith(("ok:", "fu:", "ec:", "fl:", "fb:c:", "fb:x:", "fb:s:"))
+
+
+def _button_key(data: str) -> str:
+    parts = data.split(":")
+    return parts[0] if parts[0] == "fl" else ":".join(parts[:2])
 
 logger = get_bot_logger()
 
@@ -36,10 +62,21 @@ def handle_callback(db: Session, callback: dict) -> BotReply:
         return BotReply("Seu Telegram ainda nao esta associado. Gere um codigo em Meu perfil e envie /start CODIGO.")
     try:
         data = str(callback.get("data") or "")
-        reply = bot_confirmations.handle_callback(db, user, data)
-        if reply is not None:
-            return reply
-        return handle_bill_callback(db, user, data, _message_date(callback.get("message") or {}, user))
+        reply = (bot_confirmations.handle_callback(db, user, data)
+                 or fuel_followup.handle_callback(db, user, data)
+                 or handle_bill_callback(db, user, data, _message_date(callback.get("message") or {}, user)))
+        key = _button_key(data)
+        echo = BUTTON_ECHO.get(key)
+        if key == "fl" and not any(term in reply.text.casefold() for term in REFUSALS):
+            echo = "⛽ Você escolheu registrar o abastecimento nesta despesa."
+        if echo and not any(term in reply.text.casefold() for term in REFUSALS):
+            reply = BotReply(f"{echo}\n\n{reply.text}", reply.keyboard)
+        # Cliques tambem entram no historico: a IA precisa ver a mesma conversa que o usuario.
+        db.add_all([TelegramConversationMessage(user_id=user.id, role="user",
+                                                content=f"[botão] {BUTTON_LABEL.get(key, key)}"),
+                    TelegramConversationMessage(user_id=user.id, role="assistant", content=reply.text[:4000])])
+        db.commit()
+        return reply
     except Exception:
         logger.exception("telegram_callback_failed user_id=%s data=%r", user.id, callback.get("data"))
         db.rollback()
@@ -107,8 +144,9 @@ def handle_message(db: Session, message: dict) -> str | BotReply:
         if bill_reply is not None:
             return bill_reply
         started = datetime.utcnow()
+        db.info.pop("bot_keyboard", None)
         reply = run_financial_agent(db, user, text, reference_date=message_date)
-        keyboard = (keyboard_for_recent_action(db, user.id, started)
+        keyboard = (db.info.pop("bot_keyboard", None) or keyboard_for_recent_action(db, user.id, started)
                     or bot_confirmations.keyboard_for_pending(db, user.id)
                     or _choice_keyboard(db, user.id))
         return BotReply(reply, keyboard) if keyboard else reply

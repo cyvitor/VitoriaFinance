@@ -14,7 +14,8 @@ from app.services.access_context import UserAccessContext
 from app.services.card_billing import card_invoice_is_closed, card_purchase_competence
 from app.services.monthly_projection import monthly_budget_positions, projection_budget_remaining
 from app.services.purchase_advisor import simulate_credit_purchase
-from app.services import fixed_bills
+from app.models import TelegramExpenseDraft
+from app.services import fixed_bills, fuel_followup
 from app.services.telegram_expenses import (
     ExpenseInput, cancel_expense_draft, confirm_expense_draft, create_expense_draft,
     finish_processing_queue_item, format_draft, get_active_draft,
@@ -1110,9 +1111,23 @@ def prepare_expense(db: Session, context: UserAccessContext, args: dict) -> dict
     if draft and draft.category_id and any(item in ("subcategoria", "categoria valida") for item in missing):
         missing = [item for item in missing if item not in ("subcategoria", "categoria valida")]
         category_options = []
+    summary = format_draft(draft)
+    extra = {}
+    if draft and fuel_followup.is_fuel(draft.description, draft.category):
+        details = fuel_followup.merge_details(args, args.get("_hint"))
+        if details:
+            draft.fuel_details = json.dumps(details, ensure_ascii=False)
+            db.commit()
+            summary = summary.replace("\n\nPosso registrar?",
+                                      f"\nAbastecimento: {fuel_followup.details_text(details)}\n\nPosso registrar?")
+            extra["fuel_details"] = details
+        duplicate = fuel_followup.duplicate_of(db, context, draft)
+        if duplicate:
+            extra["possible_duplicate"] = fuel_followup.transaction_label(duplicate)
+            extra["keyboard"] = fuel_followup.duplicate_keyboard(db, duplicate, draft.id)
     return {"status": "missing_information" if missing else "awaiting_confirmation",
             "missing_fields": missing, "category_options": category_options,
-            "summary": format_draft(draft), "budget_impact": _draft_budget_impact(db, context, draft)}
+            "summary": summary, "budget_impact": _draft_budget_impact(db, context, draft), **extra}
 
 
 def prepare_expenses(db: Session, context: UserAccessContext, args: dict) -> dict:
@@ -1157,28 +1172,31 @@ def confirm_expense(db: Session, context: UserAccessContext, args: dict) -> dict
     transaction = confirm_expense_draft(db, user)
     if not transaction:
         raise ToolError("Nao ha despesa aguardando confirmacao")
+    draft = db.scalar(select(TelegramExpenseDraft).where(TelegramExpenseDraft.transaction_id == transaction.id))
     finish_processing_queue_item(db, context.user_id, "confirmed")
     next_expense = _advance_expense_queue(db, context)
-    fuel_followup = False
     category = db.get(Category, transaction.category_id) if transaction.category_id else None
     category_label = f"{category.parent_name or ''} {category.name or ''}".casefold() if category else ""
     vehicles = db.scalars(select(Vehicle).where(
         Vehicle.workspace_id == transaction.workspace_id, Vehicle.is_active.is_(True),
     ).order_by(Vehicle.name)).all()
+    has_fuel_offer = False
+    fuel_prefilled = None
+    fuel_action_id = None
     if not next_expense and vehicles and any(term in category_label for term in ("combust", "gasolina", "etanol", "diesel")):
-        previous = _active_action(db, context.user_id)
-        if previous:
-            previous.status = "cancelled"; previous.resolved_at = datetime.utcnow()
-        db.add(TelegramPendingAction(
-            user_id=context.user_id, action_type="fuel_fillup", status="collecting",
-            payload=json.dumps({"phase": "offer", "transaction_id": transaction.id}, ensure_ascii=False),
-            expires_at=datetime.utcnow() + timedelta(minutes=30),
-        ))
+        details = json.loads(draft.fuel_details or "{}") if draft else {}
+        # Litros/km informados na primeira mensagem: pula a pergunta Sim/Nao e pede so o que falta.
+        phase = None if details and len(vehicles) == 1 else "offer"
+        action = fuel_followup.start_fuel_action(db, context.user_id, transaction, details, phase=phase)
         db.commit()
-        fuel_followup = True
+        fuel_action_id = action.id
+        has_fuel_offer = True
+        if phase is None:
+            fuel_prefilled = prepare_fuel_fillup(db, context, {})
     return {"registered": True, "description": transaction.description, "amount": _money(transaction.amount),
-            "next_expense": next_expense, "fuel_followup": fuel_followup,
-            "vehicles": [item.name for item in vehicles] if fuel_followup else []}
+            "next_expense": next_expense, "fuel_followup": has_fuel_offer, "fuel_action_id": fuel_action_id,
+            "fuel_prefilled": fuel_prefilled,
+            "vehicles": [item.name for item in vehicles] if has_fuel_offer else []}
 
 
 def update_expense(db: Session, context: UserAccessContext, args: dict) -> dict:
@@ -1242,8 +1260,22 @@ def cancel_expense(db: Session, context: UserAccessContext, args: dict) -> dict:
 def prepare_fuel_fillup(db: Session, context: UserAccessContext, args: dict) -> dict:
     """Completa um abastecimento pendente; a IA decide quando e com quais dados chamar."""
     action = _active_action(db, context.user_id)
+    linked = None
     if not action or action.action_type != "fuel_fillup":
-        raise ToolError("Nao ha abastecimento pendente. Primeiro registre e confirme a despesa de combustivel")
+        # Sem pedido ativo: vincula a ultima despesa de combustivel sem abastecimento (7 dias).
+        candidates = fuel_followup.link_candidates(db, context)
+        if not candidates:
+            raise ToolError("Nao encontrei despesa de combustivel sem abastecimento nos ultimos 7 dias. "
+                            "Primeiro registre e confirme a despesa de combustivel")
+        if len(candidates) > 1:
+            return {"status": "choose_expense", "deterministic": True,
+                    "message": "Qual despesa de combustível esse abastecimento completa?",
+                    "keyboard": [[{"text": f"⛽ {fuel_followup.transaction_label(item)}"[:60],
+                                   "callback_data": f"fl:{item.id}:0"}] for item in candidates[:6]]}
+        details = fuel_followup.merge_details(args, args.get("_hint"))
+        action = fuel_followup.start_fuel_action(db, context.user_id, candidates[0], details)
+        db.commit()
+        linked = fuel_followup.transaction_label(candidates[0])
     payload = json.loads(action.payload)
     transaction = db.scalar(select(Transaction).where(
         Transaction.id == payload.get("transaction_id"),
@@ -1294,7 +1326,8 @@ def prepare_fuel_fillup(db: Session, context: UserAccessContext, args: dict) -> 
     if "full_tank" not in payload: missing.append("se o tanque foi completado")
     if missing:
         db.commit()
-        return {"status": "missing_information", "missing_fields": missing,
+        return {"status": "missing_information", "missing_fields": missing, "linked_expense": linked,
+                "fuel_fillup": True, "known_values": fuel_followup.details_text(payload),
                 "vehicle_options": [item.name for item in vehicles], "known_total": _money(total)}
     previous = db.scalar(select(FuelFillup.odometer_km).where(
         FuelFillup.vehicle_id == vehicle.id,
@@ -1321,7 +1354,8 @@ def prepare_fuel_fillup(db: Session, context: UserAccessContext, args: dict) -> 
     db.commit()
     return {"status": "awaiting_confirmation", "fuel_fillup": True, "vehicle": vehicle.name,
             "odometer_km": str(odometer), "liters": str(liters), "price_per_liter": str(price),
-            "total": _money(total), "full_tank": payload["full_tank"], "calculated_fields": calculated}
+            "total": _money(total), "full_tank": payload["full_tank"], "calculated_fields": calculated,
+            "linked_expense": linked}
 
 
 def prepare_fuel_fillup_update(db: Session, context: UserAccessContext, args: dict) -> dict:

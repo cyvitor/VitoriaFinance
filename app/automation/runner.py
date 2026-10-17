@@ -5,7 +5,7 @@ from zoneinfo import ZoneInfo
 import httpx
 from sqlalchemy import select
 
-from app.automation.telegram_bot import handle_callback, handle_message
+from app.automation.telegram_bot import handle_callback, handle_message, removes_keyboard
 from app.services.fixed_bills import send_daily_reminders
 from app.database import SessionLocal
 from app.integrations.telegram import TelegramClient
@@ -33,6 +33,12 @@ def process_callback(client: TelegramClient, update: dict, callback: dict) -> No
     except Exception:
         logger.warning("telegram_answer_callback_failed update_id=%s", update_key)
     chat_id = ((callback.get("message") or {}).get("chat") or {}).get("id") or (callback.get("from") or {}).get("id")
+    message_id = (callback.get("message") or {}).get("message_id")
+    if chat_id and message_id and removes_keyboard(str(callback.get("data") or "")):
+        try:
+            client.clear_keyboard(chat_id, message_id)
+        except Exception:
+            logger.warning("telegram_clear_keyboard_failed update_id=%s", update_key)
     if chat_id and reply:
         client.send_reply(chat_id, reply)
 

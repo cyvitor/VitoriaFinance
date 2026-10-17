@@ -36,6 +36,11 @@ class TelegramClient:
         response = httpx.post(f"{self.base_url}/sendMessage", json=payload, timeout=15.0)
         response.raise_for_status()
 
+    def clear_keyboard(self, chat_id: int | str, message_id: int) -> None:
+        payload = {"chat_id": chat_id, "message_id": message_id, "reply_markup": {"inline_keyboard": []}}
+        response = httpx.post(f"{self.base_url}/editMessageReplyMarkup", json=payload, timeout=15.0)
+        response.raise_for_status()
+
     def answer_callback_query(self, callback_query_id: str, text: str | None = None) -> None:
         payload = {"callback_query_id": callback_query_id}
         if text:

@@ -117,6 +117,7 @@ class TelegramExpenseDraft(Base):
     status: Mapped[str] = mapped_column(String(30), default="awaiting_confirmation", index=True)
     expires_at: Mapped[datetime] = mapped_column(DateTime, index=True)
     transaction_id: Mapped[int | None] = mapped_column(ForeignKey("transactions.id", ondelete="SET NULL"), nullable=True)
+    fuel_details: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     person: Mapped["Person"] = relationship()

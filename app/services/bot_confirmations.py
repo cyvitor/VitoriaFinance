@@ -145,10 +145,18 @@ EXPENSE_TOOLS = {"preparar_despesa", "preparar_despesas", "atualizar_despesa", "
 
 def keyboard_after_tool(db: Session, user_id: int, tool: str, result: dict) -> list[list[dict]] | None:
     """Botoes Confirmar/Cancelar quando o resultado da ferramenta deixa algo aguardando confirmacao."""
-    if result.get("fixed_bill"):
+    if result.get("fixed_bill") or result.get("keyboard"):
         return result.get("keyboard")
     if "error" in result:
         return None
+    if result.get("fuel_followup") and result.get("fuel_action_id"):
+        from app.services import fuel_followup
+        prefilled = result.get("fuel_prefilled")
+        if prefilled and prefilled.get("status") == "awaiting_confirmation":
+            return confirm_keyboard("a", result["fuel_action_id"])
+        if prefilled:
+            return fuel_followup.skip_keyboard(result["fuel_action_id"])
+        return fuel_followup.offer_keyboard(result["fuel_action_id"])
     waiting = result.get("status") == "awaiting_confirmation" or bool(result.get("next_expense"))
     if not waiting:
         return None
