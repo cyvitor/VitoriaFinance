@@ -1,4 +1,5 @@
 """Versioned JSON API used by the native mobile application."""
+from calendar import monthrange
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 import hashlib
@@ -47,6 +48,7 @@ class TransactionPayload(BaseModel):
     category_id: int | None = None
     payment_method: str | None = Field(default=None, max_length=40)
     notes: str | None = Field(default=None, max_length=4000)
+    installments: int = Field(default=1, ge=1, le=120)
 
 
 class BudgetCreatePayload(BaseModel):
@@ -287,7 +289,7 @@ def bootstrap(area_id: int | None = None, context=Depends(_mobile_context)):
         "user": _user_json(user, db), "selected_area_id": selected,
         "areas": [{"id": item.id, "name": item.name, "person_type": item.person_type.value,
                    "can_write": item.id in writable_ids} for item in areas],
-        "accounts": [{"id": item.id, "name": item.name, "person_id": item.person_id,
+        "accounts": [{"id": item.id, "name": item.name, "bank_name": item.bank_name, "person_id": item.person_id,
                       "account_type": item.account_type.value, "initial_balance": _money(item.initial_balance),
                       "color": item.color} for item in accounts],
         "cards": [{"id": item.id, "name": item.name, "brand": item.brand,
@@ -322,7 +324,7 @@ def accounts(area_id: int | None = None, context=Depends(_mobile_context)):
     elif visible is not None:
         query = query.where(Account.person_id.in_(visible)) if visible else query.where(False)
     items = db.scalars(query.order_by(Account.name)).all()
-    return {"items": [{"id": item.id, "name": item.name, "person_id": item.person_id,
+    return {"items": [{"id": item.id, "name": item.name, "bank_name": item.bank_name, "person_id": item.person_id,
                        "account_type": item.account_type.value, "initial_balance": _money(item.initial_balance),
                        "color": item.color} for item in items]}
 
@@ -713,26 +715,47 @@ def create_transaction(payload: TransactionPayload, context=Depends(_mobile_cont
         if not category or category.kind != payload.transaction_type:
             raise HTTPException(status_code=422, detail="Categoria incompatível com o lançamento")
 
-    item = Transaction(
-        workspace_id=workspace_id,
-        transaction_type=payload.transaction_type,
-        description=payload.description,
-        amount=payload.amount,
-        transaction_date=payload.transaction_date,
-        competence_year=competence_year,
-        competence_month=competence_month,
-        status=(TransactionStatus.pending if card_credit_purchase else TransactionStatus.paid) if card else payload.status,
-        account_id=account.id if account else None,
-        destination_account_id=destination.id if destination else None,
-        card_id=card.id if card else None,
-        person_id=person_id,
-        category_id=category.id if category else None,
-        payment_method=(payload.payment_method or "Crédito") if card else payload.payment_method,
-        notes=payload.notes,
-        created_by_id=user.id,
-        source="mobile_app",
-    )
-    db.add(item)
+    installments = payload.installments if card_credit_purchase else 1
+    if payload.installments > 1 and not card_credit_purchase:
+        raise HTTPException(status_code=422, detail="Parcelamento só está disponível para compras no crédito")
+    cents = int((payload.amount * 100).quantize(Decimal("1")))
+    base_cents, remainder = divmod(cents, installments)
+    created = []
+    for index in range(installments):
+        item_year, item_month = competence_year, competence_month
+        for _ in range(index):
+            item_month += 1
+            if item_month > 12:
+                item_year, item_month = item_year + 1, 1
+        tx_date = payload.transaction_date.replace(day=min(payload.transaction_date.day, monthrange(item_year, item_month)[1]))
+        amount_cents = base_cents + (remainder if index == installments - 1 else 0)
+        description = f"{payload.description} ({index + 1}/{installments})" if installments > 1 else payload.description
+        item = Transaction(
+            workspace_id=workspace_id,
+            transaction_type=payload.transaction_type,
+            description=description,
+            amount=Decimal(amount_cents) / 100,
+            transaction_date=tx_date,
+            competence_year=item_year,
+            competence_month=item_month,
+            status=(TransactionStatus.pending if card_credit_purchase else TransactionStatus.paid) if card else payload.status,
+            account_id=account.id if account else None,
+            destination_account_id=destination.id if destination else None,
+            card_id=card.id if card else None,
+            person_id=person_id,
+            category_id=category.id if category else None,
+            payment_method=(payload.payment_method or "Crédito") if card else payload.payment_method,
+            notes=payload.notes,
+            created_by_id=user.id,
+            source="mobile_app",
+        )
+        db.add(item)
+        created.append(item)
     db.commit()
-    db.refresh(item)
-    return _transaction_json(item)
+    for item in created:
+        db.refresh(item)
+    response = _transaction_json(created[0])
+    if installments > 1:
+        response["installments"] = [_transaction_json(item) for item in created]
+        response["installment_count"] = installments
+    return response

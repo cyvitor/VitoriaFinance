@@ -259,6 +259,97 @@ def test_mobile_api_credit_card_purchase_is_pending(client):
     assert response.json()["status"] == TransactionStatus.pending.value
 
 
+def test_mobile_app_can_configure_and_confirm_a_recurring_income(client):
+    from app.models import Category, RecurrenceOccurrence
+
+    ids = create_account_fixture()
+    with SessionLocal() as db:
+        category = Category(workspace_id=ids["workspace"], name="Salário", parent_name="Receitas",
+            kind=TransactionType.income, color="#00b894")
+        db.add(category)
+        db.commit()
+        category_id = category.id
+    token = login(client)
+    rule = client.post("/api/v1/recurrences", headers=auth(token), json={
+        "transaction_type": "income", "description": "Salário mensal", "amount": "5200.00",
+        "person_id": ids["person"], "account_id": ids["account"], "category_id": category_id,
+    })
+    assert rule.status_code == 201, rule.text
+    assert rule.json()["account_id"] == ids["account"]
+    today = date.today()
+    paid = client.post(f"/api/v1/recurrences/{rule.json()['id']}/confirm", headers=auth(token), json={
+        "year": today.year, "month": today.month, "amount": "5200.00",
+        "transaction_date": today.isoformat(),
+    })
+    assert paid.status_code == 200, paid.text
+    assert paid.json()["transaction"]["status"] == "paid"
+    with SessionLocal() as db:
+        occurrence = db.query(RecurrenceOccurrence).filter_by(recurrence_rule_id=rule.json()["id"]).one()
+        assert occurrence.status == "confirmed"
+
+
+def test_mobile_card_statement_payment_and_installments(client):
+    from app.models import Card
+
+    ids = create_account_fixture()
+    with SessionLocal() as db:
+        card = Card(workspace_id=ids["workspace"], account_id=ids["account"], name="Cartão", brand="Visa",
+                    closing_day=10, due_day=20)
+        db.add(card)
+        db.commit()
+        card_id = card.id
+    token = login(client)
+    today = date.today()
+    purchase = client.post("/api/v1/transactions", headers=auth(token), json={
+        "transaction_type": "expense", "description": "Notebook", "amount": "1000.00",
+        "transaction_date": today.isoformat(), "person_id": ids["person"], "card_id": card_id,
+        "payment_method": "Crédito", "category_id": ids["category"], "installments": 4,
+    })
+    assert purchase.status_code == 201, purchase.text
+    assert purchase.json()["installment_count"] == 4
+    assert [x["amount"] for x in purchase.json()["installments"]] == ["250.00"] * 4
+    invoice_year = purchase.json()["competence_year"]
+    invoice_month = purchase.json()["competence_month"]
+    statement = client.get(f"/api/v1/cards/{card_id}/statement?year={invoice_year}&month={invoice_month}",
+                           headers=auth(token))
+    assert statement.status_code == 200, statement.text
+    assert statement.json()["credit_total"] == "250.00"
+    assert statement.json()["is_closed"] is False
+    settled = client.post(f"/api/v1/cards/{card_id}/billing/confirm?year={invoice_year}&month={invoice_month}",
+                          headers=auth(token))
+    assert settled.status_code == 200, settled.text
+    statement = client.get(f"/api/v1/cards/{card_id}/statement?year={invoice_year}&month={invoice_month}",
+                           headers=auth(token)).json()
+    assert statement["is_closed"] is True
+    assert statement["transactions"][0]["status"] == "paid"
+
+
+def test_mobile_analysis_and_assistant_history(client, monkeypatch):
+    create_account_fixture()
+    token = login(client)
+    report = client.get("/api/v1/analysis/summary?history=6&horizon=3", headers=auth(token))
+    assert report.status_code == 200, report.text
+    assert len(report.json()["monthly"]) == 6
+    assert len(report.json()["projection"]) == 3
+    monkeypatch.setattr("app.services.telegram_agent.run_financial_agent",
+        lambda db, user, text: f"Resposta local: {text}")
+    reply = client.post("/api/v1/assistant/messages", headers=auth(token), json={"message": "Oi Vitoria"})
+    assert reply.status_code == 200, reply.text
+    assert reply.json()["reply"] == "Resposta local: Oi Vitoria"
+    history = client.get("/api/v1/assistant/history", headers=auth(token)).json()["items"]
+    assert history == []
+
+
+def test_mobile_recurrence_write_respects_area_permissions(client):
+    ids = create_account_fixture(role=AccountRole.member, read_only=True)
+    token = login(client)
+    response = client.post("/api/v1/recurrences", headers=auth(token), json={
+        "transaction_type": "income", "description": "Salário", "amount": "2000.00",
+        "person_id": ids["person"], "account_id": ids["account"],
+    })
+    assert response.status_code == 403
+
+
 def test_mobile_api_transfer_appears_in_both_areas_without_changing_balance(client):
     ids = create_account_fixture()
     token = login(client)
