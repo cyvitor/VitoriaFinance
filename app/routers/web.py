@@ -11,7 +11,7 @@ from fastapi import APIRouter, Depends, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 import httpx
-from sqlalchemy import case, delete, extract, func, select
+from sqlalchemy import case, delete, extract, func, select, update
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -22,7 +22,7 @@ from app.models import (
     Transaction, TransactionStatus, TransactionType, User, UserPersonAccess, WorkspaceMember, TelegramLink,
     RecurrenceRule, RecurrenceOccurrence, AccountingPeriod, Financing, FinancingAmortization, MonthlyBudget,
     MonthlyBudgetOccurrence,
-    MemberRole, UserMemory, Workspace, Vehicle, FuelFillup,
+    MemberRole, UserMemory, Workspace, Vehicle, FuelFillup, MobileApiSession,
 )
 from app.security import hash_password, verify_password
 from app.services.card_billing import (
@@ -64,6 +64,13 @@ def render(request: Request, template: str, user=None, **context):
 
 def flash(request: Request, message: str, kind: str = "success"):
     request.session["flash"] = {"message": message, "kind": kind}
+
+
+def revoke_mobile_sessions(db: Session, user_id: int):
+    db.execute(update(MobileApiSession).where(
+        MobileApiSession.user_id == user_id,
+        MobileApiSession.revoked_at.is_(None),
+    ).values(revoked_at=datetime.utcnow()))
 
 
 def redirect(url: str):
@@ -2153,7 +2160,9 @@ def change_password(request: Request, current_password: str = Form(), new_passwo
     elif len(new_password) < 8: flash(request, "A nova senha deve ter pelo menos 8 caracteres.", "danger")
     elif new_password != confirm_password: flash(request, "A confirmação não confere.", "danger")
     else:
-        user.password_hash = hash_password(new_password); db.commit(); flash(request, "Senha alterada com sucesso.")
+        user.password_hash = hash_password(new_password)
+        revoke_mobile_sessions(db, user.id)
+        db.commit(); flash(request, "Senha alterada com sucesso.")
     return redirect("/profile")
 
 
@@ -2222,6 +2231,7 @@ def account_user_reset_password(target_id: int, request: Request, db: Session = 
         flash(request, "Altere a própria senha em Meu perfil.", "danger")
         return redirect("/account/users")
     target.password_hash = hash_password(DEFAULT_USER_PASSWORD)
+    revoke_mobile_sessions(db, target.id)
     db.commit()
     flash(request, f"Senha de {target.full_name} redefinida para {DEFAULT_USER_PASSWORD}. Peça para alterar em Meu perfil.", "warning")
     return redirect("/account/users")
