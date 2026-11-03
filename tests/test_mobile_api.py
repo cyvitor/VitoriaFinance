@@ -139,6 +139,52 @@ def test_mobile_api_creates_expense_and_updates_dashboard_and_month(client):
     assert transactions["items"][0]["id"] == saved["id"]
 
 
+def test_mobile_month_includes_budget_usage_and_projected_balance(client):
+    ids = create_account_fixture()
+    token = login(client)
+    today = date.today()
+    for description, amount, state in (("Pago", "35.90", "paid"), ("Pendente", "14.10", "pending")):
+        response = client.post("/api/v1/transactions", headers=auth(token), json={
+            "transaction_type": "expense", "description": description, "amount": amount,
+            "transaction_date": today.isoformat(), "status": state,
+            "person_id": ids["person"], "account_id": ids["account"],
+            "category_id": ids["category"],
+        })
+        assert response.status_code == 201, response.text
+
+    budget = client.post("/api/v1/budgets", headers=auth(token), json={
+        "person_id": ids["person"], "category_id": ids["category"], "amount": "100.00",
+        "start_year": today.year, "start_month": today.month, "include_in_projection": True,
+    })
+    assert budget.status_code == 201, budget.text
+    budget_id = budget.json()["id"]
+
+    response = client.get(f"/api/v1/months/{today.year}/{today.month}?area_id={ids['person']}",
+                          headers=auth(token))
+    assert response.status_code == 200
+    month = response.json()
+    assert month["opening_balance"] == "250.00"
+    assert month["closing_balance"] == "214.10"
+    assert month["projected_balance"] == "150.00"
+    assert month["budget_projection_remaining"] == "50.00"
+    assert month["budgets"] == [{
+        "id": budget_id, "person_id": ids["person"], "person_name": "Pessoal",
+        "category_id": ids["category"], "category_name": "Mercado", "parent_name": "Alimentação",
+        "start_year": today.year, "start_month": today.month,
+        "planned": "100.00", "paid": "35.90", "pending": "14.10", "spent": "50.00",
+        "remaining": "50.00", "percent": 50, "exceeded": False, "released": False,
+        "released_amount": "0.00", "include_in_projection": True,
+    }]
+
+    updated = client.patch(f"/api/v1/budgets/{budget_id}", headers=auth(token), json={
+        "amount": "120.00", "start_year": today.year, "start_month": today.month,
+        "include_in_projection": False,
+    })
+    assert updated.status_code == 200
+    assert updated.json()["amount"] == "120.00"
+    assert client.delete(f"/api/v1/budgets/{budget_id}", headers=auth(token)).status_code == 204
+
+
 def test_mobile_api_blocks_unassigned_areas_and_read_only_writes(client):
     ids = create_account_fixture(role=AccountRole.member, read_only=True)
     token = login(client)
@@ -154,6 +200,13 @@ def test_mobile_api_blocks_unassigned_areas_and_read_only_writes(client):
         "account_id": ids["account"],
     })
     assert forbidden_write.status_code == 403
+
+    forbidden_budget = client.post("/api/v1/budgets", headers=auth(token), json={
+        "person_id": ids["person"], "category_id": ids["category"], "amount": "100.00",
+        "start_year": date.today().year, "start_month": date.today().month,
+        "include_in_projection": True,
+    })
+    assert forbidden_budget.status_code == 403
 
     invalid_account = client.post("/api/v1/transactions", headers=auth(token), json={
         "transaction_type": "expense", "description": "Outra área", "amount": "10.00",

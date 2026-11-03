@@ -13,12 +13,13 @@ from sqlalchemy.orm import Session, joinedload
 from app.database import get_db
 from app.dependencies import allowed_person_ids, writable_person_ids
 from app.models import (
-    Account, AccountRole, AccountingPeriod, Category, Card, MobileApiSession, Person,
-    Transaction, TransactionStatus, TransactionType, User,
+    Account, AccountRole, AccountingPeriod, Category, Card, MobileApiSession, MonthlyBudget,
+    Person, RecurrenceOccurrence, RecurrenceRule, Transaction, TransactionStatus, TransactionType, User,
     WorkspaceMember,
 )
 from app.security import verify_password
 from app.services.card_billing import card_purchase_competence
+from app.services.monthly_projection import monthly_budget_positions, projection_budget_remaining
 
 router = APIRouter(prefix="/api/v1", tags=["mobile-api"])
 bearer = HTTPBearer(auto_error=False)
@@ -46,6 +47,22 @@ class TransactionPayload(BaseModel):
     category_id: int | None = None
     payment_method: str | None = Field(default=None, max_length=40)
     notes: str | None = Field(default=None, max_length=4000)
+
+
+class BudgetCreatePayload(BaseModel):
+    person_id: int
+    category_id: int
+    amount: Decimal = Field(gt=0, max_digits=14, decimal_places=2)
+    start_year: int = Field(ge=2000, le=2200)
+    start_month: int = Field(ge=1, le=12)
+    include_in_projection: bool = True
+
+
+class BudgetUpdatePayload(BaseModel):
+    amount: Decimal = Field(gt=0, max_digits=14, decimal_places=2)
+    start_year: int = Field(ge=2000, le=2200)
+    start_month: int = Field(ge=1, le=12)
+    include_in_projection: bool = True
 
 
 def _token_hash(token: str) -> str:
@@ -376,13 +393,14 @@ def month_view(year: int, month: int, area_id: int | None = None, context=Depend
     workspace_id = _workspace_id(db, user)
     selected = _selected_area(user, workspace_id, db, area_id)
     area_filter = _transaction_area_filter(user, workspace_id, db, selected)
-    items = db.scalars(select(Transaction).options(
+    year_items = db.scalars(select(Transaction).options(
         joinedload(Transaction.category), joinedload(Transaction.account),
     ).where(
         Transaction.workspace_id == workspace_id, area_filter,
-        Transaction.competence_year == year, Transaction.competence_month == month,
+        Transaction.competence_year == year,
         Transaction.status != TransactionStatus.cancelled,
     ).order_by(Transaction.transaction_date.desc(), Transaction.id.desc())).unique().all()
+    items = [item for item in year_items if (item.competence_month or item.transaction_date.month) == month]
     period = db.scalar(select(AccountingPeriod.id).where(
         AccountingPeriod.workspace_id == workspace_id,
         AccountingPeriod.year == year,
@@ -391,8 +409,123 @@ def month_view(year: int, month: int, area_id: int | None = None, context=Depend
     ))
     income = sum((item.amount for item in items if item.transaction_type == TransactionType.income), Decimal(0))
     expenses = sum((item.amount for item in items if item.transaction_type == TransactionType.expense), Decimal(0))
+    monthly_totals = [{
+        "income_paid": Decimal(0), "income_pending": Decimal(0),
+        "expense_paid": Decimal(0), "expense_pending": Decimal(0),
+    } for _ in range(12)]
+    for item in year_items:
+        item_month = item.competence_month or item.transaction_date.month
+        if not 1 <= item_month <= 12 or item.status not in (TransactionStatus.paid, TransactionStatus.pending):
+            continue
+        key = f"{item.transaction_type.value}_{item.status.value}"
+        if key in monthly_totals[item_month - 1]:
+            monthly_totals[item_month - 1][key] += Decimal(item.amount)
+
+    visible_ids = _visible_area_ids(user, db)
+    if selected is not None:
+        budget_person_ids = (selected,)
+    elif visible_ids is not None:
+        budget_person_ids = tuple(visible_ids)
+    else:
+        budget_person_ids = tuple(db.scalars(select(Person.id).where(
+            Person.workspace_id == workspace_id, Person.is_active.is_(True),
+        )).all())
+
+    # Mirror the web month projection: opening balance plus confirmed and pending
+    # activity, less the unspent portion of budgets that count toward projection.
+    initial_query = select(func.coalesce(func.sum(Account.initial_balance), 0)).where(
+        Account.workspace_id == workspace_id,
+    )
+    if selected is not None:
+        initial_query = initial_query.where(Account.person_id == selected)
+    elif visible_ids is not None:
+        initial_query = initial_query.where(Account.person_id.in_(visible_ids)) if visible_ids else initial_query.where(False)
+    opening_balance = Decimal(db.scalar(initial_query) or 0)
+    previous_paid = db.scalars(select(Transaction).where(
+        Transaction.workspace_id == workspace_id, area_filter,
+        Transaction.competence_year < year, Transaction.status == TransactionStatus.paid,
+    )).all()
+    opening_balance += sum((
+        Decimal(item.amount) if item.transaction_type == TransactionType.income else
+        -Decimal(item.amount) if item.transaction_type == TransactionType.expense else Decimal(0)
+        for item in previous_paid
+    ), Decimal(0))
+
+    recurrence_query = select(RecurrenceRule).where(
+        RecurrenceRule.workspace_id == workspace_id, RecurrenceRule.is_active.is_(True),
+        RecurrenceRule.description.is_not(None), RecurrenceRule.amount.is_not(None),
+    )
+    if selected is not None:
+        recurrence_query = recurrence_query.where(RecurrenceRule.person_id == selected)
+    elif visible_ids is not None:
+        recurrence_query = recurrence_query.where(RecurrenceRule.person_id.in_(visible_ids)) if visible_ids else recurrence_query.where(False)
+    recurrence_rules = db.scalars(recurrence_query).all()
+    occurrence_rows = db.execute(select(RecurrenceOccurrence, RecurrenceRule).join(
+        RecurrenceRule, RecurrenceRule.id == RecurrenceOccurrence.recurrence_rule_id,
+    ).where(RecurrenceRule.workspace_id == workspace_id, RecurrenceOccurrence.year == year)).all()
+    occurrences = {(rule.id, occurrence.month): occurrence for occurrence, rule in occurrence_rows}
+    resolved = {key for key, occurrence in occurrences.items() if occurrence.status != "partial"}
+    for rule in recurrence_rules:
+        for item_month in range(1, month + 1):
+            occurrence = occurrences.get((rule.id, item_month))
+            if (year, item_month) < (rule.created_at.year, rule.created_at.month) and not occurrence:
+                continue
+            if (rule.id, item_month) in resolved:
+                continue
+            amount = Decimal(occurrence.remaining_amount or 0) if occurrence and occurrence.status == "partial" else Decimal(rule.amount)
+            key = "income_pending" if rule.transaction_type == TransactionType.income else "expense_pending"
+            monthly_totals[item_month - 1][key] += amount
+
+    monthly_positions = {}
+    projected_balance = opening_balance
+    for item_month in range(1, month + 1):
+        positions = monthly_budget_positions(
+            db, workspace_ids=(workspace_id,), person_ids=budget_person_ids,
+            year=year, month=item_month,
+        ) if budget_person_ids else []
+        monthly_positions[item_month] = positions
+        totals = monthly_totals[item_month - 1]
+        projected_balance += totals["income_paid"] + totals["income_pending"]
+        projected_balance -= totals["expense_paid"] + totals["expense_pending"]
+        projected_balance -= projection_budget_remaining(positions)
+
+    selected_positions = monthly_positions[month]
+    budget_rows = []
+    for position in selected_positions:
+        budget = position.budget
+        related = [item for item in items if item.transaction_type == TransactionType.expense
+                   and item.person_id == budget.person_id and item.category_id == budget.category_id]
+        paid = sum((Decimal(item.amount) for item in related if item.status == TransactionStatus.paid), Decimal(0))
+        pending = sum((Decimal(item.amount) for item in related if item.status == TransactionStatus.pending), Decimal(0))
+        planned = Decimal(budget.amount)
+        budget_rows.append({
+            "id": budget.id, "person_id": budget.person_id,
+            "person_name": budget.person.name if budget.person else "Área financeira",
+            "category_id": budget.category_id,
+            "category_name": budget.category.name if budget.category else "Categoria",
+            "parent_name": budget.category.parent_name if budget.category else None,
+            "start_year": budget.start_year, "start_month": budget.start_month,
+            "planned": _money(planned), "paid": _money(paid), "pending": _money(pending),
+            "spent": _money(position.spent), "remaining": _money(position.remaining),
+            "percent": min(100, int(position.spent / planned * 100)) if planned else 0,
+            "exceeded": position.spent > planned, "released": position.is_released,
+            "released_amount": _money(position.occurrence.released_amount or 0) if position.occurrence else "0.00",
+            "include_in_projection": budget.include_in_projection,
+        })
+    selected_totals = monthly_totals[month - 1]
+    realized = selected_totals["income_paid"] - selected_totals["expense_paid"]
+    selected_opening_balance = projected_balance - (
+        selected_totals["income_paid"] + selected_totals["income_pending"]
+        - selected_totals["expense_paid"] - selected_totals["expense_pending"]
+        - projection_budget_remaining(selected_positions)
+    )
     return {"year": year, "month": month, "selected_area_id": selected, "is_closed": bool(period),
             "income": _money(income), "expenses": _money(expenses), "net": _money(income - expenses),
+            "opening_balance": _money(selected_opening_balance),
+            "closing_balance": _money(selected_opening_balance + realized),
+            "projected_balance": _money(projected_balance),
+            "budget_projection_remaining": _money(projection_budget_remaining(selected_positions)),
+            "budgets": budget_rows,
             "transactions": [_transaction_json(item) for item in items]}
 
 
@@ -443,6 +576,75 @@ def cards(area_id: int | None = None, context=Depends(_mobile_context)):
                        "account_id": item.account_id, "credit_limit": _money(item.credit_limit),
                        "closing_day": item.closing_day, "due_day": item.due_day, "color": item.color}
                       for item in items]}
+
+
+@router.post("/budgets", status_code=status.HTTP_201_CREATED)
+def create_budget(payload: BudgetCreatePayload, context=Depends(_mobile_context)):
+    user, _, db = context
+    workspace_id = _workspace_id(db, user)
+    _require_area(user, workspace_id, db, payload.person_id, write=True)
+    category = db.scalar(select(Category).where(
+        Category.id == payload.category_id, Category.workspace_id == workspace_id,
+        Category.kind == TransactionType.expense,
+    ))
+    if not category:
+        raise HTTPException(status_code=422, detail="Categoria de despesa inválida")
+    budget = db.scalar(select(MonthlyBudget).where(
+        MonthlyBudget.workspace_id == workspace_id, MonthlyBudget.person_id == payload.person_id,
+        MonthlyBudget.category_id == payload.category_id,
+    ))
+    created = budget is None
+    if created:
+        budget = MonthlyBudget(
+            workspace_id=workspace_id, person_id=payload.person_id,
+            category_id=payload.category_id, created_by_id=user.id,
+        )
+        db.add(budget)
+    budget.amount = payload.amount
+    budget.start_year = payload.start_year
+    budget.start_month = payload.start_month
+    budget.include_in_projection = payload.include_in_projection
+    budget.is_active = True
+    db.commit()
+    db.refresh(budget)
+    return {"id": budget.id, "person_id": budget.person_id, "category_id": budget.category_id,
+            "amount": _money(budget.amount), "start_year": budget.start_year,
+            "start_month": budget.start_month, "include_in_projection": budget.include_in_projection,
+            "created": created}
+
+
+@router.patch("/budgets/{budget_id}")
+def update_budget(budget_id: int, payload: BudgetUpdatePayload, context=Depends(_mobile_context)):
+    user, _, db = context
+    workspace_id = _workspace_id(db, user)
+    budget = db.scalar(select(MonthlyBudget).where(
+        MonthlyBudget.id == budget_id, MonthlyBudget.workspace_id == workspace_id,
+    ))
+    if not budget or not budget.is_active:
+        raise HTTPException(status_code=404, detail="Orçamento não encontrado")
+    _require_area(user, workspace_id, db, budget.person_id, write=True)
+    budget.amount = payload.amount
+    budget.start_year = payload.start_year
+    budget.start_month = payload.start_month
+    budget.include_in_projection = payload.include_in_projection
+    db.commit()
+    return {"id": budget.id, "person_id": budget.person_id, "category_id": budget.category_id,
+            "amount": _money(budget.amount), "start_year": budget.start_year,
+            "start_month": budget.start_month, "include_in_projection": budget.include_in_projection}
+
+
+@router.delete("/budgets/{budget_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_budget(budget_id: int, context=Depends(_mobile_context)):
+    user, _, db = context
+    workspace_id = _workspace_id(db, user)
+    budget = db.scalar(select(MonthlyBudget).where(
+        MonthlyBudget.id == budget_id, MonthlyBudget.workspace_id == workspace_id,
+    ))
+    if not budget or not budget.is_active:
+        raise HTTPException(status_code=404, detail="Orçamento não encontrado")
+    _require_area(user, workspace_id, db, budget.person_id, write=True)
+    budget.is_active = False
+    db.commit()
 
 
 @router.post("/transactions", status_code=status.HTTP_201_CREATED)
