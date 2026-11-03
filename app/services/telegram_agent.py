@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from app.models import Account, FuelFillup, Person, SystemSetting, TelegramConversationMessage, TelegramPendingAction, Transaction, User, Vehicle
 from app.logging_config import get_bot_logger
-from app.services.access_context import build_user_access_context, scope_to_principal_area
+from app.services.access_context import build_user_access_context
 from app.services.financial_tools import ToolError, execute_tool
 from app.services.llm_client import LLMConfig, LLMUnavailable, chat_completion, load_llm_config
 from app.services.telegram_ai import AIResponseFormatError, AIToolSelectionError, AIUnavailableError
@@ -27,6 +27,9 @@ WRITE_TOOLS = {
     "preparar_abastecimento",
     "preparar_correcao_abastecimento",
     "preparar_pagamento_conta_fixa", "definir_vencimento_conta_fixa",
+    "gerenciar_orcamento", "gerenciar_veiculo", "gerenciar_receita_recorrente",
+    "gerenciar_financiamento", "gerenciar_conta", "gerenciar_cartao", "gerenciar_categoria",
+    "gerenciar_conta_fixa",
 }
 
 
@@ -45,6 +48,18 @@ Ferramentas permitidas e argumentos:
 - consultar_saldo_livre: {"area":texto opcional,"planned_spending":numero opcional,"payment_method":"cash|credit" opcional,"card":texto opcional}
 - simular_compra_cartao: {"amount":numero,"card":texto opcional,"installments":inteiro opcional,"category":texto opcional,"purchase_date":"YYYY-MM-DD" opcional,"horizon_months":3|6|12 opcional,"area":texto opcional}. Ferramenta somente leitura para avaliar uma compra antes de realiza-la; nao cria despesa.
 - consultar_financiamentos: {"area":texto opcional,"include_paid":booleano opcional}
+- consultar_veiculos: {}. Lista veículos ativos/inativos e dados básicos.
+- consultar_abastecimentos: {"vehicle":texto opcional,"start_date":"AAAA-MM-DD" opcional,"end_date":"AAAA-MM-DD" opcional}. Consulta histórico de até 100 abastecimentos no período informado.
+- consultar_receitas_recorrentes: {}. Lista valores, conta de destino, área, dia de recebimento e status.
+- consultar_contas_fixas: {}. Lista contas recorrentes de saída configuradas, incluindo valor, área, vencimento e categoria.
+- gerenciar_financiamento: {"operation":"list|create|update|deactivate","description":texto opcional,"target":texto opcional,"new_description":texto opcional,"area":texto opcional,"total_installments":inteiro opcional,"paid_installments":inteiro opcional,"installment_amount":numero opcional,"financed_amount":numero opcional,"outstanding_balance":numero opcional,"institution":texto opcional,"due_day":inteiro opcional,"account":texto opcional,"category":texto opcional,"contract_type":"financing|negotiated_debt|personal_loan" opcional}. Cria também a parcela recorrente. Para amortizar use preparar_amortizacao_financiamento. Confirme antes de gravar.
+- gerenciar_conta: {"operation":"list|create","name":texto opcional,"area":texto opcional,"bank":texto opcional,"account_type":"checking|savings|investment|digital_wallet|cash" opcional,"initial_balance":numero opcional}. Informe área quando necessário. Confirme o cadastro antes de gravar.
+- gerenciar_cartao: {"operation":"list|create","name":texto opcional,"account":texto opcional,"area":texto opcional,"brand":texto opcional,"credit_limit":numero opcional,"closing_day":inteiro opcional,"due_day":inteiro opcional}. Confirme o cadastro antes de gravar.
+- gerenciar_categoria: {"operation":"list|create","name":texto opcional,"area":texto opcional,"kind":"expense|income" opcional,"parent_name":texto opcional}. Confirme o cadastro antes de gravar.
+- gerenciar_orcamento: {"operation":"create|update|deactivate|release|reactivate_month","category":texto,"amount":numero opcional,"area":texto opcional,"start_month":"AAAA-MM" opcional,"reference_month":"AAAA-MM" opcional,"include_in_projection":booleano opcional}. Use para cadastrar/ajustar/desativar orçamento, liberar o valor mensal ou reativar a reserva. Sempre confirme antes de gravar.
+- gerenciar_veiculo: {"operation":"list|create|update|deactivate","name":texto opcional,"target":texto opcional,"year":inteiro opcional,"initial_odometer_km":numero opcional,"fuel_type":texto opcional}. Para alterar ou desativar, target identifica o veículo atual. Sempre confirme antes de gravar.
+- gerenciar_receita_recorrente: {"operation":"list|create|update|deactivate","description":texto opcional,"target":texto opcional,"amount":numero opcional,"account":texto opcional,"category":texto opcional,"area":texto opcional,"due_day":inteiro opcional,"new_description":texto opcional}. Para criar, informe descrição, valor, conta de destino e dia; a área é perguntada se houver mais de uma. Sempre confirme antes de gravar.
+- gerenciar_conta_fixa: {"operation":"list|create|update|deactivate","description":texto opcional,"target":texto opcional,"amount":numero opcional,"account":texto opcional,"category":texto opcional,"area":texto opcional,"due_day":inteiro opcional,"notes":texto opcional}. Para criar, informe nome, valor e vencimento; a área é perguntada se necessária. Para editar/desativar, use o nome cadastrado e confirme antes de gravar.
 - preparar_receita: {"amount":numero opcional,"description":texto opcional,"transaction_date":"YYYY-MM-DD" opcional,"area":texto opcional,"account":texto opcional,"category":texto opcional,"payment_method":texto opcional}
 - preparar_correcao_lancamento: {"target_description":texto opcional,"target_amount":numero opcional,"target_transaction_date":"YYYY-MM-DD" opcional,"area":texto opcional,"new_description":texto opcional,"new_amount":numero opcional,"new_transaction_date":"YYYY-MM-DD" opcional,"new_category":texto opcional,"new_invoice_month":"YYYY-MM" opcional}
 - preparar_amortizacao_financiamento: {"financing":texto opcional,"new_outstanding_balance":numero opcional,"remaining_installments":inteiro opcional,"new_installment_amount":numero opcional,"amortized_amount":numero opcional,"strategy":"reduce_term|reduce_installment|reduce_both" opcional,"amortization_date":"YYYY-MM-DD" opcional,"notes":texto opcional}
@@ -109,6 +124,9 @@ def _requires_financial_tool(text: str) -> bool:
         "cartão", "cartao", "fatura", "limite", "financiamento", "amortiz", "parcela",
         "posso comprar", "posso sair", "sobrou", "livre", "registr", "paguei", "comprei",
         "categoria", "credito", "crédito", "orcamento", "orçamento",
+        "veiculo", "veículo", "abastecimento", "carro", "recebimento recorrente",
+        "salario", "salário", "mensal", "todo mes", "todo mês", "todo dia",
+        "desativar", "alterar", "atualizar", "liberar orçamento", "liberar orcamento",
     )
     return any(term in normalized for term in terms)
 
@@ -813,6 +831,36 @@ def _draft_fallback_reply(result: dict) -> str | None:
 
 
 def _fallback_tool_reply(tool_name: str, result: dict) -> str:
+    configuration_tools = {
+        "gerenciar_orcamento", "gerenciar_veiculo", "gerenciar_receita_recorrente",
+        "gerenciar_conta_fixa", "gerenciar_financiamento", "gerenciar_conta",
+        "gerenciar_cartao", "gerenciar_categoria",
+    }
+    if tool_name in configuration_tools:
+        if result.get("status") == "collecting":
+            return "Para continuar, informe: " + ", ".join(result.get("missing_fields") or []) + "."
+        if result.get("status") == "awaiting_confirmation":
+            values = result.get("preview") or {}
+            labels = {"entity": "Cadastro", "operation": "Ação", "name": "Nome", "description": "Descrição",
+                      "category": "Categoria", "amount": "Valor", "area": "Área", "account": "Conta",
+                      "due_day": "Dia", "year": "Ano", "fuel_type": "Combustível",
+                      "total_installments": "Parcelas", "installment_amount": "Valor da parcela",
+                      "credit_limit": "Limite", "reference_month": "Competência", "start_month": "Início"}
+            rows = [f"{labels[k]}: {v}" for k, v in values.items() if k in labels and v not in (None, "")]
+            return "Confira antes de salvar:\n" + "\n".join(rows) + "\nPosso confirmar?"
+        if result.get("saved"):
+            return f"{result.get('entity', 'Cadastro').replace('_', ' ').capitalize()} atualizado: {result.get('description') or result.get('name') or result.get('category') or ''}."
+    if tool_name in {"consultar_veiculos", "consultar_abastecimentos", "consultar_receitas_recorrentes",
+                     "consultar_contas_fixas", "consultar_financiamentos", "consultar_contas",
+                     "consultar_cartoes", "consultar_categorias_receita", "gerenciar_veiculo",
+                     "gerenciar_receita_recorrente", "gerenciar_financiamento", "gerenciar_conta",
+                     "gerenciar_cartao", "gerenciar_categoria"}:
+        rows = next((value for key, value in result.items() if isinstance(value, list)), None)
+        if rows is not None:
+            if not rows: return "Não encontrei cadastros para esse filtro."
+            return "Encontrei:\n" + "\n".join(
+                " · ".join(str(value) for value in row.values() if value not in (None, "", False))
+                for row in rows[:12])
     if tool_name == "simular_compra_cartao":
         return _purchase_simulation_reply(result)
     if tool_name == "consultar_gastos_cartao" and "items" in result:
@@ -1048,7 +1096,7 @@ def run_financial_agent(db: Session, user: User, text: str, reference_date: date
         logger.info("fuel_followup_local_reply user_id=%s", user.id)
         return fuel_reply
     token, model = _settings(db)
-    context = scope_to_principal_area(build_user_access_context(db, user))
+    context = build_user_access_context(db, user)
     areas = db.scalars(select(Person.name).where(Person.id.in_(context.allowed_person_ids))).all() if context.allowed_person_ids else []
     pending = _pending_context(db, user)
     memory_context = format_memory_context(relevant_memories(db, user.id, text))
@@ -1082,6 +1130,7 @@ Converta datas relativas como hoje, ontem e anteontem para YYYY-MM-DD usando a d
 Em perguntas sobre dinheiro disponivel agora, use consultar_saldo_livre com payment_method cash.
 Em perguntas sobre fechar o mes, salarios futuros ou uma consulta generica sobre credito sem intencao concreta de compra, use consultar_saldo_livre com payment_method credit quando aplicavel. Para avaliar uma compra antes de realiza-la, prefira sempre simular_compra_cartao. Reaproveite valores mencionados nos turnos recentes.
 Para amortizacao incompleta, chame preparar_amortizacao_financiamento novamente com os novos dados fornecidos.
+Para cadastrar, consultar ou alterar orçamentos, veículos, receitas recorrentes, contas fixas, contratos, contas, cartões e categorias, use as ferramentas gerenciar_* ou consultar_*; nunca responda apenas com orientação quando pedirem uma ação no sistema. Se uma ferramenta retornar dados ausentes, pergunte somente esses campos e chame a mesma ferramenta novamente. Apresente um resumo e solicite confirmação antes de qualquer gravação. A resposta afirmativa confirmará a ação pendente; uma negativa cancela. Use os nomes exatos das áreas, contas, categorias e veículos retornados pelas consultas. Todas as áreas permitidas do usuário estão disponíveis: informe a área citada e nunca acesse áreas sem permissão.
 Quando o usuario disser que pagou uma conta fixa cadastrada (luz, agua, internet, aluguel, condominio, escola, telefone, plano de saude, financiamento...), use preparar_pagamento_conta_fixa, nunca preparar_despesa. Informe bill com o nome da conta, area se ele citar a pessoa ("claro da nana" -> bill Claro, area Nana), amount somente se ele disse o valor, paid_date convertendo datas relativas e competence somente se ele indicar o mes ("e do mes atual" -> "atual"). Se a ferramenta disser que ha mais de uma conta, chame-a de novo com a area escolhida. A confirmacao usa confirmar_acao_pendente.
 Para perguntas sobre contas fixas pendentes ou a pagar, use listar_contas_fixas_pendentes. Para "a luz vence dia 10", use definir_vencimento_conta_fixa.
 Se precisar consultar dados, use uma ferramenta. Se for apenas conversa sem necessidade de dados, responda diretamente.

@@ -81,8 +81,7 @@ def ask_choice(db: Session, user: User, text: str, arguments: dict, rule, bill) 
 
 def _agent_context(db: Session, user: User):
     from app.services.access_context import build_user_access_context
-    from app.services.telegram_agent import scope_to_principal_area
-    return scope_to_principal_area(build_user_access_context(db, user))
+    return build_user_access_context(db, user)
 
 
 def _expense_reply(tool: str, result: dict) -> str:

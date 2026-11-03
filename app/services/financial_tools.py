@@ -16,6 +16,7 @@ from app.services.monthly_projection import monthly_budget_positions, projection
 from app.services.purchase_advisor import simulate_credit_purchase
 from app.models import TelegramExpenseDraft
 from app.services import fixed_bills, fuel_followup
+from app.services import conversation_crud
 from app.services.telegram_expenses import (
     ExpenseInput, cancel_expense_draft, confirm_expense_draft, create_expense_draft,
     finish_processing_queue_item, format_draft, get_active_draft,
@@ -857,6 +858,13 @@ def confirm_pending_action(db: Session, context: UserAccessContext, args: dict) 
         raise ToolError("Nao ha alteracao completa aguardando confirmacao")
     if action.action_type == fixed_bills.ACTION_TYPE:
         return fixed_bills.confirm_payment(db, context.user_id, action.id)
+    if action.action_type == "configuration_change":
+        try:
+            return conversation_crud.confirm_configuration_change(db, context, action)
+        except conversation_crud.ConfigurationError as exc:
+            raise ToolError(str(exc)) from exc
+        except (ValueError, TypeError) as exc:
+            raise ToolError("Algum dado ficou inválido. Confira os valores e tente novamente.") from exc
     if action.action_type == "fuel_fillup":
         payload = json.loads(action.payload)
         transaction = db.scalar(select(Transaction).where(
@@ -1503,6 +1511,18 @@ TOOLS = {
     "consultar_saldo_livre": calculate_free_balance,
     "simular_compra_cartao": simulate_card_purchase,
     "consultar_financiamentos": list_financings,
+    "consultar_veiculos": lambda db, context, args: conversation_crud.manage_vehicle(db, context, {"operation": "list"}),
+    "consultar_abastecimentos": lambda db, context, args: _configuration_tool(conversation_crud.query_fillups, db, context, args),
+    "consultar_receitas_recorrentes": lambda db, context, args: conversation_crud.manage_recurring_income(db, context, {"operation": "list"}),
+    "consultar_contas_fixas": lambda db, context, args: conversation_crud.manage_fixed_bill(db, context, {"operation": "list"}),
+    "gerenciar_financiamento": lambda db, context, args: _configuration_tool(conversation_crud.manage_financing, db, context, args),
+    "gerenciar_conta": lambda db, context, args: _configuration_tool(conversation_crud.manage_account, db, context, args),
+    "gerenciar_cartao": lambda db, context, args: _configuration_tool(conversation_crud.manage_card, db, context, args),
+    "gerenciar_categoria": lambda db, context, args: _configuration_tool(conversation_crud.manage_category, db, context, args),
+    "gerenciar_orcamento": lambda db, context, args: _configuration_tool(conversation_crud.manage_budget, db, context, args),
+    "gerenciar_veiculo": lambda db, context, args: _configuration_tool(conversation_crud.manage_vehicle, db, context, args),
+    "gerenciar_receita_recorrente": lambda db, context, args: _configuration_tool(conversation_crud.manage_recurring_income, db, context, args),
+    "gerenciar_conta_fixa": lambda db, context, args: _configuration_tool(conversation_crud.manage_fixed_bill, db, context, args),
     "preparar_receita": prepare_income,
     "preparar_correcao_lancamento": prepare_transaction_update,
     "preparar_amortizacao_financiamento": prepare_financing_amortization,
@@ -1531,8 +1551,37 @@ TOOLS = {
 }
 
 
+def _configuration_tool(tool, db: Session, context: UserAccessContext, args: dict) -> dict:
+    try:
+        return tool(db, context, args)
+    except conversation_crud.ConfigurationError as exc:
+        raise ToolError(str(exc)) from exc
+    except (ValueError, TypeError) as exc:
+        raise ToolError("Confira os dados informados e tente novamente.") from exc
+
+
 def execute_tool(db: Session, context: UserAccessContext, name: str, arguments: dict | None) -> dict:
     tool = TOOLS.get(name)
     if not tool:
         raise ToolError(f"Ferramenta nao permitida: {name}")
+    pending = _active_action(db, context.user_id)
+    write_tools = {
+        "preparar_receita", "preparar_correcao_lancamento", "preparar_amortizacao_financiamento",
+        "preparar_despesa", "preparar_despesas", "atualizar_despesa", "confirmar_despesa",
+        "preparar_abastecimento", "preparar_correcao_abastecimento", "preparar_pagamento_conta_fixa",
+        "definir_vencimento_conta_fixa", "gerenciar_orcamento", "gerenciar_veiculo",
+        "gerenciar_receita_recorrente", "gerenciar_conta_fixa", "gerenciar_financiamento",
+        "gerenciar_conta", "gerenciar_cartao", "gerenciar_categoria",
+    }
+    if pending and pending.action_type == "configuration_change" and name in write_tools \
+            and name not in {"confirmar_acao_pendente", "cancelar_acao_pendente"}:
+        entity_by_tool = {
+            "gerenciar_orcamento": "budget", "gerenciar_veiculo": "vehicle",
+            "gerenciar_receita_recorrente": "recurring_income", "gerenciar_conta_fixa": "fixed_bill",
+            "gerenciar_financiamento": "financing", "gerenciar_conta": "account",
+            "gerenciar_cartao": "card", "gerenciar_categoria": "category",
+        }
+        payload = json.loads(pending.payload)
+        if entity_by_tool.get(name) != payload.get("entity"):
+            raise ToolError("Há um cadastro pendente. Confirme ou cancele antes de fazer outro lançamento ou cadastro.")
     return tool(db, context, arguments or {})
