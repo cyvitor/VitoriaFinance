@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from app.models import Account, FuelFillup, Person, SystemSetting, TelegramConversationMessage, TelegramPendingAction, Transaction, User, Vehicle
 from app.logging_config import get_bot_logger
-from app.services.access_context import build_user_access_context
+from app.services.access_context import build_user_access_context, scope_to_principal_area
 from app.services.financial_tools import ToolError, execute_tool
 from app.services.llm_client import LLMConfig, LLMUnavailable, chat_completion, load_llm_config
 from app.services.telegram_ai import AIResponseFormatError, AIToolSelectionError, AIUnavailableError
@@ -1096,7 +1096,7 @@ def run_financial_agent(db: Session, user: User, text: str, reference_date: date
         logger.info("fuel_followup_local_reply user_id=%s", user.id)
         return fuel_reply
     token, model = _settings(db)
-    context = build_user_access_context(db, user)
+    context = scope_to_principal_area(build_user_access_context(db, user))
     areas = db.scalars(select(Person.name).where(Person.id.in_(context.allowed_person_ids))).all() if context.allowed_person_ids else []
     pending = _pending_context(db, user)
     memory_context = format_memory_context(relevant_memories(db, user.id, text))

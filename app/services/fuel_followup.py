@@ -216,8 +216,8 @@ def duplicate_keyboard(db: Session, transaction: Transaction, draft_id: int) -> 
 
 
 def _context(db: Session, user: User):
-    from app.services.access_context import build_user_access_context
-    return build_user_access_context(db, user)
+    from app.services.access_context import build_user_access_context, scope_to_principal_area
+    return scope_to_principal_area(build_user_access_context(db, user))
 
 
 def handle_callback(db: Session, user: User, data: str) -> BotReply | None:

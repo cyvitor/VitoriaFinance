@@ -23,11 +23,11 @@ Antes desta branch, o agente já consultava receitas, despesas, contas, cartões
 
 - Toda escrita de cadastro cria uma ação pendente. O agente apresenta um resumo e aguarda confirmação no texto; o Telegram também oferece os botões Confirmar/Cancelar.
 - Se faltarem campos, o agente pergunta apenas o que falta e retoma a mesma ação no turno seguinte.
-- O agente usa todas as áreas que o usuário pode acessar; operações de escrita continuam limitadas às áreas com permissão de escrita. A antiga limitação à área principal foi removida.
+- O agente e o Telegram usam sempre a área financeira padrão do usuário logado, mesmo que o app/web permitam trocar de área. As ferramentas mantêm a validação de permissão de leitura/escrita sobre essa área.
 - Uma ação pendente diferente ou um lançamento ainda aguardando confirmação impede iniciar outro cadastro, para não sobrescrever nem perder a confirmação anterior.
 - Configurações administrativas do provedor de IA, tokens do Telegram, senhas e gerenciamento de usuários permanecem fora das ferramentas financeiras conversacionais.
 
 ## Limites
 
 - Histórico de abastecimento retorna até 100 itens por consulta.
-- A análise e a alteração dependem do usuário informar nomes suficientemente claros quando há cadastros homônimos; o agente deve perguntar pela área/categoria/conta para desambiguar.
+- A análise e a alteração dependem do usuário informar nomes suficientemente claros quando há cadastros homônimos; o agente deve perguntar pela categoria/conta para desambiguar.
