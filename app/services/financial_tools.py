@@ -7,13 +7,14 @@ from sqlalchemy import case, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.models import (
-    Account, Card, Category, Financing, FinancingAmortization, Person, RecurrenceOccurrence, RecurrenceRule,
+    Account, Card, Category, FinancialGoal, Financing, FinancingAmortization, Person, RecurrenceOccurrence, RecurrenceRule,
     FuelFillup, TelegramPendingAction, Transaction, TransactionStatus, TransactionType, User, Vehicle,
 )
 from app.services.access_context import UserAccessContext
 from app.services.card_billing import card_invoice_is_closed, card_purchase_competence
 from app.services.monthly_projection import monthly_budget_positions, projection_budget_remaining
 from app.services.purchase_advisor import simulate_credit_purchase
+from app.services.smart_goals import build_goal
 from app.models import TelegramExpenseDraft
 from app.services import fixed_bills, fuel_followup
 from app.services import conversation_crud
@@ -858,6 +859,24 @@ def confirm_pending_action(db: Session, context: UserAccessContext, args: dict) 
         raise ToolError("Nao ha alteracao completa aguardando confirmacao")
     if action.action_type == fixed_bills.ACTION_TYPE:
         return fixed_bills.confirm_payment(db, context.user_id, action.id)
+    if action.action_type == "smart_goal":
+        payload = json.loads(action.payload)
+        person = db.scalar(select(Person).where(Person.id == payload["person_id"],
+            Person.workspace_id.in_(context.writable_workspace_ids),
+            Person.id.in_(context.writable_person_ids)))
+        if not person:
+            action.status = "cancelled"; action.resolved_at = datetime.utcnow(); db.commit()
+            raise ToolError("A área da meta mudou ou não está mais disponível")
+        goal = FinancialGoal(workspace_id=person.workspace_id, person_id=person.id, user_id=context.user_id,
+            goal_type=payload["goal_type"], title=payload["title"], sentence=payload["sentence"],
+            target_amount=Decimal(payload["target_amount"]) if payload.get("target_amount") else None,
+            weekly_amount=Decimal(payload["weekly_amount"]) if payload.get("weekly_amount") else None,
+            days_per_week=payload.get("days_per_week"), hour_label=payload.get("hour"),
+            start_date=date.fromisoformat(payload["start_date"]), end_date=date.fromisoformat(payload["end_date"]),
+            weeks=int(payload["weeks"]), is_tight=bool(payload.get("is_tight")), status="active")
+        db.add(goal); action.status = "confirmed"; action.resolved_at = datetime.utcnow(); db.commit()
+        return {"registered": True, "smart_goal": True, "sentence": goal.sentence,
+            "weekly_amount": _money(goal.weekly_amount) if goal.weekly_amount else None}
     if action.action_type == "configuration_change":
         try:
             return conversation_crud.confirm_configuration_change(db, context, action)
@@ -1497,6 +1516,49 @@ def simulate_card_purchase(db: Session, context: UserAccessContext, args: dict) 
         raise ToolError(str(exc)) from exc
 
 
+def prepare_smart_goal(db: Session, context: UserAccessContext, args: dict) -> dict:
+    if not context.can_write or not context.default_person_id:
+        raise ToolError("Escolha uma área financeira principal com permissão de escrita para criar o plano")
+    person = db.scalar(select(Person).where(Person.id == context.default_person_id,
+        Person.workspace_id.in_(context.writable_workspace_ids), Person.id.in_(context.writable_person_ids)))
+    if not person:
+        raise ToolError("A área principal não está disponível para escrita")
+    proposal = build_goal(str(args.get("text") or ""), date.today())
+    if proposal["status"] == "invalid":
+        return {"status": "invalid", "summary": proposal["summary"]}
+    if proposal["status"] == "missing":
+        return {"status": "missing_information", "missing_fields": proposal["missing_fields"],
+            "summary": "Ainda falta " + proposal["missing_fields"][0] + "."}
+    totals = dict(db.execute(select(Transaction.transaction_type, func.coalesce(func.sum(Transaction.amount), 0)).where(
+        Transaction.workspace_id == person.workspace_id, Transaction.person_id == person.id,
+        Transaction.status == TransactionStatus.paid,
+        Transaction.transaction_date >= date.today() - timedelta(days=183),
+        Transaction.transaction_type.in_([TransactionType.income, TransactionType.expense]),
+    ).group_by(Transaction.transaction_type)).all())
+    monthly_surplus = max(Decimal(0), Decimal(totals.get(TransactionType.income, 0))-
+        Decimal(totals.get(TransactionType.expense, 0))) / Decimal(6)
+    weekly = Decimal(proposal["weekly_amount"]) if proposal.get("weekly_amount") else Decimal(0)
+    is_tight = bool(weekly and weekly > monthly_surplus / Decimal("4.33"))
+    previous = _active_action(db, context.user_id)
+    if previous:
+        previous.status = "cancelled"; previous.resolved_at = datetime.utcnow()
+    payload = {"workspace_id": person.workspace_id, "person_id": person.id,
+        "goal_type": proposal["goal_type"], "title": proposal["title"], "sentence": proposal["sentence"],
+        "target_amount": proposal["target_amount"], "weekly_amount": proposal["weekly_amount"],
+        "days_per_week": proposal["days_per_week"], "hour": proposal["hour"],
+        "start_date": date.today().isoformat(), "end_date": proposal["end_date"], "weeks": proposal["weeks"],
+        "is_tight": is_tight}
+    db.add(TelegramPendingAction(user_id=context.user_id, action_type="smart_goal",
+        status="awaiting_confirmation", payload=json.dumps(payload, ensure_ascii=False),
+        expires_at=datetime.utcnow()+timedelta(hours=12)))
+    db.commit()
+    return {"status": "awaiting_confirmation", "smart_goal": True, "saved": False,
+        "sentence": proposal["sentence"], "weekly_amount": proposal["weekly_amount"],
+        "weeks": proposal["weeks"], "end_date": proposal["end_date"],
+        "is_tight": is_tight,
+        "summary": proposal["sentence"] + (" Esse ritmo supera a sobra média dos últimos seis meses." if is_tight else "") + " Posso guardar?"}
+
+
 TOOLS = {
     "listar_areas_financeiras": list_financial_areas,
     "consultar_contas": list_accounts,
@@ -1523,6 +1585,7 @@ TOOLS = {
     "gerenciar_veiculo": lambda db, context, args: _configuration_tool(conversation_crud.manage_vehicle, db, context, args),
     "gerenciar_receita_recorrente": lambda db, context, args: _configuration_tool(conversation_crud.manage_recurring_income, db, context, args),
     "gerenciar_conta_fixa": lambda db, context, args: _configuration_tool(conversation_crud.manage_fixed_bill, db, context, args),
+    "preparar_meta_smart": prepare_smart_goal,
     "preparar_receita": prepare_income,
     "preparar_correcao_lancamento": prepare_transaction_update,
     "preparar_amortizacao_financiamento": prepare_financing_amortization,
@@ -1572,6 +1635,7 @@ def execute_tool(db: Session, context: UserAccessContext, name: str, arguments: 
         "definir_vencimento_conta_fixa", "gerenciar_orcamento", "gerenciar_veiculo",
         "gerenciar_receita_recorrente", "gerenciar_conta_fixa", "gerenciar_financiamento",
         "gerenciar_conta", "gerenciar_cartao", "gerenciar_categoria",
+        "preparar_meta_smart",
     }
     if pending and pending.action_type == "configuration_change" and name in write_tools \
             and name not in {"confirmar_acao_pendente", "cancelar_acao_pendente"}:

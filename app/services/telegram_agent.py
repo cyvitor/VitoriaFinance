@@ -30,6 +30,7 @@ WRITE_TOOLS = {
     "gerenciar_orcamento", "gerenciar_veiculo", "gerenciar_receita_recorrente",
     "gerenciar_financiamento", "gerenciar_conta", "gerenciar_cartao", "gerenciar_categoria",
     "gerenciar_conta_fixa",
+    "preparar_meta_smart",
 }
 
 
@@ -60,6 +61,7 @@ Ferramentas permitidas e argumentos:
 - gerenciar_veiculo: {"operation":"list|create|update|deactivate","name":texto opcional,"target":texto opcional,"year":inteiro opcional,"initial_odometer_km":numero opcional,"fuel_type":texto opcional}. Para alterar ou desativar, target identifica o veículo atual. Sempre confirme antes de gravar.
 - gerenciar_receita_recorrente: {"operation":"list|create|update|deactivate","description":texto opcional,"target":texto opcional,"amount":numero opcional,"account":texto opcional,"category":texto opcional,"area":texto opcional,"due_day":inteiro opcional,"new_description":texto opcional}. Para criar, informe descrição, valor, conta de destino e dia; a área é perguntada se houver mais de uma. Sempre confirme antes de gravar.
 - gerenciar_conta_fixa: {"operation":"list|create|update|deactivate","description":texto opcional,"target":texto opcional,"amount":numero opcional,"account":texto opcional,"category":texto opcional,"area":texto opcional,"due_day":inteiro opcional,"notes":texto opcional}. Para criar, informe nome, valor e vencimento; a área é perguntada se necessária. Para editar/desativar, use o nome cadastrado e confirme antes de gravar.
+- preparar_meta_smart: {"text":texto}. Use quando o usuário quiser planejar uma viagem ou compra com um valor e prazo, ou definir um hábito mensurável. Pergunte apenas o dado essencial que faltar; a ferramenta monta a meta e só salva depois de confirmação explícita.
 - preparar_receita: {"amount":numero opcional,"description":texto opcional,"transaction_date":"YYYY-MM-DD" opcional,"area":texto opcional,"account":texto opcional,"category":texto opcional,"payment_method":texto opcional}
 - preparar_correcao_lancamento: {"target_description":texto opcional,"target_amount":numero opcional,"target_transaction_date":"YYYY-MM-DD" opcional,"area":texto opcional,"new_description":texto opcional,"new_amount":numero opcional,"new_transaction_date":"YYYY-MM-DD" opcional,"new_category":texto opcional,"new_invoice_month":"YYYY-MM" opcional}
 - preparar_amortizacao_financiamento: {"financing":texto opcional,"new_outstanding_balance":numero opcional,"remaining_installments":inteiro opcional,"new_installment_amount":numero opcional,"amortized_amount":numero opcional,"strategy":"reduce_term|reduce_installment|reduce_both" opcional,"amortization_date":"YYYY-MM-DD" opcional,"notes":texto opcional}
@@ -126,6 +128,7 @@ def _requires_financial_tool(text: str) -> bool:
         "categoria", "credito", "crédito", "orcamento", "orçamento",
         "veiculo", "veículo", "abastecimento", "carro", "recebimento recorrente",
         "salario", "salário", "mensal", "todo mes", "todo mês", "todo dia",
+        "meta", "planejar", "planejamento", "objetivo financeiro",
         "desativar", "alterar", "atualizar", "liberar orçamento", "liberar orcamento",
     )
     return any(term in normalized for term in terms)
@@ -555,10 +558,9 @@ def _select_decision(token: str, model: str, messages: list[dict], text: str) ->
 
 
 def _conversation_history(db: Session, user_id: int) -> list[dict]:
-    items = db.scalars(select(TelegramConversationMessage).where(
-        TelegramConversationMessage.user_id == user_id
-    ).order_by(TelegramConversationMessage.id.desc()).limit(12)).all()
-    return [{"role": item.role, "content": item.content[:2000]} for item in reversed(items)]
+    """Janela limitada (N mensagens e orcamento de caracteres, configuraveis no admin); so mensagens concluidas."""
+    from app.services.chat_history import model_window
+    return [{"role": item.role, "content": item.content} for item in model_window(db, user_id)]
 
 
 def _pending_context(db: Session, user: User) -> str:
@@ -1074,14 +1076,28 @@ Retorne SOMENTE JSON: {"category":"opção exata ou null","confidence":0.0}."""
     return None
 
 
-def run_financial_agent(db: Session, user: User, text: str, reference_date: date | None = None) -> str:
+def _user_message(user: User, text: str, channel: str, existing: TelegramConversationMessage | None,
+                  stored: str | None) -> TelegramConversationMessage:
+    """The user's turn: reuse the row already saved by the app (async audio) or create a new one."""
+    content = (stored or text)[:4000]
+    if existing is not None:
+        existing.content = content
+        return existing
+    return TelegramConversationMessage(user_id=user.id, role="user", content=content, channel=channel)
+
+
+def run_financial_agent(db: Session, user: User, text: str, reference_date: date | None = None, channel: str = "telegram",
+                        user_message: TelegramConversationMessage | None = None,
+                        stored_user_content: str | None = None) -> str:
+    """``user_message``/``stored_user_content`` let the app keep one chat row for an audio message:
+    the model receives ``text`` (internal prompt) while the history stores ``stored_user_content``."""
     reference_date = reference_date or date.today()
     explicit_preference_reply = _store_explicit_preference(db, user, text)
     if explicit_preference_reply:
         db.add_all([
-            TelegramConversationMessage(user_id=user.id, role="user", content=text[:4000]),
+            _user_message(user, text, channel, user_message, stored_user_content),
             TelegramConversationMessage(
-                user_id=user.id, role="assistant", content=explicit_preference_reply,
+                user_id=user.id, role="assistant", content=explicit_preference_reply, channel=channel,
             ),
         ])
         db.commit()
@@ -1090,8 +1106,8 @@ def run_financial_agent(db: Session, user: User, text: str, reference_date: date
     from app.services import fuel_followup
     fuel_reply = fuel_followup.local_text_reply(db, user, text)
     if fuel_reply:
-        db.add_all([TelegramConversationMessage(user_id=user.id, role="user", content=text[:4000]),
-                    TelegramConversationMessage(user_id=user.id, role="assistant", content=fuel_reply[:4000])])
+        db.add_all([_user_message(user, text, channel, user_message, stored_user_content),
+                    TelegramConversationMessage(user_id=user.id, role="assistant", content=fuel_reply[:4000], channel=channel)])
         db.commit()
         logger.info("fuel_followup_local_reply user_id=%s", user.id)
         return fuel_reply
@@ -1130,7 +1146,7 @@ Converta datas relativas como hoje, ontem e anteontem para YYYY-MM-DD usando a d
 Em perguntas sobre dinheiro disponivel agora, use consultar_saldo_livre com payment_method cash.
 Em perguntas sobre fechar o mes, salarios futuros ou uma consulta generica sobre credito sem intencao concreta de compra, use consultar_saldo_livre com payment_method credit quando aplicavel. Para avaliar uma compra antes de realiza-la, prefira sempre simular_compra_cartao. Reaproveite valores mencionados nos turnos recentes.
 Para amortizacao incompleta, chame preparar_amortizacao_financiamento novamente com os novos dados fornecidos.
-Para cadastrar, consultar ou alterar orçamentos, veículos, receitas recorrentes, contas fixas, contratos, contas, cartões e categorias, use as ferramentas gerenciar_* ou consultar_*; nunca responda apenas com orientação quando pedirem uma ação no sistema. Se uma ferramenta retornar dados ausentes, pergunte somente esses campos e chame a mesma ferramenta novamente. Apresente um resumo e solicite confirmação antes de qualquer gravação. A resposta afirmativa confirmará a ação pendente; uma negativa cancela. Use os nomes exatos das áreas, contas, categorias e veículos retornados pelas consultas. Todas as áreas permitidas do usuário estão disponíveis: informe a área citada e nunca acesse áreas sem permissão.
+Para cadastrar, consultar ou alterar orçamentos, veículos, receitas recorrentes, contas fixas, contratos, contas, cartões e categorias, use as ferramentas gerenciar_* ou consultar_*; nunca responda apenas com orientação quando pedirem uma ação no sistema. Para criar um plano SMART de compra ou viagem, use preparar_meta_smart com o texto original do usuário; preserve os valores, apresente o ritmo semanal e peça confirmação antes de guardar. Pergunte apenas o dado essencial que faltar. A meta pertence à área principal com escrita do usuário e não registra nem reserva dinheiro automaticamente. Se uma ferramenta retornar dados ausentes, pergunte somente esses campos e chame a mesma ferramenta novamente. Apresente um resumo e solicite confirmação antes de qualquer gravação. A resposta afirmativa confirmará a ação pendente; uma negativa cancela. Use os nomes exatos das áreas, contas, categorias e veículos retornados pelas consultas. Todas as áreas permitidas do usuário estão disponíveis: informe a área citada e nunca acesse áreas sem permissão.
 Quando o usuario disser que pagou uma conta fixa cadastrada (luz, agua, internet, aluguel, condominio, escola, telefone, plano de saude, financiamento...), use preparar_pagamento_conta_fixa, nunca preparar_despesa. Informe bill com o nome da conta, area se ele citar a pessoa ("claro da nana" -> bill Claro, area Nana), amount somente se ele disse o valor, paid_date convertendo datas relativas e competence somente se ele indicar o mes ("e do mes atual" -> "atual"). Se a ferramenta disser que ha mais de uma conta, chame-a de novo com a area escolhida. A confirmacao usa confirmar_acao_pendente.
 Para perguntas sobre contas fixas pendentes ou a pagar, use listar_contas_fixas_pendentes. Para "a luz vence dia 10", use definir_vencimento_conta_fixa.
 Se precisar consultar dados, use uma ferramenta. Se for apenas conversa sem necessidade de dados, responda diretamente.
@@ -1154,11 +1170,11 @@ Retorne SOMENTE JSON valido em um destes formatos:
     else:
         decision = _select_decision(token, model, selector_messages, text)
         decision = _enforce_fixed_bill_intent(db, user, text, decision)
-    db.add(TelegramConversationMessage(user_id=user.id, role="user", content=text[:4000]))
+    db.add(_user_message(user, text, channel, user_message, stored_user_content))
     if decision.get("action") == "ask_choice":
         reply = str(decision.get("reply") or "")[:4000]
         db.info["bot_keyboard"] = decision.get("keyboard")
-        db.add(TelegramConversationMessage(user_id=user.id, role="assistant", content=reply))
+        db.add(TelegramConversationMessage(user_id=user.id, role="assistant", content=reply, channel=channel))
         db.commit()
         return reply
     if decision.get("action") == "respond":
@@ -1245,7 +1261,7 @@ apresente o saldo livre e a projecao mensal e pergunte o valor aproximado e como
             reply = _balance_snapshot_reply(result, ask_for_details=True)[:4000]
     else:
         raise AIUnavailableError("O modelo nao selecionou uma acao valida")
-    db.add(TelegramConversationMessage(user_id=user.id, role="assistant", content=reply))
+    db.add(TelegramConversationMessage(user_id=user.id, role="assistant", content=reply, channel=channel))
     logger.debug("agent_reply user_id=%s reply=%r", user.id, reply)
     db.flush()
     _extract_memories(db, user, token, model)

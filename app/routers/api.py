@@ -21,6 +21,7 @@ from app.models import (
 from app.security import verify_password
 from app.services.card_billing import card_purchase_competence
 from app.services.monthly_projection import monthly_budget_positions, projection_budget_remaining
+from app.services.accounting_periods import current_open_month
 
 router = APIRouter(prefix="/api/v1", tags=["mobile-api"])
 bearer = HTTPBearer(auto_error=False)
@@ -285,8 +286,10 @@ def bootstrap(area_id: int | None = None, context=Depends(_mobile_context)):
     )).all()
     writable = writable_person_ids(user, db)
     writable_ids = allowed if writable is None else set(writable)
+    open_year, open_month = current_open_month(db, workspace_id)
     return {
         "user": _user_json(user, db), "selected_area_id": selected,
+        "open_month": {"year": open_year, "month": open_month},
         "areas": [{"id": item.id, "name": item.name, "person_type": item.person_type.value,
                    "can_write": item.id in writable_ids} for item in areas],
         "accounts": [{"id": item.id, "name": item.name, "bank_name": item.bank_name, "person_id": item.person_id,

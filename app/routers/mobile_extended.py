@@ -1,16 +1,20 @@
 """Additional native-app endpoints for finance workflows already available on web."""
-from datetime import date, datetime
+import logging
+import threading
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Header, HTTPException, Query, UploadFile, status
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from sqlalchemy import select
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session, joinedload, sessionmaker
 
 from app.database import get_db
 from app.dependencies import allowed_person_ids, writable_person_ids
 from app.models import (
-    Account, AccountType, AccountingPeriod, Card, CardBillingPeriod, Category, Financing,
+    Account, AccountType, AccountingPeriod, Card, CardBillingPeriod, Category, ChatMedia, FinancialGoal, Financing,
     FinancingAmortization, FuelFillup, MonthlyBudget, MonthlyBudgetOccurrence, Person, PersonType,
     RecurrenceOccurrence, RecurrenceRule, SystemSetting, TelegramConversationMessage,
     Transaction, TransactionStatus, TransactionType, User, UserMemory, Vehicle, WorkspaceMember,
@@ -19,14 +23,19 @@ from app.routers.api import (
     _account, _mobile_context, _money, _require_area, _selected_area, _transaction_area_filter,
     _user_json, _workspace_id, _visible_area_ids,
 )
+from app.services.chat_history import model_window
 from app.services.card_billing import card_invoice_is_closed, card_purchase_competence
 from app.services.monthly_projection import monthly_budget_positions
+from app.services.accounting_periods import current_open_month
+from app.services.chat_media import (IMAGE_TRANSCRIPT_PREFIX, MAX_MEDIA_BYTES, MediaProcessingError, describe_receipt,
+    read_bytes as read_private_media, store_bytes, synthesize_speech, transcribe_audio)
 from app.services.recurrence_payments import (
     RecurrenceAlreadyResolved, apply_recurrence_confirmation, find_occurrence, remaining_amount,
 )
 from app.security import hash_password, verify_password
 
 router = APIRouter(prefix="/api/v1", tags=["mobile-api"])
+logger = logging.getLogger(__name__)
 
 
 class RecurrencePayload(BaseModel):
@@ -57,6 +66,25 @@ class ChatMessage(BaseModel):
     message: str = Field(min_length=1, max_length=4000)
 
 
+class GoalPayload(BaseModel):
+    goal_type: str = Field(pattern=r"^(purchase|habit)$")
+    title: str = Field(min_length=1, max_length=180)
+    sentence: str = Field(min_length=1, max_length=2000)
+    target_amount: Decimal | None = Field(default=None, gt=0, max_digits=14, decimal_places=2)
+    weekly_amount: Decimal | None = Field(default=None, gt=0, max_digits=14, decimal_places=2)
+    days_per_week: int | None = Field(default=None, ge=1, le=7)
+    hour_label: str | None = Field(default=None, pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
+    start_date: date
+    end_date: date
+    weeks: int = Field(ge=1, le=520)
+    is_tight: bool = False
+    person_id: int
+
+
+class GoalProgressPayload(BaseModel):
+    amount: Decimal = Field(gt=0, max_digits=14, decimal_places=2)
+
+
 class AccountPayload(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     bank_name: str = Field(default="", max_length=120)
@@ -85,6 +113,7 @@ class CardPayload(BaseModel):
 
 class FinancingPayload(BaseModel):
     description: str = Field(min_length=1, max_length=180)
+    contract_type: str = Field(default="financing", pattern=r"^(financing|negotiated_debt|personal_loan)$")
     person_id: int
     total_installments: int = Field(ge=1)
     paid_installments: int = Field(default=0, ge=0)
@@ -96,6 +125,7 @@ class FinancingPayload(BaseModel):
     account_id: int | None = None
     category_id: int | None = None
     due_day: int | None = Field(default=None, ge=1, le=31)
+    start_date: date | None = None
     notes: str | None = Field(default=None, max_length=4000)
 
 
@@ -114,6 +144,10 @@ class VehiclePayload(BaseModel):
     year: int | None = Field(default=None, ge=1900, le=2200)
     initial_odometer_km: Decimal = Field(default=Decimal(0), ge=0, max_digits=12, decimal_places=1)
     fuel_type: str | None = Field(default=None, max_length=40)
+
+
+class VehicleUpdatePayload(VehiclePayload):
+    is_active: bool = True
 
 
 class FuelPayload(BaseModel):
@@ -354,6 +388,7 @@ def future_transactions(area_id: int | None = None, context=Depends(_mobile_cont
     selected = _selected_area(user, workspace_id, db, area_id)
     query = select(Transaction).options(joinedload(Transaction.category), joinedload(Transaction.account)).where(
         Transaction.workspace_id == workspace_id, Transaction.status == TransactionStatus.pending,
+        Transaction.card_id.is_(None),
         _transaction_area_filter(user, workspace_id, db, selected),
     ).order_by(Transaction.transaction_date, Transaction.id)
     from app.routers.api import _transaction_json
@@ -720,14 +755,15 @@ def create_financing(payload: FinancingPayload, context=Depends(_mobile_context)
     if category and (category.workspace_id != workspace_id or category.kind != TransactionType.expense):
         raise HTTPException(422, "Categoria de despesa inválida")
     rule = RecurrenceRule(workspace_id=workspace_id, frequency="monthly", transaction_type=TransactionType.expense,
-        start_date=date.today().replace(day=1),
+        start_date=(payload.start_date or date.today()).replace(day=1),
         description=f"{payload.description.strip()} - parcela {payload.paid_installments+1}/{payload.total_installments}",
         amount=payload.installment_amount, account_id=payload.account_id, person_id=payload.person_id,
         category_id=payload.category_id, notes=payload.notes, created_by_id=user.id, is_active=True)
     db.add(rule)
     db.flush()
     item = Financing(workspace_id=workspace_id, person_id=payload.person_id, recurrence_rule_id=rule.id,
-        description=payload.description.strip(), paid_installments=payload.paid_installments,
+        description=payload.description.strip(), contract_type=payload.contract_type, start_date=payload.start_date,
+        paid_installments=payload.paid_installments,
         total_installments=payload.total_installments, installment_amount=payload.installment_amount,
         financed_amount=payload.financed_amount, outstanding_balance=payload.outstanding_balance,
         nominal_interest_rate=payload.nominal_interest_rate,
@@ -753,6 +789,10 @@ def financing_detail(financing_id: int, context=Depends(_mobile_context)):
         FinancingAmortization.financing_id == item.id).order_by(
             FinancingAmortization.amortization_date.desc(), FinancingAmortization.id.desc())).all()
     return {"financing": {"id": item.id, "description": item.description,
+        "contract_type": item.contract_type, "institution": item.institution,
+        "financed_amount": _money(item.financed_amount), "nominal_interest_rate": str(item.nominal_interest_rate) if item.nominal_interest_rate is not None else None,
+        "due_day": item.due_day, "start_date": item.start_date.isoformat() if item.start_date else None,
+        "notes": item.notes,
         "person_id": item.person_id, "paid_installments": item.paid_installments,
         "total_installments": item.total_installments, "installment_amount": _money(item.installment_amount),
         "outstanding_balance": _money(item.outstanding_balance), "status": item.status},
@@ -817,14 +857,44 @@ def list_vehicles(context=Depends(_mobile_context)):
 def create_vehicle(payload: VehiclePayload, context=Depends(_mobile_context)):
     user, _, db = context
     workspace_id = _workspace_id(db, user)
-    if not (user.is_super_admin or user.account_role.value == "admin"):
-        raise HTTPException(403, "Somente administradores podem cadastrar veículos")
     item = Vehicle(workspace_id=workspace_id, name=payload.name.strip(), year=payload.year,
         initial_odometer_km=payload.initial_odometer_km, fuel_type=payload.fuel_type)
     db.add(item)
     db.commit()
     db.refresh(item)
     return {"id": item.id, "name": item.name, "is_active": item.is_active}
+
+
+@router.patch("/vehicles/{vehicle_id}")
+def update_vehicle(vehicle_id: int, payload: VehicleUpdatePayload, context=Depends(_mobile_context)):
+    user, _, db = context
+    workspace_id = _workspace_id(db, user)
+    item = db.scalar(select(Vehicle).where(Vehicle.id == vehicle_id, Vehicle.workspace_id == workspace_id))
+    if not item:
+        raise HTTPException(404, "Veículo não encontrado")
+    latest_odometer = db.scalar(select(FuelFillup.odometer_km).where(
+        FuelFillup.vehicle_id == item.id).order_by(FuelFillup.odometer_km.desc()))
+    if latest_odometer is not None and payload.initial_odometer_km > latest_odometer:
+        raise HTTPException(422, "A quilometragem inicial não pode superar um abastecimento registrado")
+    item.name = payload.name.strip()
+    item.year = payload.year
+    item.initial_odometer_km = payload.initial_odometer_km
+    item.fuel_type = payload.fuel_type
+    item.is_active = payload.is_active
+    db.commit()
+    return {"id": item.id, "name": item.name, "is_active": item.is_active}
+
+
+@router.delete("/vehicles/{vehicle_id}", status_code=status.HTTP_204_NO_CONTENT)
+def deactivate_vehicle(vehicle_id: int, context=Depends(_mobile_context)):
+    user, _, db = context
+    workspace_id = _workspace_id(db, user)
+    item = db.scalar(select(Vehicle).where(Vehicle.id == vehicle_id, Vehicle.workspace_id == workspace_id))
+    if not item:
+        raise HTTPException(404, "Veículo não encontrado")
+    item.is_active = False
+    db.commit()
+    return None
 
 
 @router.post("/fuel-fillups", status_code=status.HTTP_201_CREATED)
@@ -968,22 +1038,352 @@ def analysis_summary(area_id: int | None = None,
         "projection": projections}
 
 
-@router.get("/assistant/history")
-def assistant_history(limit: int = Query(default=50, ge=1, le=100), context=Depends(_mobile_context)):
+@router.get("/goals")
+def list_goals(area_id: int | None = None, context=Depends(_mobile_context)):
     user, _, db = context
-    rows = db.scalars(select(TelegramConversationMessage).where(
-        TelegramConversationMessage.user_id == user.id,
-    ).order_by(TelegramConversationMessage.id.desc()).limit(limit)).all()
-    return {"items": [{"id": item.id, "role": item.role, "content": item.content,
-        "created_at": item.created_at.isoformat()} for item in reversed(rows)]}
+    workspace_id = _workspace_id(db, user)
+    selected = _selected_area(user, workspace_id, db, area_id)
+    query = select(FinancialGoal).where(FinancialGoal.user_id == user.id,
+        FinancialGoal.workspace_id == workspace_id)
+    if selected is not None:
+        query = query.where(FinancialGoal.person_id == selected)
+    rows = db.scalars(query.order_by(FinancialGoal.status, FinancialGoal.end_date)).all()
+    return {"items": [{"id": g.id, "person_id": g.person_id, "goal_type": g.goal_type,
+        "title": g.title, "sentence": g.sentence, "target_amount": _money(g.target_amount),
+        "saved_amount": _money(g.saved_amount), "weekly_amount": _money(g.weekly_amount),
+        "days_per_week": g.days_per_week, "hour_label": g.hour_label,
+        "start_date": g.start_date.isoformat(), "end_date": g.end_date.isoformat(),
+        "weeks": g.weeks, "status": g.status, "is_tight": g.is_tight} for g in rows]}
+
+
+@router.post("/goals", status_code=status.HTTP_201_CREATED)
+def create_goal(payload: GoalPayload, context=Depends(_mobile_context)):
+    user, _, db = context
+    workspace_id = _workspace_id(db, user)
+    _require_area(user, workspace_id, db, payload.person_id, write=True)
+    if payload.end_date <= payload.start_date:
+        raise HTTPException(422, "A data final precisa ser posterior à data inicial")
+    if payload.goal_type == "purchase" and (payload.target_amount is None or payload.weeks < 1):
+        raise HTTPException(422, "Informe valor alvo e prazo para a meta financeira")
+    weekly = (payload.target_amount / payload.weeks).quantize(Decimal("0.01")) if payload.target_amount else None
+    item = FinancialGoal(workspace_id=workspace_id, person_id=payload.person_id, user_id=user.id,
+        goal_type=payload.goal_type, title=payload.title.strip(), sentence=payload.sentence.strip(),
+        target_amount=payload.target_amount, weekly_amount=weekly, days_per_week=payload.days_per_week,
+        hour_label=payload.hour_label, start_date=payload.start_date, end_date=payload.end_date,
+        weeks=payload.weeks, is_tight=payload.is_tight, status="active")
+    db.add(item); db.commit(); db.refresh(item)
+    return {"id": item.id, "status": item.status, "weekly_amount": _money(item.weekly_amount)}
+
+
+@router.post("/goals/{goal_id}/progress")
+def add_goal_progress(goal_id: int, payload: GoalProgressPayload, context=Depends(_mobile_context)):
+    user, _, db = context
+    workspace_id = _workspace_id(db, user)
+    item = db.scalar(select(FinancialGoal).where(FinancialGoal.id == goal_id,
+        FinancialGoal.user_id == user.id, FinancialGoal.workspace_id == workspace_id))
+    if not item:
+        raise HTTPException(404, "Meta não encontrada")
+    _require_area(user, workspace_id, db, item.person_id, write=True)
+    if item.goal_type != "purchase" or item.status != "active":
+        raise HTTPException(422, "Esta meta não aceita aportes")
+    item.saved_amount = min(Decimal(item.target_amount or 0), Decimal(item.saved_amount or 0) + payload.amount)
+    if item.saved_amount >= Decimal(item.target_amount or 0):
+        item.status = "completed"
+    db.commit()
+    return {"id": item.id, "saved_amount": _money(item.saved_amount), "status": item.status}
+
+
+AUDIO_PENDING_TIMEOUT = timedelta(minutes=10)
+
+
+def _expire_stale_audio(db: Session, user: User) -> None:
+    """A job lost to a server restart would stay pending forever; let the user retry it instead."""
+    stale = db.scalars(select(TelegramConversationMessage).where(
+        TelegramConversationMessage.user_id == user.id, TelegramConversationMessage.status == "pending",
+        TelegramConversationMessage.created_at < datetime.utcnow() - AUDIO_PENDING_TIMEOUT)).all()
+    for item in stale:
+        item.status = "error"
+    if stale:
+        db.commit()
+
+
+HISTORY_PAGE_DEFAULT = 20
+HISTORY_PAGE_MAX = 100
+HISTORY_CHANNELS = ["telegram", "app"]
+
+
+@router.get("/assistant/history")
+def assistant_history(before_id: int | None = Query(default=None, ge=1),
+                      limit: int | None = Query(default=None, ge=1, le=HISTORY_PAGE_MAX),
+                      context=Depends(_mobile_context)):
+    """Without parameters: the same window the model sees (last N done messages within the char budget,
+    plus anything still processing). With ``before_id``/``limit``: an older page, newest of that page last.
+    ``memory_start_id`` is the oldest message the model still remembers."""
+    user, _, db = context
+    _expire_stale_audio(db, user)
+    window = model_window(db, user.id)
+    memory_start_id = window[0].id if window else None
+    base = select(TelegramConversationMessage).where(
+        TelegramConversationMessage.user_id == user.id, TelegramConversationMessage.channel.in_(HISTORY_CHANNELS))
+    if before_id is None and limit is None and memory_start_id is not None:
+        rows = db.scalars(base.where(TelegramConversationMessage.id >= memory_start_id)
+                          .order_by(TelegramConversationMessage.id.asc())).all()
+    else:
+        query = base if before_id is None else base.where(TelegramConversationMessage.id < before_id)
+        rows = list(reversed(db.scalars(query.order_by(TelegramConversationMessage.id.desc())
+                                        .limit(limit or HISTORY_PAGE_DEFAULT)).all()))
+    has_more = bool(rows) and db.scalar(select(TelegramConversationMessage.id).where(
+        TelegramConversationMessage.user_id == user.id, TelegramConversationMessage.channel.in_(HISTORY_CHANNELS),
+        TelegramConversationMessage.id < rows[0].id).limit(1)) is not None
+    ids = [item.id for item in rows]
+    media_by_message: dict[int, list[dict]] = {}
+    if ids:
+        for media in db.scalars(select(ChatMedia).where(
+            ChatMedia.user_id == user.id, ChatMedia.message_id.in_(ids)
+        ).order_by(ChatMedia.id)).all():
+            media_by_message.setdefault(media.message_id, []).append({
+                "id": media.id, "kind": media.kind, "mime_type": media.mime_type,
+                "transcript": media.transcript, "url": f"/assistant/media/{media.id}",
+                "played": media.played_at is not None,
+            })
+
+    def shown(item):
+        kinds = {x["kind"] for x in media_by_message.get(item.id, [])}
+        if "audio_user" in kinds:
+            return "\u00c1udio enviado."
+        if "receipt_image" in kinds:
+            return "Comprovante enviado."
+        return item.content
+
+    return {"items": [{"id": item.id, "role": item.role, "status": item.status, "client_key": item.client_key,
+        "channel": item.channel, "content": shown(item), "created_at": item.created_at.isoformat(),
+        "media": media_by_message.get(item.id, [])} for item in rows],
+        "has_more": has_more, "memory_start_id": memory_start_id}
+
+
+@router.post("/assistant/media/{media_id}/played")
+def assistant_media_played(media_id: int, context=Depends(_mobile_context)):
+    user, _, db = context
+    media = db.scalar(select(ChatMedia).where(ChatMedia.id == media_id, ChatMedia.user_id == user.id,
+        ChatMedia.kind == "audio_response"))
+    if not media:
+        raise HTTPException(404, "M\u00eddia n\u00e3o encontrada")
+    if media.played_at is None:
+        media.played_at = datetime.utcnow()
+        db.commit()
+    return {"id": media.id, "played": True}
+
+
+def _attach_private_media(db: Session, user: User, message: TelegramConversationMessage,
+                          kind: str, data: bytes, filename: str, mime_type: str,
+                          transcript: str | None = None) -> ChatMedia:
+    key = store_bytes(data, mime_type)
+    media = ChatMedia(user_id=user.id, message_id=message.id, kind=kind, storage_key=key,
+        filename=filename[:180], mime_type=mime_type, transcript=transcript)
+    db.add(media)
+    db.commit()
+    db.refresh(media)
+    return media
+
+
+def _latest_assistant_message(db: Session, user: User, after_id: int) -> TelegramConversationMessage | None:
+    return db.scalar(select(TelegramConversationMessage).where(
+        TelegramConversationMessage.user_id == user.id, TelegramConversationMessage.channel == "app",
+        TelegramConversationMessage.role == "assistant", TelegramConversationMessage.id > after_id,
+    ).order_by(TelegramConversationMessage.id.desc()))
+
+
+def _add_generated_audio(db: Session, user: User, assistant: TelegramConversationMessage | None) -> None:
+    if assistant is None:
+        return
+    try:
+        generated = synthesize_speech(db, assistant.content)
+        if generated:
+            audio_bytes, mime_type = generated
+            extension = ".wav" if mime_type == "audio/wav" else ".mp3"
+            _attach_private_media(db, user, assistant, "audio_response", audio_bytes,
+                f"resposta{extension}", mime_type, assistant.content)
+    except MediaProcessingError:
+        # A resposta escrita deve continuar disponível se o serviço de voz falhar.
+        db.rollback()
+
+
+@router.get("/assistant/media/{media_id}")
+def assistant_media(media_id: int, context=Depends(_mobile_context)):
+    user, _, db = context
+    media = db.scalar(select(ChatMedia).where(ChatMedia.id == media_id, ChatMedia.user_id == user.id))
+    if not media:
+        raise HTTPException(404, "Mídia não encontrada")
+    try:
+        data = read_private_media(media.storage_key)
+    except FileNotFoundError as exc:
+        raise HTTPException(404, "Mídia não encontrada") from exc
+    return Response(content=data, media_type=media.mime_type,
+        headers={"Cache-Control": "private, no-store", "Content-Disposition": "inline"})
+
+
+def _check_upload(data: bytes, filename: str, mime_type: str, allowed_prefix: str) -> None:
+    if not data:
+        raise HTTPException(422, "O arquivo enviado está vazio")
+    if len(data) > MAX_MEDIA_BYTES:
+        raise HTTPException(413, "O arquivo excede o limite de 12 MB")
+    if not mime_type.startswith(allowed_prefix):
+        raise HTTPException(415, "Formato de mídia não suportado")
+    if mime_type not in {"audio/mp4", "audio/mpeg", "audio/wav", "audio/x-wav", "audio/aac", "audio/ogg", "audio/webm", "image/jpeg", "image/png", "image/webp"}:
+        raise HTTPException(415, "Use áudio M4A, MP3, WAV, AAC, OGG ou WebM; para imagem, JPEG, PNG ou WebP")
+
+
+def setting_exists(db: Session, key: str) -> bool:
+    return bool(db.scalar(select(SystemSetting.value).where(SystemSetting.key == key)))
+
+
+_USER_JOB_LOCKS: dict[int, threading.Lock] = {}
+_USER_JOB_LOCKS_GUARD = threading.Lock()
+
+
+def _user_job_lock(user_id: int) -> threading.Lock:
+    """One audio job at a time per user: the agent keeps per-user pending actions and conversation order."""
+    with _USER_JOB_LOCKS_GUARD:
+        return _USER_JOB_LOCKS.setdefault(user_id, threading.Lock())
+
+
+MEDIA_KINDS = ("audio_user", "receipt_image")
+UPLOAD_LABELS = {"audio_user": "\u00c1udio enviado.", "receipt_image": "Comprovante enviado."}
+
+
+def _media_job_json(message: TelegramConversationMessage, duplicate: bool = False) -> dict:
+    return {"id": message.id, "status": message.status, "client_key": message.client_key, "duplicate": duplicate}
+
+
+def _run_media_job(bind, user_id: int, message_id: int) -> None:
+    """Background: read the audio/image, answer with the agent, synthesize the reply (audio only), mark done."""
+    with _user_job_lock(user_id):
+        db = sessionmaker(bind=bind, autoflush=False, expire_on_commit=False)()
+        agent_finished = False
+        try:
+            user = db.get(User, user_id)
+            message = db.get(TelegramConversationMessage, message_id)
+            if not user or not message or message.status != "pending":
+                return
+            media = db.scalar(select(ChatMedia).where(ChatMedia.message_id == message.id, ChatMedia.kind.in_(MEDIA_KINDS)))
+            if not media:
+                raise MediaProcessingError("Anexo n\u00e3o encontrado")
+            if media.kind == "audio_user":
+                if not media.transcript:
+                    media.transcript = transcribe_audio(db, read_private_media(media.storage_key), media.filename, media.mime_type)
+                    db.commit()
+                transcript = media.transcript
+                prompt = (f"O usu\u00e1rio enviou um \u00e1udio. Transcri\u00e7\u00e3o: {transcript}. Responda ao pedido e use as ferramentas "
+                    "financeiras quando necess\u00e1rio; confirme qualquer inclus\u00e3o ou altera\u00e7\u00e3o antes de efetiv\u00e1-la.")
+                stored = f"\u00c1udio enviado. Transcri\u00e7\u00e3o: {transcript}"
+            else:
+                if not media.transcript:
+                    extracted = describe_receipt(db, read_private_media(media.storage_key), media.mime_type)
+                    media.transcript = f"{IMAGE_TRANSCRIPT_PREFIX}{extracted}"
+                    db.commit()
+                extracted = media.transcript.removeprefix(IMAGE_TRANSCRIPT_PREFIX)
+                prompt = ("O usu\u00e1rio enviou uma imagem de comprovante para ajudar a registrar uma despesa. "
+                    f"Dados extra\u00eddos, que devem ser confirmados pelo usu\u00e1rio: {extracted}. "
+                    "Apresente os dados de forma clara, pergunte o que estiver ausente e nunca registre sem mostrar o resumo e receber confirma\u00e7\u00e3o expl\u00edcita.")
+                stored = f"Comprovante enviado.\n{media.transcript}"
+            from app.services.telegram_agent import run_financial_agent
+            run_financial_agent(db, user, prompt[:4000], channel="app", user_message=message, stored_user_content=stored)
+            agent_finished = True
+            if media.kind == "audio_user":
+                _add_generated_audio(db, user, _latest_assistant_message(db, user, message.id))
+            message.status = "done"
+            db.commit()
+        except Exception:
+            logger.exception("media_job_failed user_id=%s message_id=%s", user_id, message_id)
+            db.rollback()
+            try:
+                row = db.get(TelegramConversationMessage, message_id)
+                if row is not None:
+                    # Once the agent has answered, the reply exists: never reprocess it (would repeat actions).
+                    row.status = "done" if agent_finished else "error"
+                    db.commit()
+            except Exception:
+                db.rollback()
+        finally:
+            db.close()
+
+
+def _accept_media_upload(background: BackgroundTasks, db: Session, user: User, kind: str, allowed_prefix: str,
+                         file: UploadFile, idempotency_key: str | None) -> dict:
+    """Saves the user's message and file right away and processes them in the background (202)."""
+    key = (idempotency_key or "").strip() or None
+    if key and len(key) > 64:
+        raise HTTPException(422, "Idempotency-Key muito longa")
+    if key:
+        existing = db.scalar(select(TelegramConversationMessage).where(
+            TelegramConversationMessage.user_id == user.id, TelegramConversationMessage.client_key == key))
+        if existing:
+            if existing.status == "error":
+                existing.status = "pending"
+                db.commit()
+                background.add_task(_run_media_job, db.get_bind(), user.id, existing.id)
+            return _media_job_json(existing, duplicate=True)
+    mime_type = (file.content_type or "").lower()
+    data = file.file.read(MAX_MEDIA_BYTES + 1)
+    _check_upload(data, file.filename or "anexo", mime_type, allowed_prefix)
+    message = TelegramConversationMessage(user_id=user.id, role="user", channel="app", status="pending",
+        content=UPLOAD_LABELS[kind], client_key=key)
+    db.add(message)
+    try:
+        db.flush()
+    except IntegrityError:  # the same key arrived twice at once: the first request owns the message
+        db.rollback()
+        existing = db.scalar(select(TelegramConversationMessage).where(
+            TelegramConversationMessage.user_id == user.id, TelegramConversationMessage.client_key == key))
+        if existing:
+            return _media_job_json(existing, duplicate=True)
+        raise
+    default_name = "audio.m4a" if kind == "audio_user" else "imagem.jpg"
+    _attach_private_media(db, user, message, kind, data, file.filename or default_name, mime_type)
+    background.add_task(_run_media_job, db.get_bind(), user.id, message.id)
+    return _media_job_json(message)
+
+
+@router.post("/assistant/media/audio", status_code=202)
+def assistant_audio_message(background: BackgroundTasks, file: UploadFile = File(...),
+                            idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+                            context=Depends(_mobile_context)):
+    user, _, db = context
+    return _accept_media_upload(background, db, user, "audio_user", "audio/", file, idempotency_key)
+
+
+@router.post("/assistant/media/image", status_code=202)
+def assistant_image_message(background: BackgroundTasks, file: UploadFile = File(...),
+                            idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+                            context=Depends(_mobile_context)):
+    user, _, db = context
+    return _accept_media_upload(background, db, user, "receipt_image", "image/", file, idempotency_key)
+
+
+@router.post("/assistant/messages/{message_id}/retry", status_code=202)
+def assistant_media_retry(message_id: int, background: BackgroundTasks, context=Depends(_mobile_context)):
+    user, _, db = context
+    message = db.scalar(select(TelegramConversationMessage).where(
+        TelegramConversationMessage.id == message_id, TelegramConversationMessage.user_id == user.id,
+        TelegramConversationMessage.channel == "app", TelegramConversationMessage.role == "user"))
+    if not message or not db.scalar(select(ChatMedia.id).where(
+            ChatMedia.message_id == message.id, ChatMedia.kind.in_(MEDIA_KINDS))):
+        raise HTTPException(404, "Mensagem n\u00e3o encontrada")
+    if message.status == "error":
+        message.status = "pending"
+        db.commit()
+        background.add_task(_run_media_job, db.get_bind(), user.id, message.id)
+    return _media_job_json(message)
 
 
 @router.post("/assistant/messages")
 def assistant_message(payload: ChatMessage, context=Depends(_mobile_context)):
     user, _, db = context
     from app.services.telegram_agent import run_financial_agent
+    before_id = db.scalar(select(TelegramConversationMessage.id).where(
+        TelegramConversationMessage.user_id == user.id).order_by(TelegramConversationMessage.id.desc())) or 0
     try:
-        reply = run_financial_agent(db, user, payload.message.strip())
+        reply = run_financial_agent(db, user, payload.message.strip(), channel="app")
     except Exception as exc:
         db.rollback()
         raise HTTPException(503, "A Vitoria IA está temporariamente indisponível") from exc

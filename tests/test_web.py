@@ -1,4 +1,4 @@
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 
 from app.database import SessionLocal
@@ -24,20 +24,50 @@ def seed_test():
 def test_health(client): assert client.get("/health").json()["status"] == "ok"
 
 
-def test_month_defaults_to_earliest_open_period(client):
+def test_web_smart_goals_can_be_created_and_tracked(client):
+    person_id = seed_test()
+    client.post("/login", data={"username": "vh", "password": "123456"})
+    deadline = date.today() + timedelta(days=84)
+    page = client.get("/goals")
+    assert page.status_code == 200 and "Converse com a Vitória" in page.text
+    saved = client.post("/goals", data={"title": "Fazer uma viagem", "target_amount": "2400",
+        "end_date": deadline.isoformat(), "person_id": str(person_id)}, follow_redirects=False)
+    assert saved.status_code == 303 and saved.headers["location"] == "/goals"
+    with SessionLocal() as db:
+        from app.models import FinancialGoal
+        goal = db.scalar(select(FinancialGoal))
+        assert goal and goal.weekly_amount == Decimal("200.00")
+        goal_id = goal.id
+    client.post(f"/goals/{goal_id}/progress", data={"amount": "500"}, follow_redirects=False)
+    with SessionLocal() as db:
+        from app.models import FinancialGoal
+        assert db.get(FinancialGoal, goal_id).saved_amount == Decimal("500.00")
+
+
+def test_month_defaults_to_current_open_period(client):
     seed_test()
+    client.post("/login", data={"username": "vh", "password": "123456"})
+    page = client.get("/month")
+    assert page.status_code == 200
+    assert f'<span class="macro-month">{date.today().month:02d}</span>' in page.text
     with SessionLocal() as db:
         workspace_id = db.scalar(select(Workspace.id))
         db.add_all([
             AccountingPeriod(workspace_id=workspace_id, year=2026, month=month, is_closed=True)
-            for month in range(1, 7)
+            for month in range(1, date.today().month)
         ])
         db.commit()
-        assert earliest_open_month(db, workspace_id, date(2026, 9, 4)) == (2026, 7)
-        period = db.scalar(select(AccountingPeriod).where(AccountingPeriod.month == 6))
-        period.is_closed = False
+        assert earliest_open_month(db, workspace_id, date.today()) == (date.today().year, date.today().month)
+        current = db.scalar(select(AccountingPeriod).where(AccountingPeriod.month == date.today().month))
+        if current is None:
+            current = AccountingPeriod(workspace_id=workspace_id, year=date.today().year,
+                month=date.today().month, is_closed=True)
+            db.add(current)
+        else:
+            current.is_closed = True
         db.commit()
-        assert earliest_open_month(db, workspace_id, date(2026, 9, 4)) == (2026, 6)
+        expected_month = min(date.today().month + 1, 12)
+        assert earliest_open_month(db, workspace_id, date.today()) == (date.today().year, expected_month)
 
 
 def test_login_dashboard_and_change_password(client):
@@ -835,7 +865,14 @@ def test_superadmin_creates_account_and_refreshes_deepinfra_models(client, monke
     assert client.get("/system/accounts").status_code == 200
     assert client.get("/system/settings").status_code == 200
     client.post("/logout"); client.post("/login", data={"username":"vh", "password":"123456"})
-    client.post("/system/settings", data={"deepinfra_api_key":"secret", "deepinfra_model":"", "telegram_bot_token":""})
+    client.post("/system/settings", data={"deepinfra_api_key":"secret", "deepinfra_model":"", "telegram_bot_token":"",
+        "audio_transcription_model": "openai/whisper-large-v3-turbo",
+        "audio_generation_model": "tts-model", "image_recognition_model": "vision-model"})
+    with SessionLocal() as db:
+        settings = {row.key: row.value for row in db.scalars(select(SystemSetting)).all()}
+        assert settings["audio_transcription_model"] == "openai/whisper-large-v3-turbo"
+        assert settings["audio_generation_model"] == "tts-model"
+        assert settings["image_recognition_model"] == "vision-model"
     class FakeResponse:
         def raise_for_status(self): return None
         def json(self): return {"data":[{"id":"meta-llama/Llama-3"},{"id":"deepseek-ai/DeepSeek-V3"}]}

@@ -167,10 +167,30 @@ class TelegramBillReminder(Base):
 
 class TelegramConversationMessage(Base):
     __tablename__ = "telegram_conversation_messages"
+    __table_args__ = (UniqueConstraint("user_id", "client_key", name="uq_conversation_user_client_key"),)
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     role: Mapped[str] = mapped_column(String(20))
     content: Mapped[str] = mapped_column(Text)
+    channel: Mapped[str] = mapped_column(String(20), default="telegram", index=True)
+    # pending/done/error: app audio messages are processed after the upload request returns.
+    status: Mapped[str] = mapped_column(String(12), default="done", server_default="done", index=True)
+    client_key: Mapped[str | None] = mapped_column(String(64), nullable=True)  # idempotency key sent by the app
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+
+class ChatMedia(Base):
+    """Private app-chat attachment; file bytes live outside the public static tree."""
+    __tablename__ = "chat_media"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    message_id: Mapped[int] = mapped_column(ForeignKey("telegram_conversation_messages.id", ondelete="CASCADE"), index=True)
+    kind: Mapped[str] = mapped_column(String(20), index=True)
+    storage_key: Mapped[str] = mapped_column(String(80), unique=True)
+    filename: Mapped[str] = mapped_column(String(180))
+    mime_type: Mapped[str] = mapped_column(String(80))
+    transcript: Mapped[str | None] = mapped_column(Text, nullable=True)
+    played_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)  # assistant audio already auto-played
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
 
 
@@ -474,6 +494,28 @@ class Vehicle(Base):
     initial_odometer_km: Mapped[Decimal] = mapped_column(Numeric(12, 1), default=0)
     fuel_type: Mapped[str | None] = mapped_column(String(40), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class FinancialGoal(Base):
+    __tablename__ = "financial_goals"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    workspace_id: Mapped[int] = mapped_column(ForeignKey("workspaces.id", ondelete="CASCADE"), index=True)
+    person_id: Mapped[int] = mapped_column(ForeignKey("people.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    goal_type: Mapped[str] = mapped_column(String(20))
+    title: Mapped[str] = mapped_column(String(180))
+    sentence: Mapped[str] = mapped_column(Text)
+    target_amount: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    saved_amount: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
+    weekly_amount: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    days_per_week: Mapped[int | None] = mapped_column(nullable=True)
+    hour_label: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    start_date: Mapped[date] = mapped_column(Date)
+    end_date: Mapped[date] = mapped_column(Date)
+    weeks: Mapped[int] = mapped_column()
+    is_tight: Mapped[bool] = mapped_column(Boolean, default=False)
+    status: Mapped[str] = mapped_column(String(20), default="active", index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 

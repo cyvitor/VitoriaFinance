@@ -18,7 +18,7 @@ from app.database import get_db
 from app.database import SessionLocal
 from app.dependencies import allowed_person_ids, can_write_all_areas, current_user, current_workspace_id, writable_person_ids
 from app.models import (
-    Account, AccountRole, AccountType, AreaAccessLevel, Card, CardBillingPeriod, Category, Person, PersonType, SystemAccount, SystemSetting,
+    Account, AccountRole, AccountType, AreaAccessLevel, Card, CardBillingPeriod, Category, FinancialGoal, Person, PersonType, SystemAccount, SystemSetting,
     Transaction, TransactionStatus, TransactionType, User, UserPersonAccess, WorkspaceMember, TelegramLink,
     RecurrenceRule, RecurrenceOccurrence, AccountingPeriod, Financing, FinancingAmortization, MonthlyBudget,
     MonthlyBudgetOccurrence,
@@ -29,6 +29,7 @@ from app.services.card_billing import (
     card_invoice_is_closed, card_purchase_competence, shift_month as shift_competence_month,
 )
 from app.services.monthly_projection import monthly_budget_positions, projection_budget_remaining
+from app.services.accounting_periods import current_open_month
 from app.services.telegram_auth import PAIRING_TTL_MINUTES, create_pairing_code, unlink_telegram
 from scripts.seed import seed_categories
 
@@ -250,24 +251,8 @@ def shift_month(value: date, offset: int) -> date:
 
 
 def earliest_open_month(db: Session, workspace_id: int, today: date) -> tuple[int, int]:
-    """Retorna a competência aberta mais antiga do ano corrente."""
-    periods = db.scalars(select(AccountingPeriod).where(
-        AccountingPeriod.workspace_id == workspace_id,
-        AccountingPeriod.year == today.year,
-        AccountingPeriod.month <= today.month,
-    )).all()
-    reopened = sorted(item.month for item in periods if not item.is_closed)
-    if reopened:
-        return today.year, reopened[0]
-    closed = {item.month for item in periods if item.is_closed}
-    consecutive_closed = 0
-    for month in range(1, today.month + 1):
-        if month not in closed:
-            break
-        consecutive_closed = month
-    if consecutive_closed:
-        return today.year, min(consecutive_closed + 1, today.month)
-    return today.year, today.month
+    """Use the current competence if open, otherwise its next open successor."""
+    return current_open_month(db, workspace_id, today)
 
 
 @router.get("/login", response_class=HTMLResponse)
@@ -1041,6 +1026,75 @@ def fixed_expense_delete(rule_id: int, request: Request, db: Session = Depends(g
     db.commit()
     flash(request, "Despesa fixa excluída dos meses futuros. Pagamentos confirmados foram preservados.")
     return redirect("/fixed-expenses")
+
+
+@router.get("/goals", response_class=HTMLResponse)
+def financial_goals(request: Request, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    wid = current_workspace_id(request, user, db)
+    active_area = active_area_id(request, user, wid, db)
+    query = select(FinancialGoal).where(FinancialGoal.workspace_id == wid, FinancialGoal.user_id == user.id)
+    if active_area:
+        query = query.where(FinancialGoal.person_id == active_area)
+    items = db.scalars(query.order_by(FinancialGoal.status, FinancialGoal.end_date)).all()
+    return render(request, "financial_goals.html", user=user, items=items,
+        people=visible_people(user, wid, db), selected_area=active_area)
+
+
+@router.post("/goals")
+def create_financial_goal(request: Request, title: str = Form(""), target_amount: Decimal = Form(),
+        end_date: str = Form(""), person_id: int = Form(), db: Session = Depends(get_db),
+        user: User = Depends(current_user)):
+    wid = current_workspace_id(request, user, db)
+    ensure_area_access(person_id, user, wid, db)
+    try:
+        deadline = date.fromisoformat(end_date)
+    except ValueError:
+        flash(request, "Informe uma data final válida.", "danger")
+        return redirect("/goals")
+    start = date.today()
+    if not title.strip() or target_amount <= 0 or deadline <= start:
+        flash(request, "Informe um objetivo, valor positivo e prazo futuro.", "danger")
+        return redirect("/goals")
+    weeks = max(1, ((deadline-start).days + 6)//7)
+    weekly = (target_amount / weeks).quantize(Decimal("0.01"))
+    sentence = f"Quero {title.strip()} de {money(target_amount)} até {deadline.strftime('%d/%m/%Y')}, separando {money(weekly)} por semana."
+    totals = dict(db.execute(select(Transaction.transaction_type, func.coalesce(func.sum(Transaction.amount), 0)).where(
+        Transaction.workspace_id == wid, Transaction.person_id == person_id,
+        Transaction.status == TransactionStatus.paid,
+        Transaction.transaction_date >= start - timedelta(days=183),
+        Transaction.transaction_type.in_([TransactionType.income, TransactionType.expense]),
+    ).group_by(Transaction.transaction_type)).all())
+    average_monthly_surplus = max(Decimal(0), Decimal(totals.get(TransactionType.income, 0))-
+        Decimal(totals.get(TransactionType.expense, 0))) / Decimal(6)
+    is_tight = weekly > average_monthly_surplus / Decimal("4.33")
+    db.add(FinancialGoal(workspace_id=wid, person_id=person_id, user_id=user.id, goal_type="purchase",
+        title=title.strip(), sentence=sentence, target_amount=target_amount, weekly_amount=weekly,
+        start_date=start, end_date=deadline, weeks=weeks, is_tight=is_tight, status="active"))
+    db.commit()
+    flash(request, "Plano salvo. Converse com a Vitória antes de decidir se a compra cabe no momento." +
+        (" O ritmo semanal supera a sobra histórica média; considere estender o prazo." if is_tight else ""),
+        "warning" if is_tight else "success")
+    return redirect("/goals")
+
+
+@router.post("/goals/{goal_id}/progress")
+def update_financial_goal_progress(goal_id: int, request: Request, amount: Decimal = Form(),
+        db: Session = Depends(get_db), user: User = Depends(current_user)):
+    wid = current_workspace_id(request, user, db)
+    item = db.scalar(select(FinancialGoal).where(FinancialGoal.id == goal_id,
+        FinancialGoal.user_id == user.id, FinancialGoal.workspace_id == wid))
+    if not item:
+        raise HTTPException(404)
+    ensure_area_access(item.person_id, user, wid, db)
+    if amount <= 0:
+        flash(request, "Informe um valor maior que zero.", "danger")
+        return redirect("/goals")
+    item.saved_amount = min(Decimal(item.target_amount or 0), Decimal(item.saved_amount or 0)+amount)
+    if item.saved_amount >= Decimal(item.target_amount or 0):
+        item.status = "completed"
+    db.commit()
+    flash(request, "Progresso da meta atualizado.")
+    return redirect("/goals")
 
 
 @router.get("/budgets", response_class=HTMLResponse)
@@ -2244,6 +2298,7 @@ def system_settings(request: Request, db: Session = Depends(get_db), user: User 
     try: models = json.loads(values.get("deepinfra_models", "[]"))
     except json.JSONDecodeError: models = []
     from app.services import llm_client as llm
+    from app.services import chat_history
     llm_defaults = {
         "deepinfra_model": llm.DEFAULT_MODEL,
         "deepinfra_fallback_models": ", ".join(llm.DEFAULT_FALLBACK_MODELS),
@@ -2252,6 +2307,11 @@ def system_settings(request: Request, db: Session = Depends(get_db), user: User 
         "llm_retry_max_delay_ms": llm.DEFAULT_RETRY_MAX_DELAY_MS,
         "llm_request_timeout_ms": llm.DEFAULT_REQUEST_TIMEOUT_MS,
         "bill_reminder_time": "08:00",
+        "audio_transcription_model": "openai/whisper-large-v3-turbo",
+        "audio_generation_model": "",
+        "image_recognition_model": "",
+        "chat_history_max_messages": chat_history.DEFAULT_HISTORY_MESSAGES,
+        "chat_history_max_chars": chat_history.DEFAULT_HISTORY_CHARS,
     }
     return render(request, "admin/system_settings.html", user=user, values=values, models=models,
                   llm_defaults=llm_defaults)
@@ -2263,15 +2323,24 @@ def system_settings_save(request: Request, deepinfra_api_key: str = Form(""), de
         llm_retry_attempts: str = Form(""), llm_retry_base_delay_ms: str = Form(""),
         llm_retry_max_delay_ms: str = Form(""), llm_request_timeout_ms: str = Form(""),
         bill_reminder_time: str = Form(""),
+        audio_transcription_model: str = Form(""), audio_generation_model: str = Form(""),
+        image_recognition_model: str = Form(""),
+        chat_history_max_messages: str = Form(""), chat_history_max_chars: str = Form(""),
         db: Session = Depends(get_db), user: User = Depends(current_user)):
     require_super_admin(user)
     from app.services.llm_client import parse_model_list
     if deepinfra_api_key: set_system_setting(db, "deepinfra_api_key", deepinfra_api_key, True)
     if deepinfra_model: set_system_setting(db, "deepinfra_model", deepinfra_model.strip())
+    for key, value in (("audio_transcription_model", audio_transcription_model),
+                       ("audio_generation_model", audio_generation_model),
+                       ("image_recognition_model", image_recognition_model)):
+        set_system_setting(db, key, value.strip())
     if deepinfra_fallback_models is not None:
         set_system_setting(db, "deepinfra_fallback_models", ", ".join(parse_model_list(deepinfra_fallback_models)))
     numeric = {"llm_retry_attempts": (llm_retry_attempts, 1, 10), "llm_retry_base_delay_ms": (llm_retry_base_delay_ms, 0, 60000),
-               "llm_retry_max_delay_ms": (llm_retry_max_delay_ms, 0, 120000), "llm_request_timeout_ms": (llm_request_timeout_ms, 1000, 120000)}
+               "llm_retry_max_delay_ms": (llm_retry_max_delay_ms, 0, 120000), "llm_request_timeout_ms": (llm_request_timeout_ms, 1000, 120000),
+               "chat_history_max_messages": (chat_history_max_messages, 2, 200),
+               "chat_history_max_chars": (chat_history_max_chars, 500, 60000)}
     for key, (raw, low, high) in numeric.items():
         raw = (raw or "").strip()
         if not raw: continue
