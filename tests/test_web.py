@@ -873,3 +873,81 @@ def test_superadmin_creates_account_and_refreshes_deepinfra_models(client, monke
     client.post("/logout")
     response = client.post("/login", data={"username":"joao", "password":"123456"}, follow_redirects=False)
     assert response.status_code == 303 and response.headers["location"] == "/login"
+
+
+
+def test_card_create_in_any_area_and_read_only_blocked(client):
+    vitor_id = seed_test()
+    with SessionLocal() as db:
+        workspace_id = db.scalar(select(Workspace.id))
+        admin = db.scalar(select(User).where(User.username == "vh"))
+        nana = Person(workspace_id=workspace_id, name="Nana", person_type=PersonType.personal)
+        db.add(nana); db.flush()
+        vitor_account = Account(workspace_id=workspace_id, person_id=vitor_id, name="Conta Vitor", account_type=AccountType.checking)
+        nana_account = Account(workspace_id=workspace_id, person_id=nana.id, name="Conta Nana", account_type=AccountType.checking)
+        db.add_all([vitor_account, nana_account]); db.flush()
+        nana_user = User(system_account_id=admin.system_account_id, username="nana", full_name="Nana",
+                         password_hash=hash_password("senha-nana-123"), account_role=AccountRole.member,
+                         default_person_id=nana.id)
+        db.add(nana_user); db.flush()
+        db.add(WorkspaceMember(workspace_id=workspace_id, user_id=nana_user.id, role=MemberRole.editor))
+        db.commit()
+        nana_id, nana_user_id = nana.id, nana_user.id
+        vitor_account_id, nana_account_id = vitor_account.id, nana_account.id
+    client.post("/login", data={"username": "vh", "password": "123456"})
+    card = {"name": "C6", "brand": "", "credit_limit": "1000", "closing_day": "5", "due_day": "12", "color": "#111111"}
+    assert client.post("/cards", data={**card, "account_id": str(nana_account_id)}, follow_redirects=False).status_code == 303
+    client.post(f"/account/users/{nana_user_id}/access", data={"area_access": [f"{nana_id}:write", f"{vitor_id}:read"]})
+    client.post("/logout")
+    client.post("/login", data={"username": "nana", "password": "senha-nana-123"})
+    assert client.post("/cards", data={**card, "name": "Nana", "account_id": str(nana_account_id)}, follow_redirects=False).status_code == 303
+    assert client.post("/cards", data={**card, "name": "X", "account_id": str(vitor_account_id)}, follow_redirects=False).status_code == 403
+    with SessionLocal() as db:
+        assert db.scalar(select(func.count(Card.id))) == 2
+
+
+def test_account_can_be_edited_including_balance(client):
+    area_id = seed_test()
+    client.post("/login", data={"username": "vh", "password": "123456"})
+    client.post("/accounts", data={"name": "Conta", "bank_name": "Itau", "account_type": "checking",
+        "person_id": str(area_id), "initial_balance": "10", "color": "#6c5ce7"})
+    with SessionLocal() as db:
+        account_id = db.scalar(select(Account.id))
+    assert f"/accounts/{account_id}/edit" in client.get("/accounts").text
+    response = client.post(f"/accounts/{account_id}/edit", data={"name": "Conta C6", "bank_name": "C6",
+        "account_type": "savings", "person_id": str(area_id), "initial_balance": "1234.56", "color": "#000000"},
+        follow_redirects=False)
+    assert response.status_code == 303
+    with SessionLocal() as db:
+        account = db.get(Account, account_id)
+        assert account.id == account_id and account.name == "Conta C6" and account.bank_name == "C6"
+        assert account.account_type == AccountType.savings and account.initial_balance == Decimal("1234.56")
+    assert client.post("/accounts/999999/edit", data={"name": "x", "account_type": "checking",
+        "person_id": str(area_id)}, follow_redirects=False).status_code == 404
+
+
+def test_financing_edit_corrects_installments_without_payments(client):
+    area_id = seed_test()
+    client.post("/login", data={"username": "vh", "password": "123456"})
+    client.post("/financings", data={"description": "Carro", "paid_installments": "5",
+        "total_installments": "12", "installment_amount": "500", "person_id": str(area_id),
+        "account_id": "", "category_id": "", "financed_amount": "", "outstanding_balance": "",
+        "nominal_interest_rate": "", "institution": "", "due_day": "", "notes": ""})
+    with SessionLocal() as db:
+        financing = db.scalar(select(Financing)); financing_id, rule_id = financing.id, financing.recurrence_rule_id
+    base = {"description": "Carro", "person_id": str(area_id), "institution": "", "account_id": "",
+            "category_id": "", "financed_amount": "", "nominal_interest_rate": "", "due_day": "", "notes": ""}
+    assert client.post(f"/financings/{financing_id}/edit", data={**base, "paid_installments": "9",
+        "total_installments": "12"}, follow_redirects=False).status_code == 303
+    with SessionLocal() as db:
+        financing = db.get(Financing, financing_id); rule = db.get(RecurrenceRule, rule_id)
+        assert financing.paid_installments == 9 and financing.total_installments == 12
+        assert "10/12" in rule.description and rule.is_active and financing.status == "active"
+        assert db.scalar(select(func.count(FinancingAmortization.id))) == 0
+        assert db.scalar(select(func.count(Transaction.id))) == 0
+    client.post(f"/financings/{financing_id}/edit", data={**base, "paid_installments": "13", "total_installments": "12"})
+    with SessionLocal() as db:
+        assert db.get(Financing, financing_id).paid_installments == 9
+    client.post(f"/financings/{financing_id}/edit", data={**base, "paid_installments": "12", "total_installments": "12"})
+    with SessionLocal() as db:
+        assert db.get(Financing, financing_id).status == "paid" and not db.get(RecurrenceRule, rule_id).is_active

@@ -923,6 +923,7 @@ def financing_edit(financing_id: int, request: Request, description: str = Form(
                    category_id: str | None = Form(None), financed_amount: str | None = Form(None),
                    nominal_interest_rate: str | None = Form(None), due_day: str | None = Form(None),
                    start_date: date | None = Form(None), notes: str | None = Form(None),
+                   paid_installments: str | None = Form(None), total_installments: str | None = Form(None),
                    db: Session = Depends(get_db), user: User = Depends(current_user)):
     wid = current_workspace_id(request, user, db)
     financing = db.scalar(select(Financing).where(
@@ -943,6 +944,13 @@ def financing_edit(financing_id: int, request: Request, description: str = Form(
     if not description.strip() or (due_day_value and not 1 <= due_day_value <= 31):
         flash(request, "Confira a descrição e o dia de vencimento.", "danger")
         return redirect(f"/financings/{financing.id}")
+    paid_value = optional_int(paid_installments) if (paid_installments or "").strip() else financing.paid_installments
+    total_value = optional_int(total_installments) if (total_installments or "").strip() else financing.total_installments
+    if paid_value is None or total_value is None or total_value < 1 or paid_value < 0 or paid_value > total_value:
+        flash(request, "Confira as parcelas: pagas deve ficar entre 0 e o total.", "danger")
+        return redirect(f"/financings/{financing.id}")
+    financing.paid_installments = paid_value
+    financing.total_installments = total_value
     financing.description = description.strip()
     financing.person_id = person_id
     financing.institution = (institution or "").strip() or None
@@ -957,7 +965,10 @@ def financing_edit(financing_id: int, request: Request, description: str = Form(
         rule.account_id = account_value
         rule.category_id = category_value
         rule.notes = financing.notes
-        rule.description = f"{financing.description} - parcela {financing.paid_installments + 1}/{financing.total_installments}"
+        rule.description = f"{financing.description} - parcela {min(financing.paid_installments + 1, financing.total_installments)}/{financing.total_installments}"
+    if financing.status in ("active", "paid"):
+        financing.status = "paid" if financing.paid_installments >= financing.total_installments else "active"
+        if rule: rule.is_active = financing.status == "active"
     db.commit()
     flash(request, "Informações do financiamento atualizadas.")
     return redirect(f"/financings/{financing.id}")
@@ -1889,6 +1900,23 @@ def account_create(request: Request, name: str = Form(), bank_name: str = Form("
     flash(request, "Conta adicionada."); return redirect("/accounts")
 
 
+@router.post("/accounts/{account_id}/edit")
+def account_edit(account_id: int, request: Request, name: str = Form(), bank_name: str = Form(""),
+                 account_type: AccountType = Form(), person_id: int = Form(), initial_balance: Decimal = Form(0),
+                 color: str = Form("#6c5ce7"), db: Session = Depends(get_db), user: User = Depends(current_user)):
+    wid = current_workspace_id(request, user, db)
+    account = db.scalar(select(Account).where(Account.id == account_id, Account.workspace_id == wid))
+    if not account: raise HTTPException(404)
+    if account.person_id: ensure_area_access(account.person_id, user, wid, db)
+    ensure_area_access(person_id, user, wid, db)
+    if not name.strip():
+        flash(request, "Informe o nome da conta.", "danger"); return redirect("/accounts")
+    account.name = name.strip(); account.bank_name = bank_name.strip(); account.account_type = account_type
+    account.person_id = person_id; account.initial_balance = initial_balance; account.color = color
+    db.commit()
+    flash(request, "Conta atualizada."); return redirect("/accounts")
+
+
 @router.get("/cards", response_class=HTMLResponse)
 def cards(request: Request, db: Session = Depends(get_db), user: User = Depends(current_user)):
     wid = current_workspace_id(request, user, db)
@@ -2068,7 +2096,9 @@ def card_expense_delete(card_id: int, transaction_id: int, request: Request,
 @router.post("/cards")
 def card_create(request: Request, name: str = Form(), brand: str = Form(""), account_id: str | None = Form(None), credit_limit: Decimal = Form(0), closing_day: int = Form(), due_day: int = Form(), color: str = Form("#1e293b"), db: Session = Depends(get_db), user: User = Depends(current_user)):
     if not 1 <= closing_day <= 31 or not 1 <= due_day <= 31: flash(request, "Os dias devem estar entre 1 e 31.", "danger"); return redirect("/cards")
-    wid = current_workspace_id(request, user, db, write=True); account_value = optional_int(account_id); ensure_account_access(account_value, user, wid, db)
+    wid = current_workspace_id(request, user, db); account_value = optional_int(account_id)
+    if account_value: ensure_account_access(account_value, user, wid, db, write=True)
+    elif writable_person_ids(user, db) is not None: raise HTTPException(403, "Selecione uma conta de uma \u00e1rea com permiss\u00e3o de escrita")
     db.add(Card(workspace_id=wid, name=name.strip(), brand=brand.strip(), account_id=account_value, credit_limit=credit_limit, closing_day=closing_day, due_day=due_day, color=color)); db.commit()
     flash(request, "Cartão adicionado."); return redirect("/cards")
 
