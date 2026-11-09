@@ -194,6 +194,7 @@ def _handle_audio(db: Session, user: User, media: dict, client, message_date) ->
     echo = f"\U0001f399\ufe0f Entendi: \u201c{_snippet(transcript)}\u201d"
     stored = f"\u00c1udio enviado. Transcri\u00e7\u00e3o: {transcript}"
     before_id = _last_message_id(db, user.id)
+    db.info.pop("bot_write_flow", None)
     try:
         reply = telegram_bot.text_turn(db, user, transcript, message_date, stored_user_content=stored)
     except Exception as exc:
@@ -203,13 +204,16 @@ def _handle_audio(db: Session, user: User, media: dict, client, message_date) ->
     assistant_id = _persist(db, user, before_id, stored, reply_text, "audio_user", data,
                             media.get("name") or "voz.ogg", mime, transcript)
     full = f"{echo}\n\n{reply_text}"
-    if media.get("voice") and len(reply_text) <= VOICE_REPLY_MAX_CHARS:
+    # Voz so para conversa/consultoria: gasto em confirmacao (botoes) ou escrita no turno responde so em texto.
+    if (media.get("voice") and len(reply_text) <= VOICE_REPLY_MAX_CHARS
+            and not keyboard and not db.info.pop("bot_write_flow", False)):
         return VoiceBotReply(full, keyboard, voice_text=reply_text, user_id=user.id, message_id=assistant_id)
     return BotReply(full, keyboard)
 
 
 def _handle_image(db: Session, user: User, message: dict, media: dict, client, message_date) -> str | BotReply:
     from app.automation import telegram_bot
+    from app.services.telegram_agent import receipt_prompt
     mime = _image_mime(media.get("mime"))
     if not mime:
         return MSG_IMAGE_FORMAT
@@ -225,11 +229,7 @@ def _handle_image(db: Session, user: User, message: dict, media: dict, client, m
         return MSG_IMAGE_FAIL
     caption = " ".join((message.get("caption") or "").split())[:500]
     transcript = f"{IMAGE_TRANSCRIPT_PREFIX}{extracted}"
-    prompt = ("O usu\u00e1rio enviou uma imagem de comprovante para ajudar a registrar uma despesa. "
-              f"Dados extra\u00eddos, que devem ser confirmados pelo usu\u00e1rio: {extracted}. "
-              + (f"O usu\u00e1rio escreveu junto da imagem: {caption}. " if caption else "")
-              + "Apresente os dados de forma clara, pergunte o que estiver ausente e nunca registre sem mostrar "
-                "o resumo e receber confirma\u00e7\u00e3o expl\u00edcita.")
+    prompt = receipt_prompt(extracted, caption)
     stored = f"Comprovante enviado.\n{transcript}" + (f"\nLegenda: {caption}" if caption else "")
     before_id = _last_message_id(db, user.id)
     reply = telegram_bot.agent_turn(db, user, prompt[:4000], message_date, stored_user_content=stored[:4000])

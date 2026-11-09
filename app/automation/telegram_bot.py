@@ -111,11 +111,14 @@ def agent_turn(db: Session, user: User, text: str, message_date, stored_user_con
     """Roda o agente na area padrao do usuario e anexa os botoes de confirmacao quando houver."""
     started = datetime.utcnow()
     db.info.pop("bot_keyboard", None)
+    db.info.pop("bot_write_flow", None)
     extra = {"stored_user_content": stored_user_content} if stored_user_content is not None else {}
     reply = run_financial_agent(db, user, text, reference_date=message_date, **extra)
-    keyboard = (db.info.pop("bot_keyboard", None) or keyboard_for_recent_action(db, user.id, started)
-                or bot_confirmations.keyboard_for_pending(db, user.id)
-                or _choice_keyboard(db, user.id))
+    keyboard = db.info.pop("bot_keyboard", None) or keyboard_for_recent_action(db, user.id, started)
+    if not keyboard and db.info.get("bot_write_flow"):
+        # Regra: botoes so quando ESTE turno mexeu em algo que aguarda confirmacao (rascunho, acao pendente,
+        # escolha). Conversa comum ("oi") nao traz botoes, mesmo havendo pendencia antiga.
+        keyboard = bot_confirmations.keyboard_for_pending(db, user.id) or _choice_keyboard(db, user.id)
     return BotReply(reply, keyboard) if keyboard else reply
 
 

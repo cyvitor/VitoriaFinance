@@ -1261,6 +1261,7 @@ def _run_media_job(bind, user_id: int, message_id: int) -> None:
         db = sessionmaker(bind=bind, autoflush=False, expire_on_commit=False)()
         agent_finished = False
         try:
+            from app.services.telegram_agent import receipt_prompt
             user = db.get(User, user_id)
             message = db.get(TelegramConversationMessage, message_id)
             if not user or not message or message.status != "pending":
@@ -1273,8 +1274,7 @@ def _run_media_job(bind, user_id: int, message_id: int) -> None:
                     media.transcript = transcribe_audio(db, read_private_media(media.storage_key), media.filename, media.mime_type)
                     db.commit()
                 transcript = media.transcript
-                prompt = (f"O usu\u00e1rio enviou um \u00e1udio. Transcri\u00e7\u00e3o: {transcript}. Responda ao pedido e use as ferramentas "
-                    "financeiras quando necess\u00e1rio; confirme qualquer inclus\u00e3o ou altera\u00e7\u00e3o antes de efetiv\u00e1-la.")
+                prompt = transcript  # mesmo caminho do Telegram: o pedido falado vale como texto digitado
                 stored = f"\u00c1udio enviado. Transcri\u00e7\u00e3o: {transcript}"
             else:
                 if not media.transcript:
@@ -1282,14 +1282,13 @@ def _run_media_job(bind, user_id: int, message_id: int) -> None:
                     media.transcript = f"{IMAGE_TRANSCRIPT_PREFIX}{extracted}"
                     db.commit()
                 extracted = media.transcript.removeprefix(IMAGE_TRANSCRIPT_PREFIX)
-                prompt = ("O usu\u00e1rio enviou uma imagem de comprovante para ajudar a registrar uma despesa. "
-                    f"Dados extra\u00eddos, que devem ser confirmados pelo usu\u00e1rio: {extracted}. "
-                    "Apresente os dados de forma clara, pergunte o que estiver ausente e nunca registre sem mostrar o resumo e receber confirma\u00e7\u00e3o expl\u00edcita.")
+                prompt = receipt_prompt(extracted)
                 stored = f"Comprovante enviado.\n{media.transcript}"
             from app.services.telegram_agent import run_financial_agent
             run_financial_agent(db, user, prompt[:4000], channel="app", user_message=message, stored_user_content=stored)
             agent_finished = True
-            if media.kind == "audio_user":
+            # Voz so para conversa/consultoria; gasto em confirmacao ou escrita no turno fica so em texto.
+            if media.kind == "audio_user" and not db.info.get("bot_write_flow") and not db.info.get("bot_keyboard"):
                 _add_generated_audio(db, user, _latest_assistant_message(db, user, message.id))
             message.status = "done"
             db.commit()

@@ -110,18 +110,18 @@ def test_voice_note_is_transcribed_echoed_answered_and_shared_with_the_app_histo
     telegram = FakeTelegram()
     with SessionLocal() as db:
         reply = handle_message(db, voice_message(), media_client=telegram)
-    assert isinstance(reply, VoiceBotReply) and telegram.downloads == ["V1"]
+    # Gasto aguardando confirmacao (botoes): so texto, sem TTS.
+    assert not isinstance(reply, VoiceBotReply) and telegram.downloads == ["V1"]
     assert env["agent_calls"] == ["quanto gastei no mercado esse m\u00eas"]  # o agente recebe a transcricao, como se fosse texto
     assert reply.text.startswith("\U0001f399\ufe0f Entendi: \u201cquanto gastei no mercado esse m\u00eas\u201d")
     assert "Voc\u00ea gastou R$ 120,50" in reply.text and reply.keyboard == env["keyboard"]
-    assert reply.voice_text == env["reply"]
+    assert getattr(reply, "voice_text", None) is None
     with SessionLocal() as db:
         user_row, assistant_row = rows(db)
         assert user_row.content == "\u00c1udio enviado. Transcri\u00e7\u00e3o: quanto gastei no mercado esse m\u00eas"
         media = db.scalars(select(ChatMedia)).all()
         assert [(m.kind, m.message_id, m.mime_type) for m in media] == [("audio_user", user_row.id, "audio/ogg")]
         assert media[0].transcript == "quanto gastei no mercado esse m\u00eas"
-        assert reply.message_id == assistant_row.id
     token = client.post("/api/v1/auth/login", json={"username": "expense-user", "password": "password123"}).json()["access_token"]
     history = client.get("/api/v1/assistant/history", headers={"Authorization": f"Bearer {token}"}).json()["items"]
     assert [(row["role"], row["channel"]) for row in history] == [("user", "telegram"), ("assistant", "telegram")]
@@ -371,3 +371,15 @@ def test_telegram_download_error_never_contains_the_token_url(monkeypatch):
     with pytest.raises(TelegramDownloadError) as caught:
         TelegramClient("111:TOKEN").download_file("F1")
     assert "TOKEN" not in str(caught.value) and caught.value.__cause__ is None
+
+
+def test_advisory_voice_answer_is_spoken_but_an_expense_confirmation_is_not(env):
+    telegram = FakeTelegram()
+    with SessionLocal() as db:
+        spoken = handle_message(db, voice_message(), media_client=telegram)
+        assert isinstance(spoken, VoiceBotReply)  # conversa/consultoria: responde tambem por voz
+        env["reply"] = "Confirme este gasto:\n\nValor: R$ 10,00\n\nPosso registrar?"
+        env["keyboard"] = [[{"text": "Confirmar", "callback_data": "ok:c:d:1"}]]
+        confirm = handle_message(db, voice_message(), media_client=telegram)
+    assert not isinstance(confirm, VoiceBotReply) and confirm.keyboard == env["keyboard"]
+    assert confirm.text.startswith("\U0001f399\ufe0f Entendi:") and "Confirme este gasto" in confirm.text

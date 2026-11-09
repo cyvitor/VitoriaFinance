@@ -123,6 +123,14 @@ def _normalize(value: str) -> str:
     ).replace(">", " ").split())
 
 
+CARD_QUERY_NOISE = {"credito", "debito", "cartao", "de", "do", "no", "na"}
+
+
+def _card_query(value: str) -> str:
+    """Ex.: C6 Credito -> c6; a modalidade vai em payment_method, nao no nome do cartao."""
+    return " ".join(word for word in _normalize(value).split() if word not in CARD_QUERY_NOISE)
+
+
 def _resolve_category(db: Session, workspace_id: int, value: str) -> tuple[Category | None, list[str]]:
     normalized_value = _normalize(value)
     words = normalized_value.split()
@@ -210,6 +218,8 @@ def update_expense_draft(db: Session, user: User, *, description: str | None = N
         )).all()
         if card:
             matches = [item for item in cards if card.casefold() in item.name.casefold()]
+            if not matches and _card_query(card):
+                matches = [item for item in cards if _card_query(card) in _normalize(item.name)]
             if len(matches) == 1:
                 draft.card_id = matches[0].id
                 draft.account_id = matches[0].account_id
