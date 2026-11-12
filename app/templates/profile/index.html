@@ -14,7 +14,7 @@
       <div class="d-flex justify-content-between align-items-start gap-3 flex-wrap"><div><h2><i class="bi bi-telegram"></i> Telegram</h2><p class="text-secondary mb-0">Associe seu Telegram para usar a automação com sua própria conta financeira.</p></div>
       {% if telegram_link %}<span class="badge text-bg-success">Associado</span>{% else %}<span class="badge text-bg-secondary">Não associado</span>{% endif %}</div>
       {% if telegram_link %}
-        <hr><p class="mb-1"><strong>ID:</strong> {{ telegram_link.telegram_user_id }}</p><p class="text-secondary">{% if telegram_link.telegram_username %}@{{ telegram_link.telegram_username }} · {% endif %}associado em {{ telegram_link.linked_at.strftime('%d/%m/%Y %H:%M') }}</p>
+        <hr><p class="mb-1"><strong>ID:</strong> {{ telegram_link.telegram_user_id }}</p><p class="text-secondary">{% if telegram_link.telegram_username %}@{{ telegram_link.telegram_username }} · {% endif %}associado em {{ telegram_link.linked_at|br_datetime('%d/%m/%Y %H:%M') }}</p>
         <form method="post" action="/profile/telegram/unlink"><button class="btn btn-outline-danger" onclick="return confirm('Desvincular este Telegram?')">Desvincular Telegram</button></form>
       {% else %}
         <hr><ol><li>Gere um código temporário abaixo.</li><li>Abra o VitoriaBot no Telegram.</li><li>Envie <code>/start CODIGO</code> ao bot.</li></ol>

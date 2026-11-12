@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 import json
+import re
 import unicodedata
 
 from sqlalchemy import select
@@ -9,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from app.models import (
     Account, AccountRole, AreaAccessLevel, Card, Category, Person, TelegramExpenseDraft, TelegramExpenseQueueItem,
-    Transaction, TransactionStatus, TransactionType, User, UserPersonAccess, WorkspaceMember,
+    Transaction, TransactionStatus, TransactionType, User, UserMemory, UserPersonAccess, WorkspaceMember,
 )
 from app.services.card_billing import card_purchase_competence
 
@@ -53,8 +54,29 @@ def _category_label(category: Category) -> str:
     return f"{category.parent_name} > {category.name}" if category.parent_name else category.name
 
 
+def _memory_category(db: Session, user_id: int | None, categories: list[Category],
+                     normalized_description: str) -> Category | None:
+    """Categoria que o usuario ja associou ao estabelecimento em uma memoria (ex.: Steam -> Lazer > Jogos)."""
+    if not user_id:
+        return None
+    description_words = set(re.findall(r"[a-z0-9]{3,}", normalized_description))
+    memories = db.scalars(select(UserMemory).where(
+        UserMemory.user_id == user_id, UserMemory.is_active.is_(True),
+        UserMemory.memory_type.in_(("category_preference", "merchant_alias")),
+    ).order_by(UserMemory.confidence.desc(), UserMemory.id.desc())).all()
+    for memory in memories:
+        if not description_words & set(re.findall(r"[a-z0-9]{3,}", _normalize(memory.subject))):
+            continue
+        text = _normalize(f"{memory.summary} {memory.value_json}")
+        found = [category for category in categories if category.parent_name and re.search(
+            rf"(?<![a-z0-9]){re.escape(_normalize(category.parent_name + ' ' + category.name))}(?![a-z0-9])", text)]
+        if found:
+            return max(found, key=lambda category: len(category.name))
+    return None
+
+
 def _infer_category(
-    db: Session, workspace_id: int, person_id: int, description: str,
+    db: Session, workspace_id: int, person_id: int, description: str, user_id: int | None = None,
 ) -> tuple[Category | None, str | None]:
     categories = db.scalars(select(Category).where(
         Category.workspace_id == workspace_id, Category.kind == TransactionType.expense,
@@ -80,6 +102,9 @@ def _infer_category(
         category = next((item for item in categories if item.id == best_id), None)
         if category:
             return category, "historico do estabelecimento"
+    remembered = _memory_category(db, user_id, categories, normalized)
+    if remembered:
+        return remembered, "memoria do usuario"
     merchant_aliases = {
         "ifood": ("alimentacao", "delivery"),
         "hiperideal": ("alimentacao", "mercado"),
@@ -107,7 +132,7 @@ def suggest_expense_category(db: Session, user: User) -> tuple[TelegramExpenseDr
     if not draft:
         return None, None, None
     category, source = _infer_category(
-        db, draft.workspace_id, draft.person_id, draft.description,
+        db, draft.workspace_id, draft.person_id, draft.description, user.id,
     )
     if category:
         draft.category_id = category.id
@@ -248,13 +273,22 @@ def create_expense_draft(db: Session, user: User, expense: ExpenseInput, now: da
     if active:
         active.status = "cancelled"
         active.resolved_at = now
-    category, _ = _infer_category(db, workspace_id, person.id, expense.description)
+    category, _ = _infer_category(db, workspace_id, person.id, expense.description, user.id)
     draft = TelegramExpenseDraft(
         user_id=user.id, workspace_id=workspace_id, person_id=person.id,
         description=expense.description, amount=expense.amount, transaction_date=date.today(),
         category_id=category.id if category else None,
         expires_at=now + timedelta(minutes=DRAFT_TTL_MINUTES),
     )
+    if (active and active.person_id == person.id and active.amount == expense.amount
+            and _normalize(active.description) == _normalize(expense.description)):
+        # Mesmo gasto preparado de novo (ex.: o modelo repete a ferramenta ao receber o cartao):
+        # categoria e pagamento ja escolhidos nao podem se perder no rascunho novo.
+        draft.category_id = draft.category_id or active.category_id
+        draft.payment_method = active.payment_method
+        draft.card_id, draft.account_id = active.card_id, active.account_id
+        draft.transaction_date = active.transaction_date
+        draft.fuel_details = active.fuel_details
     db.add(draft)
     db.commit()
     db.refresh(draft)

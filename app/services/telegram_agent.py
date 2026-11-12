@@ -928,7 +928,7 @@ def _expense_tool_reply_base(tool_name: str, result: dict, model_reply: str) -> 
         reply = (
             f"Despesa registrada com sucesso: **{result.get('description', '')}**"
             + (f" — {_format_brl(result.get('amount'))}" if result.get("amount") else "")
-            + "."
+            + f". Categoria: **{result.get('category') or 'sem categoria'}**."
         )
         if result.get("fuel_followup") and result.get("fuel_prefilled"):
             prefilled = result["fuel_prefilled"]
@@ -960,6 +960,13 @@ def _expense_tool_reply_base(tool_name: str, result: dict, model_reply: str) -> 
             )
         summary = str(result.get("summary") or model_reply).replace("\n\nPosso registrar?", "").rstrip()
         return summary + "\n\n" + budget_text + "\n\nPosso registrar?"
+    if (tool_name in ("preparar_despesa", "preparar_despesas", "atualizar_despesa")
+            and result.get("status") == "awaiting_confirmation" and result.get("summary")):
+        # O resumo mostrado ao usuario vem do rascunho gravado, nunca do texto do modelo:
+        # assim a categoria/cartao confirmados sao exatamente o que sera salvo.
+        batch = result.get("batch") or {}
+        prefix = f"Despesa {batch.get('current', 1)} de {batch['total']}:\n\n" if batch.get("total") else ""
+        return prefix + str(result["summary"])
     if model_reply.startswith("A consulta foi executada, mas nao consegui formatar"):
         return _draft_fallback_reply(result) or model_reply
     return model_reply
