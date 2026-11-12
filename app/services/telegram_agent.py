@@ -555,10 +555,9 @@ def _select_decision(token: str, model: str, messages: list[dict], text: str) ->
 
 
 def _conversation_history(db: Session, user_id: int) -> list[dict]:
-    items = db.scalars(select(TelegramConversationMessage).where(
-        TelegramConversationMessage.user_id == user_id
-    ).order_by(TelegramConversationMessage.id.desc()).limit(12)).all()
-    return [{"role": item.role, "content": item.content[:2000]} for item in reversed(items)]
+    """Janela limitada (N mensagens e orcamento de caracteres, configuraveis no admin); so mensagens concluidas."""
+    from app.services.chat_history import model_window
+    return [{"role": item.role, "content": item.content} for item in model_window(db, user_id)]
 
 
 def _pending_context(db: Session, user: User) -> str:
@@ -1074,14 +1073,28 @@ Retorne SOMENTE JSON: {"category":"opção exata ou null","confidence":0.0}."""
     return None
 
 
-def run_financial_agent(db: Session, user: User, text: str, reference_date: date | None = None) -> str:
+def _user_message(user: User, text: str, channel: str, existing: TelegramConversationMessage | None,
+                  stored: str | None) -> TelegramConversationMessage:
+    """The user's turn: reuse the row already saved by the app (async audio) or create a new one."""
+    content = (stored or text)[:4000]
+    if existing is not None:
+        existing.content = content
+        return existing
+    return TelegramConversationMessage(user_id=user.id, role="user", content=content, channel=channel)
+
+
+def run_financial_agent(db: Session, user: User, text: str, reference_date: date | None = None, channel: str = "telegram",
+                        user_message: TelegramConversationMessage | None = None,
+                        stored_user_content: str | None = None) -> str:
+    """``user_message``/``stored_user_content`` let the app keep one chat row for an audio message:
+    the model receives ``text`` (internal prompt) while the history stores ``stored_user_content``."""
     reference_date = reference_date or date.today()
     explicit_preference_reply = _store_explicit_preference(db, user, text)
     if explicit_preference_reply:
         db.add_all([
-            TelegramConversationMessage(user_id=user.id, role="user", content=text[:4000]),
+            _user_message(user, text, channel, user_message, stored_user_content),
             TelegramConversationMessage(
-                user_id=user.id, role="assistant", content=explicit_preference_reply,
+                user_id=user.id, role="assistant", content=explicit_preference_reply, channel=channel,
             ),
         ])
         db.commit()
@@ -1090,8 +1103,8 @@ def run_financial_agent(db: Session, user: User, text: str, reference_date: date
     from app.services import fuel_followup
     fuel_reply = fuel_followup.local_text_reply(db, user, text)
     if fuel_reply:
-        db.add_all([TelegramConversationMessage(user_id=user.id, role="user", content=text[:4000]),
-                    TelegramConversationMessage(user_id=user.id, role="assistant", content=fuel_reply[:4000])])
+        db.add_all([_user_message(user, text, channel, user_message, stored_user_content),
+                    TelegramConversationMessage(user_id=user.id, role="assistant", content=fuel_reply[:4000], channel=channel)])
         db.commit()
         logger.info("fuel_followup_local_reply user_id=%s", user.id)
         return fuel_reply
@@ -1154,11 +1167,11 @@ Retorne SOMENTE JSON valido em um destes formatos:
     else:
         decision = _select_decision(token, model, selector_messages, text)
         decision = _enforce_fixed_bill_intent(db, user, text, decision)
-    db.add(TelegramConversationMessage(user_id=user.id, role="user", content=text[:4000]))
+    db.add(_user_message(user, text, channel, user_message, stored_user_content))
     if decision.get("action") == "ask_choice":
         reply = str(decision.get("reply") or "")[:4000]
         db.info["bot_keyboard"] = decision.get("keyboard")
-        db.add(TelegramConversationMessage(user_id=user.id, role="assistant", content=reply))
+        db.add(TelegramConversationMessage(user_id=user.id, role="assistant", content=reply, channel=channel))
         db.commit()
         return reply
     if decision.get("action") == "respond":
@@ -1245,7 +1258,7 @@ apresente o saldo livre e a projecao mensal e pergunte o valor aproximado e como
             reply = _balance_snapshot_reply(result, ask_for_details=True)[:4000]
     else:
         raise AIUnavailableError("O modelo nao selecionou uma acao valida")
-    db.add(TelegramConversationMessage(user_id=user.id, role="assistant", content=reply))
+    db.add(TelegramConversationMessage(user_id=user.id, role="assistant", content=reply, channel=channel))
     logger.debug("agent_reply user_id=%s reply=%r", user.id, reply)
     db.flush()
     _extract_memories(db, user, token, model)
