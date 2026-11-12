@@ -1,11 +1,12 @@
 from calendar import monthrange
 from copy import copy
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 import json
 from pathlib import Path
 import re
 from urllib.parse import parse_qs, urlparse
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -43,7 +44,20 @@ def money(value):
     return f"R$ {value:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 
+SAO_PAULO = ZoneInfo("America/Sao_Paulo")
+
+
+def br_datetime(value, fmt: str = "%d/%m/%Y às %H:%M"):
+    """Datas gravadas em UTC (naive) aparecem no horario de Brasilia."""
+    if not value:
+        return ""
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(SAO_PAULO).strftime(fmt)
+
+
 templates.env.filters["money"] = money
+templates.env.filters["br_datetime"] = br_datetime
 templates.env.globals["set"] = set
 
 

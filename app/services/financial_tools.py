@@ -1220,8 +1220,9 @@ def confirm_expense(db: Session, context: UserAccessContext, args: dict) -> dict
         has_fuel_offer = True
         if phase is None:
             fuel_prefilled = prepare_fuel_fillup(db, context, {})
+    saved_category = (f"{category.parent_name} > {category.name}" if category.parent_name else category.name) if category else None
     return {"registered": True, "description": transaction.description, "amount": _money(transaction.amount),
-            "next_expense": next_expense, "fuel_followup": has_fuel_offer, "fuel_action_id": fuel_action_id,
+            "category": saved_category, "next_expense": next_expense, "fuel_followup": has_fuel_offer, "fuel_action_id": fuel_action_id,
             "fuel_prefilled": fuel_prefilled,
             "vehicles": [item.name for item in vehicles] if has_fuel_offer else []}
 
