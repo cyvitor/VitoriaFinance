@@ -27,6 +27,10 @@ HOMOLOGATION_BRANCH=${VITORIAFINANCE_HOMOLOGATION_BRANCH:-main}
 HEALTH_TIMEOUT=${VITORIAFINANCE_HEALTH_TIMEOUT:-45}
 BACKUP_RETENTION=${VITORIAFINANCE_BACKUP_RETENTION:-30}
 
+# Pula a rodada de testes do deploy quando o CI ja testou este mesmo commit.
+# Por padrao os testes sempre rodam (deploy manual e producao).
+SKIP_TESTS=${VITORIAFINANCE_SKIP_TESTS:-0}
+
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPOSITORY_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 
@@ -41,7 +45,11 @@ die() {
 
 usage() {
     cat <<'EOF'
-Uso: ./devops/deploy.sh [comando] [referencia]
+Uso: ./devops/deploy.sh [--skip-tests] [comando] [referencia]
+
+  --skip-tests        Nao roda o pytest antes do deploy. Use somente quando o
+                      mesmo commit ja passou nos testes do CI. Tambem vale
+                      VITORIAFINANCE_SKIP_TESTS=1.
 
   auto                Verifica o Git e publica quando houver versao elegivel
                       Este e o comando padrao quando nenhum argumento e informado
@@ -285,6 +293,10 @@ run_migrations() {
 }
 
 run_tests() {
+    if [ "$SKIP_TESTS" = "1" ]; then
+        info "Testes automatizados ja executados pelo CI neste commit. Pulando a segunda rodada."
+        return 0
+    fi
     info "Executando testes automatizados antes do deploy."
     (
         cd "$APP_DIR"
@@ -725,6 +737,11 @@ show_logs() {
             ;;
     esac
 }
+
+if [ "${1:-}" = "--skip-tests" ]; then
+    SKIP_TESTS=1
+    shift
+fi
 
 command_name=${1:-auto}
 case "$command_name" in

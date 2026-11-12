@@ -73,5 +73,6 @@ jobs:
       cancel-in-progress: false
 
     steps:
+      # O job pytest acima ja testou este commit; o deploy nao repete a rodada.
       - name: Publicar versao aprovada na homologacao
-        run: sudo -n /usr/local/sbin/vitoriafinance-deploy
+        run: sudo -n /usr/local/sbin/vitoriafinance-deploy --skip-tests
