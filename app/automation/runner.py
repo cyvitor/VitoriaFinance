@@ -7,8 +7,9 @@ from sqlalchemy import select
 
 from app.automation.telegram_bot import handle_callback, handle_message, removes_keyboard
 from app.services.fixed_bills import send_daily_reminders
+from app.services.telegram_media import deliver_voice
 from app.database import SessionLocal
-from app.integrations.telegram import TelegramClient
+from app.integrations.telegram import TelegramClient, chat_action
 from app.logging_config import configure_bot_logging
 from app.models import SystemSetting, TelegramProcessedUpdate
 
@@ -43,6 +44,26 @@ def process_callback(client: TelegramClient, update: dict, callback: dict) -> No
         client.send_reply(chat_id, reply)
 
 
+def process_message(client, update: dict, message: dict, session_factory=SessionLocal) -> bool:
+    """Atende uma mensagem: indicador de digitacao, resposta em texto e, para mensagem de voz, a resposta falada."""
+    logger.debug("telegram_message_received update_id=%s telegram_user_id=%s text=%r",
+                 update.get("update_id"), (message.get("from") or {}).get("id"), message.get("text"))
+    update_key = str(update["update_id"])
+    chat_id = message["chat"]["id"]
+    with chat_action(client, chat_id, "typing"):  # "digitando..." enquanto transcreve, le a imagem ou consulta a IA
+        with session_factory() as db:
+            if db.scalar(select(TelegramProcessedUpdate.id).where(TelegramProcessedUpdate.update_id == update_key)):
+                return False
+            response = handle_message(db, message, media_client=client)
+            db.add(TelegramProcessedUpdate(update_id=update_key))
+            db.commit()
+    logger.debug("telegram_message_reply update_id=%s telegram_user_id=%s reply=%r",
+                 update.get("update_id"), (message.get("from") or {}).get("id"), response)
+    client.send_reply(chat_id, response)
+    deliver_voice(client, chat_id, response, session_factory)
+    return True
+
+
 def run() -> None:
     token = load_telegram_token()
     if not token:
@@ -66,18 +87,7 @@ def run() -> None:
                 message = update.get("message")
                 if not message:
                     continue
-                logger.debug("telegram_message_received update_id=%s telegram_user_id=%s text=%r",
-                             update.get("update_id"), (message.get("from") or {}).get("id"), message.get("text"))
-                with SessionLocal() as db:
-                    update_key = str(update["update_id"])
-                    if db.scalar(select(TelegramProcessedUpdate.id).where(TelegramProcessedUpdate.update_id == update_key)):
-                        continue
-                    response = handle_message(db, message)
-                    db.add(TelegramProcessedUpdate(update_id=update_key))
-                    db.commit()
-                logger.debug("telegram_message_reply update_id=%s telegram_user_id=%s reply=%r",
-                             update.get("update_id"), (message.get("from") or {}).get("id"), response)
-                client.send_reply(message["chat"]["id"], response)
+                process_message(client, update, message)
         except KeyboardInterrupt:
             logger.info("Worker encerrado.")
             return

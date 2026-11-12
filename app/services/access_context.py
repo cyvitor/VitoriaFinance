@@ -11,6 +11,7 @@ class UserAccessContext:
     user_id: int
     system_account_id: int | None
     workspace_ids: tuple[int, ...]
+    person_workspace_ids: tuple[tuple[int, int], ...]
     allowed_person_ids: tuple[int, ...]
     writable_person_ids: tuple[int, ...]
     writable_workspace_ids: tuple[int, ...]
@@ -34,6 +35,11 @@ def build_user_access_context(db: Session, user: User) -> UserAccessContext:
             Person.workspace_id.in_(workspace_ids),
             Person.is_active.is_(True),
         )).all()) if workspace_ids else ()
+    person_workspace_ids = tuple(
+        (person_id, workspace_id) for person_id, workspace_id in db.execute(
+            select(Person.id, Person.workspace_id).where(Person.id.in_(person_ids))
+        ).all()
+    ) if person_ids else ()
     if is_admin:
         writable_ids = person_ids
     else:
@@ -53,6 +59,7 @@ def build_user_access_context(db: Session, user: User) -> UserAccessContext:
         user_id=user.id,
         system_account_id=user.system_account_id,
         workspace_ids=workspace_ids,
+        person_workspace_ids=person_workspace_ids,
         allowed_person_ids=person_ids,
         writable_person_ids=writable_ids,
         writable_workspace_ids=writable_workspace_ids,
@@ -75,8 +82,12 @@ def scope_to_principal_area(context: UserAccessContext) -> UserAccessContext:
     if principal is None:
         return replace(context, allowed_person_ids=(), writable_person_ids=(), can_write=False)
     scoped = (principal,)
+    scoped_workspaces = tuple(workspace_id for person_id, workspace_id in context.person_workspace_ids
+                              if person_id == principal)
     return replace(
         context,
+        workspace_ids=scoped_workspaces,
+        writable_workspace_ids=tuple(w for w in context.writable_workspace_ids if w in scoped_workspaces),
         allowed_person_ids=scoped,
         writable_person_ids=scoped,
         default_person_id=principal,

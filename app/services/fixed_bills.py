@@ -19,7 +19,7 @@ from app.models import (
     Account, Card, Person, RecurrenceRule, SystemSetting, TelegramBillReminder, TelegramLink,
     TelegramPendingAction, TransactionType, User,
 )
-from app.services.access_context import UserAccessContext, build_user_access_context
+from app.services.access_context import UserAccessContext, build_user_access_context, scope_to_principal_area
 from app.services.recurrence_payments import (
     PendingBill, RecurrenceAlreadyResolved, apply_recurrence_confirmation, pending_fixed_bills,
 )
@@ -81,7 +81,7 @@ def parse_amount(text: str) -> Decimal | None:
 
 def _context(db: Session, user_id: int) -> UserAccessContext | None:
     user = db.get(User, user_id)
-    return build_user_access_context(db, user) if user else None
+    return scope_to_principal_area(build_user_access_context(db, user)) if user else None
 
 
 def _people(db: Session, context: UserAccessContext) -> dict[int, Person]:

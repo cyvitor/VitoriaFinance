@@ -62,8 +62,11 @@ def handle_callback(db: Session, callback: dict) -> BotReply:
         return BotReply("Seu Telegram ainda nao esta associado. Gere um codigo em Meu perfil e envie /start CODIGO.")
     try:
         data = str(callback.get("data") or "")
+        from app.services import scheduled_expenses, statement_balance
         reply = (bot_confirmations.handle_callback(db, user, data)
                  or fuel_followup.handle_callback(db, user, data)
+                 or scheduled_expenses.handle_callback(db, user, data)
+                 or statement_balance.handle_callback(db, user, data)
                  or handle_bill_callback(db, user, data, _message_date(callback.get("message") or {}, user)))
         key = _button_key(data)
         echo = BUTTON_ECHO.get(key)
@@ -107,7 +110,46 @@ def _choice_keyboard(db: Session, user_id: int):
              {"text": "🆕 Despesa nova", "callback_data": f"ec:n:{action.id}"}]]
 
 
-def handle_message(db: Session, message: dict) -> str | BotReply:
+def agent_turn(db: Session, user: User, text: str, message_date, stored_user_content: str | None = None) -> str | BotReply:
+    """Roda o agente na area padrao do usuario e anexa os botoes de confirmacao quando houver."""
+    started = datetime.utcnow()
+    db.info.pop("bot_keyboard", None)
+    db.info.pop("bot_write_flow", None)
+    extra = {"stored_user_content": stored_user_content} if stored_user_content is not None else {}
+    reply = run_financial_agent(db, user, text, reference_date=message_date, **extra)
+    keyboard = db.info.pop("bot_keyboard", None) or keyboard_for_recent_action(db, user.id, started)
+    if not keyboard and db.info.get("bot_write_flow"):
+        # Regra: botoes so quando ESTE turno mexeu em algo que aguarda confirmacao (rascunho, acao pendente,
+        # escolha). Conversa comum ("oi") nao traz botoes, mesmo havendo pendencia antiga.
+        keyboard = bot_confirmations.keyboard_for_pending(db, user.id) or _choice_keyboard(db, user.id)
+    return BotReply(reply, keyboard) if keyboard else reply
+
+
+def text_turn(db: Session, user: User, text: str, message_date, stored_user_content: str | None = None) -> str | BotReply:
+    """Mesmo caminho do texto digitado: contas fixas locais primeiro, depois o agente."""
+    bill_reply = handle_bill_text(db, user, text, message_date)
+    if bill_reply is not None:
+        return bill_reply
+    return agent_turn(db, user, text, message_date, stored_user_content)
+
+
+def agent_error_message(user_id: int, exc: Exception) -> str:
+    if isinstance(exc, (AIResponseFormatError, AIToolSelectionError)):
+        logger.error("agent_structured_response_failed user_id=%s error=%s", user_id, exc)
+        return "N\u00e3o consegui organizar essa consulta com seguran\u00e7a agora. Nenhum lan\u00e7amento foi feito; tente novamente em instantes."
+    if isinstance(exc, AIUnavailableError):
+        logger.error("deepinfra_unavailable user_id=%s error=%s", user_id, exc)
+        return "N\u00e3o consegui acessar a Vitoria pela DeepInfra agora. Nenhum lan\u00e7amento foi feito; use a interface web por enquanto."
+    logger.error("unexpected_agent_error user_id=%s", user_id, exc_info=exc)
+    return "Ocorreu um erro inesperado ao processar sua mensagem. Nenhum lan\u00e7amento foi feito; use a interface web por enquanto."
+
+
+UNSUPPORTED_MESSAGE = ("Ainda n\u00e3o entendo esse tipo de mensagem. Pode me escrever, mandar um \u00e1udio "
+                       "ou a foto de um comprovante.")
+
+
+def handle_message(db: Session, message: dict, media_client=None) -> str | BotReply:
+    """``media_client`` (TelegramClient ou equivalente) baixa audios e fotos; sem ele so o texto funciona."""
     text = (message.get("text") or "").strip()
     sender = message.get("from") or {}
     chat = message.get("chat") or {}
@@ -131,31 +173,14 @@ def handle_message(db: Session, message: dict) -> str | BotReply:
         return "Para associar sua conta, gere um codigo em Meu perfil no VitoriaFinance e envie /start CODIGO."
     if not user or not user.is_active or (user.system_account and not user.system_account.is_active):
         return "Seu Telegram ainda nao esta associado. Gere um codigo em Meu perfil e envie /start CODIGO."
+    message_date = _message_date(message, user)
+    if not text:
+        from app.services import telegram_media
+        media = telegram_media.incoming_media(message)
+        if media is None:
+            return UNSUPPORTED_MESSAGE
+        return telegram_media.handle_media(db, user, message, media, media_client, message_date)
     try:
-        message_date = None
-        if message.get("date") is not None:
-            try:
-                message_date = datetime.fromtimestamp(
-                    int(message["date"]), tz=ZoneInfo("America/Sao_Paulo")
-                ).date()
-            except (TypeError, ValueError, OSError):
-                logger.warning("telegram_message_invalid_date user_id=%s date=%r", user.id, message.get("date"))
-        bill_reply = handle_bill_text(db, user, text, message_date)
-        if bill_reply is not None:
-            return bill_reply
-        started = datetime.utcnow()
-        db.info.pop("bot_keyboard", None)
-        reply = run_financial_agent(db, user, text, reference_date=message_date)
-        keyboard = (db.info.pop("bot_keyboard", None) or keyboard_for_recent_action(db, user.id, started)
-                    or bot_confirmations.keyboard_for_pending(db, user.id)
-                    or _choice_keyboard(db, user.id))
-        return BotReply(reply, keyboard) if keyboard else reply
-    except (AIResponseFormatError, AIToolSelectionError) as exc:
-        logger.error("agent_structured_response_failed user_id=%s error=%s", user.id, exc)
-        return "Não consegui organizar essa consulta com segurança agora. Nenhum lançamento foi feito; tente novamente em instantes."
-    except AIUnavailableError as exc:
-        logger.error("deepinfra_unavailable user_id=%s error=%s", user.id, exc)
-        return "Não consegui acessar a Vitoria pela DeepInfra agora. Nenhum lançamento foi feito; use a interface web por enquanto."
-    except Exception:
-        logger.exception("unexpected_agent_error user_id=%s", user.id)
-        return "Ocorreu um erro inesperado ao processar sua mensagem. Nenhum lançamento foi feito; use a interface web por enquanto."
+        return text_turn(db, user, text, message_date)
+    except Exception as exc:
+        return agent_error_message(user.id, exc)

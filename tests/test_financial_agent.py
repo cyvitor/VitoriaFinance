@@ -18,7 +18,7 @@ from app.services.telegram_agent import (
     _ai_category_recommendation, _enforce_balance_intent, _enforce_category_recommendation_intent,
     _enforce_expense_reference_date, _enforce_pending_confirmation_intent,
     _enforce_pending_description_intent, _enforce_pending_expense_intent,
-    _expense_tool_reply, _requires_financial_tool,
+    _expense_tool_reply, _select_decision, receipt_prompt,
     _enforce_spending_feasibility_intent, _enforce_transaction_period_intent,
     _fallback_tool_reply, _looks_like_multiple_expenses, run_financial_agent,
 )
@@ -430,28 +430,105 @@ def test_agent_respects_model_tool_selection_without_fixed_intent_override(monke
     assert reply == "Receitas e despesas consultadas."
 
 
-def test_expense_typo_with_financial_context_still_requires_tool():
-    assert _requires_financial_tool("gatei 5 no credito c6 na doce pão") is True
-    assert _requires_financial_tool(
-        "grave na sua memória que se eu não disser a data do gasto, considere o dia corrente"
-    ) is False
+def _agent_settings(db):
+    db.add_all([SystemSetting(key="deepinfra_api_key", value="secret", is_secret=True),
+                SystemSetting(key="deepinfra_model", value="deepseek")])
+    db.commit()
 
 
-def test_explicit_default_date_preference_is_stored_without_deepinfra():
+def test_receipt_prompt_is_a_single_expense_and_must_use_a_tool(monkeypatch):
+    prompt = receipt_prompt("Mercado Bom Preco, R$ 60,58, 05/11/2026, 2 itens e total R$ 60,58")
+    assert _looks_like_multiple_expenses(prompt) is False  # causa do "nao consegui organizar" no comprovante
+    draft = json.dumps({"action": "tool", "tool": "preparar_despesa", "arguments": {"amount": 60.58, "description": "Mercado"}})
+    only_text = json.dumps({"action": "respond", "reply": "Confirme este gasto: ..."})
+    replies = iter([only_text, draft])
+    monkeypatch.setattr("app.services.telegram_agent._complete", lambda *a, **k: next(replies))
+    decision = _select_decision("t", "m", [{"role": "user", "content": prompt}], prompt, require_tool=True)
+    assert decision["tool"] == "preparar_despesa"  # texto solto e recusado: o rascunho precisa existir para o 'sim' funcionar
+
+
+def test_financial_questions_are_no_longer_forced_to_a_tool_by_keywords(monkeypatch):
+    reply = json.dumps({"action": "respond", "reply": "Posso ajudar com isso."})
+    monkeypatch.setattr("app.services.telegram_agent._complete", lambda *a, **k: reply)
+    decision = _select_decision("t", "m", [], "quanto custa um cartao de credito?")
+    assert decision["action"] == "respond"
+
+
+def test_model_saves_preference_with_tool_and_it_is_always_in_context(monkeypatch):
+    prompts = []
+    responses = iter([
+        json.dumps({"action": "tool", "tool": "salvar_preferencia", "arguments": {
+            "subject": "cartao padrao", "summary": "Sem cartao informado, o gasto e no C6 credito.",
+            "value": {"card": "C6", "payment_method": "credit"}}}),
+        "Combinado! Quando voce nao disser o cartao, vou usar o C6 no credito.",
+        json.dumps({"action": "respond", "reply": "Registrado no C6."}),
+    ])
+
+    def complete(token, model, messages, *args, **kwargs):
+        prompts.append(messages[0]["content"])
+        return next(responses)
+
+    monkeypatch.setattr("app.services.telegram_agent._complete", complete)
+    monkeypatch.setattr("app.services.telegram_agent._extract_memories", lambda *args: None)
     with SessionLocal() as db:
         user, financing, hidden, rule = setup_financings(db)
-        reply = run_financial_agent(
-            db, user,
-            "Grave na sua memória q se eu n disse q data do gasto, considerar sempre o dia corrente",
-            reference_date=date(2026, 8, 6),
-        )
-        assert "guardei essa preferência" in reply
-        memory = db.scalar(select(UserMemory).where(
-            UserMemory.user_id == user.id,
-            UserMemory.subject == "data_padrao_dos_gastos",
-        ))
-        assert memory is not None
-        assert json.loads(memory.value_json)["default"] == "telegram_message_date"
+        _agent_settings(db)
+        first = run_financial_agent(db, user, "sem cartao informado, e C6 credito")
+        assert first.startswith("Combinado")
+        memory = db.scalar(select(UserMemory).where(UserMemory.user_id == user.id))
+        assert memory.memory_type == "user_preference" and memory.source == "user_explicit"
+        assert json.loads(memory.value_json) == {"card": "C6", "payment_method": "credit"}
+        # Mensagem sem nenhuma palavra em comum: a preferencia entra no contexto mesmo assim.
+        run_financial_agent(db, user, "bom dia")
+        assert "Sem cartao informado, o gasto e no C6 credito." in prompts[-1]
+
+
+def test_explicit_preference_overrides_older_automatic_memory_and_old_preferred_card_is_always_listed():
+    from app.services.user_memory import store_candidates
+    with SessionLocal() as db:
+        user, financing, hidden, rule = setup_financings(db)
+        store_candidates(db, user.id, [{"type": "preferred_card", "subject": "mercado", "value": {"card": "C6"},
+                                        "summary": "Prefere o C6 credito no mercado.", "confidence": 0.9}])
+        store_candidates(db, user.id, [{"type": "user_preference", "subject": "cartao padrao", "value": {"card": "C6"},
+                                        "summary": "Padrao: C6.", "confidence": 0.95}], source="user_explicit", override=True)
+        db.flush()
+        store_candidates(db, user.id, [{"type": "user_preference", "subject": "cartao padrao", "value": {"card": "Nu"},
+                                        "summary": "Padrao agora: Nu.", "confidence": 0.95}], source="user_explicit", override=True)
+        db.commit()
+        picked = relevant_memories(db, user.id, "bom dia")
+        assert [m.summary for m in picked][0] == "Padrao agora: Nu."
+        assert "Prefere o C6 credito no mercado." in [m.summary for m in picked]
+
+
+def test_default_date_phrase_is_not_intercepted_by_code(monkeypatch):
+    calls = []
+    monkeypatch.setattr("app.services.telegram_agent._complete",
+                        lambda *a, **k: (calls.append(1), json.dumps({"action": "respond", "reply": "Entendido."}))[1])
+    monkeypatch.setattr("app.services.telegram_agent._extract_memories", lambda *args: None)
+    with SessionLocal() as db:
+        user, financing, hidden, rule = setup_financings(db)
+        _agent_settings(db)
+        reply = run_financial_agent(db, user, "Lembre que se eu nao disser a data, considere hoje")
+    assert reply == "Entendido." and calls  # o modelo decide; nao ha resposta pronta em codigo
+
+
+def test_buttons_only_for_a_real_pending_action_not_for_a_simple_greeting(monkeypatch):
+    from app.automation import telegram_bot
+    monkeypatch.setattr("app.services.telegram_agent._complete",
+                        lambda *a, **k: json.dumps({"action": "respond", "reply": "Oi! Como posso ajudar?"}))
+    monkeypatch.setattr("app.services.telegram_agent._extract_memories", lambda *args: None)
+    with SessionLocal() as db:
+        user, financing, hidden, rule = setup_financings(db)
+        _agent_settings(db)
+        db.add(TelegramPendingAction(user_id=user.id, action_type="income_registration", status="awaiting_confirmation",
+                                     payload="{}", expires_at=datetime.utcnow() + timedelta(minutes=30)))
+        db.commit()
+        reply = telegram_bot.agent_turn(db, user, "oi", None)
+        assert reply == "Oi! Como posso ajudar?"  # pendencia antiga existe, mas o turno nao mexeu nela: sem botoes
+        monkeypatch.setattr("app.automation.telegram_bot.run_financial_agent",
+                            lambda db, user, text, **kw: (db.info.__setitem__("bot_write_flow", True), "Confirme?")[1])
+        flagged = telegram_bot.agent_turn(db, user, "gastei 10", None)
+        assert flagged.keyboard and flagged.keyboard[0][0]["callback_data"].startswith("ok:c:a:")
 
 
 def test_category_reply_updates_existing_expense_instead_of_recreating_it():
@@ -634,3 +711,31 @@ def test_agent_retries_plain_text_and_forces_financial_tool(monkeypatch):
         db.commit()
         reply = run_financial_agent(db, user, "ainda tenho saldo livre? pretendo gastar 100 reais")
         assert "R$ 100,00" in reply
+
+
+def test_decision_with_tool_name_as_action_is_accepted(monkeypatch):
+    flat = json.dumps({"action": "preparar_despesa", "amount": 27.9, "description": "Farmacia", "card": "C6 Credito"})
+    monkeypatch.setattr("app.services.telegram_agent._complete", lambda *a, **k: flat)
+    decision = _select_decision("t", "m", [], "gastei 27,90 na farmacia")
+    assert decision == {"action": "tool", "tool": "preparar_despesa",
+                        "arguments": {"amount": 27.9, "description": "Farmacia", "card": "C6 Credito"}}
+
+
+def test_card_with_payment_mode_in_name_matches_the_card():
+    from app.services.telegram_expenses import _card_query
+    assert _card_query("C6 Cr\u00e9dito") == "c6"
+    assert _card_query("cartao NuVirtual") == "nuvirtual"
+
+
+def test_automatic_extraction_never_overwrites_explicit_preference():
+    from app.services.user_memory import store_candidates
+    with SessionLocal() as db:
+        user, financing, hidden, rule = setup_financings(db)
+        store_candidates(db, user.id, [{"type": "user_preference", "subject": "cartao padrao", "value": {"card": "C6"},
+                                        "summary": "Padrao: C6.", "confidence": 0.95}], source="user_explicit", override=True)
+        db.flush()
+        store_candidates(db, user.id, [{"type": "user_preference", "subject": "cartao padrao", "value": {"card": "Nu"},
+                                        "summary": "Padrao: Nu.", "confidence": 0.95}])
+        db.commit()
+        memory = db.scalar(select(UserMemory).where(UserMemory.user_id == user.id))
+        assert memory.summary == "Padrao: C6." and memory.source == "user_explicit"

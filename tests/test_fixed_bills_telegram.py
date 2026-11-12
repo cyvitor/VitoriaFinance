@@ -87,7 +87,9 @@ def test_pending_command_lists_oldest_competence_first_with_buttons(monkeypatch)
         reply = handle_message(db, message("/contas"))
         assert isinstance(reply, BotReply)
         assert reply.text.index("09/2026") < reply.text.index("10/2026")
-        assert "Claro (Esposa)" in reply.text and "Luz (Vitor)" in reply.text
+        # O Telegram atende somente a area padrao do usuario: as contas da esposa nao aparecem.
+        assert "Claro (Vitor)" in reply.text and "Luz (Vitor)" in reply.text
+        assert "Esposa" not in reply.text
         datas = [button["callback_data"] for row in reply.keyboard for button in row]
         assert f"fb:p:{luz.id}:202609" in datas and f"fb:m:{luz.id}" in datas
         assert all(len(item.encode()) <= 64 for item in datas)
@@ -130,14 +132,13 @@ def test_ambiguous_name_asks_which_area(monkeypatch):
     llm(monkeypatch)
     with SessionLocal() as db:
         user, luz, claro_v, claro_e = seed(db)
+        # So a area padrao conta: "claro" nao e ambiguo e nunca resolve para a conta da esposa.
         result = prepare_payment(db, user.id, today=TODAY, bill="claro")
-        assert result["status"] == "ambiguous"
-        assert result["options"] == ["Claro (Vitor)", "Claro (Esposa)"] or set(result["options"]) == {
-            "Claro (Vitor)", "Claro (Esposa)"}
-        chosen = prepare_payment(db, user.id, today=TODAY, bill="claro da esposa")
-        assert chosen["status"] == "missing_method" and chosen["rule_id"] == claro_e.id
-        assert chosen["source_options"] == ["Conta Santander (débito)"]
-        assert "Santander" in chosen["message"]
+        assert result["status"] == "missing_method" and result["rule_id"] == claro_v.id
+        assert "Claro (Vitor)" in result["message"] and "Esposa" not in result["message"]
+        hinted = prepare_payment(db, user.id, today=TODAY, bill="claro da esposa")
+        assert hinted["rule_id"] == claro_v.id and hinted["rule_id"] != claro_e.id
+        assert not any("Santander" in option for option in hinted["source_options"])
 
 
 def test_current_month_competence_by_text_and_button(monkeypatch):
@@ -200,9 +201,11 @@ def test_due_day_by_text_and_daily_reminder_without_duplicates(monkeypatch):
         reply = handle_message(db, message("luz vence dia 10"))
         assert "vence todo dia 10" in reply.text
         db.refresh(luz); assert luz.days_of_month == "10"
-        ambiguous = handle_message(db, message("claro vence dia 13"))
-        assert "mais de uma conta" in ambiguous.text
+        # Sem ambiguidade: a conta da esposa fica fora do alcance do Telegram.
+        own = handle_message(db, message("claro vence dia 13"))
+        assert "Claro (Vitor)" in own.text and "mais de uma conta" not in own.text
         handle_message(db, message("claro da esposa vence dia 13"))
+        db.refresh(claro_e); assert claro_e.days_of_month is None
         sent = []
         sender = lambda chat, reply: sent.append((chat, reply))
         tz = fixed_bills.SAO_PAULO
