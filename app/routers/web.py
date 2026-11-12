@@ -1,11 +1,12 @@
 from calendar import monthrange
 from copy import copy
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 import json
 from pathlib import Path
 import re
 from urllib.parse import parse_qs, urlparse
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -29,6 +30,7 @@ from app.services.card_billing import (
     card_invoice_is_closed, card_purchase_competence, shift_month as shift_competence_month,
 )
 from app.services.monthly_projection import monthly_budget_positions, projection_budget_remaining
+from app.services.accounting_periods import current_open_month
 from app.services.telegram_auth import PAIRING_TTL_MINUTES, create_pairing_code, unlink_telegram
 from scripts.seed import seed_categories
 
@@ -42,7 +44,20 @@ def money(value):
     return f"R$ {value:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 
+SAO_PAULO = ZoneInfo("America/Sao_Paulo")
+
+
+def br_datetime(value, fmt: str = "%d/%m/%Y às %H:%M"):
+    """Datas gravadas em UTC (naive) aparecem no horario de Brasilia."""
+    if not value:
+        return ""
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(SAO_PAULO).strftime(fmt)
+
+
 templates.env.filters["money"] = money
+templates.env.filters["br_datetime"] = br_datetime
 templates.env.globals["set"] = set
 
 
@@ -243,24 +258,8 @@ def shift_month(value: date, offset: int) -> date:
 
 
 def earliest_open_month(db: Session, workspace_id: int, today: date) -> tuple[int, int]:
-    """Retorna a competência aberta mais antiga do ano corrente."""
-    periods = db.scalars(select(AccountingPeriod).where(
-        AccountingPeriod.workspace_id == workspace_id,
-        AccountingPeriod.year == today.year,
-        AccountingPeriod.month <= today.month,
-    )).all()
-    reopened = sorted(item.month for item in periods if not item.is_closed)
-    if reopened:
-        return today.year, reopened[0]
-    closed = {item.month for item in periods if item.is_closed}
-    consecutive_closed = 0
-    for month in range(1, today.month + 1):
-        if month not in closed:
-            break
-        consecutive_closed = month
-    if consecutive_closed:
-        return today.year, min(consecutive_closed + 1, today.month)
-    return today.year, today.month
+    """Use the current competence if open, otherwise its next open successor."""
+    return current_open_month(db, workspace_id, today)
 
 
 @router.get("/login", response_class=HTMLResponse)
@@ -2264,6 +2263,7 @@ def system_settings(request: Request, db: Session = Depends(get_db), user: User 
     try: models = json.loads(values.get("deepinfra_models", "[]"))
     except json.JSONDecodeError: models = []
     from app.services import llm_client as llm
+    from app.services import chat_history
     llm_defaults = {
         "deepinfra_model": llm.DEFAULT_MODEL,
         "deepinfra_fallback_models": ", ".join(llm.DEFAULT_FALLBACK_MODELS),
@@ -2272,6 +2272,11 @@ def system_settings(request: Request, db: Session = Depends(get_db), user: User 
         "llm_retry_max_delay_ms": llm.DEFAULT_RETRY_MAX_DELAY_MS,
         "llm_request_timeout_ms": llm.DEFAULT_REQUEST_TIMEOUT_MS,
         "bill_reminder_time": "08:00",
+        "audio_transcription_model": "openai/whisper-large-v3-turbo",
+        "audio_generation_model": "",
+        "image_recognition_model": "",
+        "chat_history_max_messages": chat_history.DEFAULT_HISTORY_MESSAGES,
+        "chat_history_max_chars": chat_history.DEFAULT_HISTORY_CHARS,
     }
     return render(request, "admin/system_settings.html", user=user, values=values, models=models,
                   llm_defaults=llm_defaults)
@@ -2283,15 +2288,24 @@ def system_settings_save(request: Request, deepinfra_api_key: str = Form(""), de
         llm_retry_attempts: str = Form(""), llm_retry_base_delay_ms: str = Form(""),
         llm_retry_max_delay_ms: str = Form(""), llm_request_timeout_ms: str = Form(""),
         bill_reminder_time: str = Form(""),
+        audio_transcription_model: str = Form(""), audio_generation_model: str = Form(""),
+        image_recognition_model: str = Form(""),
+        chat_history_max_messages: str = Form(""), chat_history_max_chars: str = Form(""),
         db: Session = Depends(get_db), user: User = Depends(current_user)):
     require_super_admin(user)
     from app.services.llm_client import parse_model_list
     if deepinfra_api_key: set_system_setting(db, "deepinfra_api_key", deepinfra_api_key, True)
     if deepinfra_model: set_system_setting(db, "deepinfra_model", deepinfra_model.strip())
+    for key, value in (("audio_transcription_model", audio_transcription_model),
+                       ("audio_generation_model", audio_generation_model),
+                       ("image_recognition_model", image_recognition_model)):
+        set_system_setting(db, key, value.strip())
     if deepinfra_fallback_models is not None:
         set_system_setting(db, "deepinfra_fallback_models", ", ".join(parse_model_list(deepinfra_fallback_models)))
     numeric = {"llm_retry_attempts": (llm_retry_attempts, 1, 10), "llm_retry_base_delay_ms": (llm_retry_base_delay_ms, 0, 60000),
-               "llm_retry_max_delay_ms": (llm_retry_max_delay_ms, 0, 120000), "llm_request_timeout_ms": (llm_request_timeout_ms, 1000, 120000)}
+               "llm_retry_max_delay_ms": (llm_retry_max_delay_ms, 0, 120000), "llm_request_timeout_ms": (llm_request_timeout_ms, 1000, 120000),
+               "chat_history_max_messages": (chat_history_max_messages, 2, 200),
+               "chat_history_max_chars": (chat_history_max_chars, 500, 60000)}
     for key, (raw, low, high) in numeric.items():
         raw = (raw or "").strip()
         if not raw: continue

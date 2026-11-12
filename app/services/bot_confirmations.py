@@ -87,7 +87,7 @@ def _agent_context(db: Session, user: User):
 
 def _expense_reply(tool: str, result: dict) -> str:
     from app.services.telegram_agent import _expense_tool_reply, _fallback_tool_reply, _fuel_tool_reply
-    if result.get("fixed_bill"):
+    if result.get("fixed_bill") or result.get("deterministic"):
         return str(result.get("message") or "")
     reply = _expense_tool_reply(tool, result, _fallback_tool_reply(tool, result))
     return _fuel_tool_reply(result, reply)

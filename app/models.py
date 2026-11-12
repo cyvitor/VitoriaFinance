@@ -156,10 +156,30 @@ class TelegramBillReminder(Base):
 
 class TelegramConversationMessage(Base):
     __tablename__ = "telegram_conversation_messages"
+    __table_args__ = (UniqueConstraint("user_id", "client_key", name="uq_conversation_user_client_key"),)
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     role: Mapped[str] = mapped_column(String(20))
     content: Mapped[str] = mapped_column(Text)
+    channel: Mapped[str] = mapped_column(String(20), default="telegram", index=True)
+    # pending/done/error: áudio do app é processado depois que o upload responde.
+    status: Mapped[str] = mapped_column(String(12), default="done", server_default="done", index=True)
+    client_key: Mapped[str | None] = mapped_column(String(64), nullable=True)  # chave de idempotência enviada pelo app
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+
+class ChatMedia(Base):
+    """Anexo privado do chat. Os bytes ficam fora da pasta pública de estáticos."""
+    __tablename__ = "chat_media"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    message_id: Mapped[int] = mapped_column(ForeignKey("telegram_conversation_messages.id", ondelete="CASCADE"), index=True)
+    kind: Mapped[str] = mapped_column(String(20), index=True)
+    storage_key: Mapped[str] = mapped_column(String(80), unique=True)
+    filename: Mapped[str] = mapped_column(String(180))
+    mime_type: Mapped[str] = mapped_column(String(80))
+    transcript: Mapped[str | None] = mapped_column(Text, nullable=True)
+    played_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)  # áudio da assistente já reproduzido
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
 
 
@@ -274,6 +294,23 @@ class Account(Base):
     color: Mapped[str] = mapped_column(String(7), default="#6c5ce7")
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     person: Mapped[Person | None] = relationship()
+
+
+class AccountBalanceAdjustment(Base):
+    """Auditoria do ajuste de saldo pelo extrato. Não é receita nem despesa."""
+    __tablename__ = "account_balance_adjustments"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    adjustment_date: Mapped[date] = mapped_column(Date, index=True)
+    previous_balance: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+    new_balance: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+    previous_initial_balance: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+    new_initial_balance: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+    description: Mapped[str] = mapped_column(String(180), default="Ajuste de saldo pelo extrato")
+    notes: Mapped[str | None] = mapped_column(String(180), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    account: Mapped[Account] = relationship()
 
 
 class Card(Base):

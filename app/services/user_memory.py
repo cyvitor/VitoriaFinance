@@ -14,7 +14,7 @@ ALLOWED_MEMORY_TYPES = {
     "merchant_alias", "preferred_account", "preferred_card", "category_preference",
     "financial_area_alias", "financing_alias", "user_preference", "financial_goal",
 }
-ALWAYS_INCLUDED_TYPES = {"user_preference", "financial_area_alias", "financing_alias"}
+ALWAYS_INCLUDED_TYPES = {"user_preference", "preferred_card", "preferred_account", "financial_area_alias", "financing_alias"}
 FORBIDDEN_TERMS = {"senha", "password", "token", "api key", "codigo de autenticacao", "secret"}
 
 
@@ -27,7 +27,7 @@ def _tokens(value: str) -> set[str]:
     return {token for token in re.findall(r"[a-z0-9]{3,}", _normalize(value))}
 
 
-def relevant_memories(db: Session, user_id: int, message: str, limit: int = 12) -> list[UserMemory]:
+def relevant_memories(db: Session, user_id: int, message: str, limit: int = 20) -> list[UserMemory]:
     memories = db.scalars(select(UserMemory).where(
         UserMemory.user_id == user_id, UserMemory.is_active.is_(True)
     )).all()
@@ -39,6 +39,8 @@ def relevant_memories(db: Session, user_id: int, message: str, limit: int = 12) 
         always = memory.memory_type in ALWAYS_INCLUDED_TYPES
         if overlap or always:
             score = overlap * 10 + float(memory.confidence) + (3 if always else 0)
+            if memory.source == "user_explicit":
+                score += 5  # regra declarada pelo usuario vence sugestoes automaticas
             ranked.append((score, memory))
     selected = [memory for _, memory in sorted(ranked, key=lambda item: item[0], reverse=True)[:limit]]
     now = datetime.utcnow()
@@ -58,7 +60,9 @@ def format_memory_context(memories: list[UserMemory]) -> str:
     return "Memorias permanentes relevantes:\n" + "\n".join(lines)
 
 
-def store_candidates(db: Session, user_id: int, candidates: list[dict]) -> int:
+def store_candidates(db: Session, user_id: int, candidates: list[dict],
+                     source: str = "automatic_extraction", override: bool = False) -> int:
+    """``override``: preferencia declarada pelo usuario, substitui o valor anterior do mesmo assunto."""
     stored = 0
     for candidate in candidates[:10]:
         memory_type = str(candidate.get("type") or "").strip()
@@ -85,10 +89,18 @@ def store_candidates(db: Session, user_id: int, candidates: list[dict]) -> int:
             same_value = existing.value_json == value_json
             existing.observation_count += 1
             existing.is_active = True
-            if same_value:
+            if override:
+                existing.value_json = value_json
+                existing.summary = summary
+                existing.confidence = confidence
+                existing.source = source
+                existing.confirmation_count += 1
+            elif same_value:
                 existing.confidence = min(Decimal("0.990"), Decimal(existing.confidence) + Decimal("0.080"))
                 if confidence >= Decimal("0.850"):
                     existing.confirmation_count += 1
+            elif existing.source == "user_explicit" and source != "user_explicit":
+                pass  # extracao automatica nunca sobrescreve regra declarada pelo usuario
             elif confidence >= Decimal(existing.confidence):
                 existing.value_json = value_json
                 existing.summary = summary
@@ -98,6 +110,6 @@ def store_candidates(db: Session, user_id: int, candidates: list[dict]) -> int:
         db.add(UserMemory(user_id=user_id, memory_type=memory_type, subject=normalized_subject,
                           value_json=value_json, summary=summary, confidence=confidence,
                           confirmation_count=1 if confidence >= Decimal("0.900") else 0,
-                          source="automatic_extraction"))
+                          source=source))
         stored += 1
     return stored
