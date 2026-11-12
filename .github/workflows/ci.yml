@@ -20,7 +20,7 @@ jobs:
       - Linux
       - X64
       - vitoria-test
-    timeout-minutes: 30
+    timeout-minutes: 60
     concurrency:
       group: testes-${{ github.ref }}
       cancel-in-progress: true
