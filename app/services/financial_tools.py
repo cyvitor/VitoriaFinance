@@ -858,6 +858,13 @@ def confirm_pending_action(db: Session, context: UserAccessContext, args: dict) 
         raise ToolError("Nao ha alteracao completa aguardando confirmacao")
     if action.action_type == fixed_bills.ACTION_TYPE:
         return fixed_bills.confirm_payment(db, context.user_id, action.id)
+    if action.action_type == "scheduled_expense":
+        from app.services import scheduled_expenses
+        return scheduled_expenses.confirm(db, context.user_id, action.id)
+    if action.action_type == "statement_balance":
+        from app.services import statement_balance
+        user = db.get(User, context.user_id)
+        return statement_balance.apply_adjustment(db, user, action)
     if action.action_type == "configuration_change":
         try:
             return conversation_crud.confirm_configuration_change(db, context, action)
@@ -1059,6 +1066,12 @@ def cancel_pending_action(db: Session, context: UserAccessContext, args: dict) -
         return {"cancelled": False, "message": "Nenhuma alteracao pendente"}
     if action.action_type == fixed_bills.ACTION_TYPE:
         return fixed_bills.cancel_payment(db, context.user_id, action.id)
+    if action.action_type == "scheduled_expense":
+        from app.services import scheduled_expenses
+        return scheduled_expenses.cancel(db, context.user_id, action.id)
+    if action.action_type in ("statement_balance", "document_kind"):
+        from app.services import statement_balance
+        return statement_balance.cancel(db, context.user_id, action.id)
     action.status = "cancelled"; action.resolved_at = datetime.utcnow(); db.commit()
     return {"cancelled": True}
 
@@ -1119,7 +1132,11 @@ def prepare_expense(db: Session, context: UserAccessContext, args: dict) -> dict
     if draft and draft.category_id and any(item in ("subcategoria", "categoria valida") for item in missing):
         missing = [item for item in missing if item not in ("subcategoria", "categoria valida")]
         category_options = []
-    summary = format_draft(draft)
+    complete = not missing
+    summary = format_draft(
+        draft, _draft_budget_impact(db, context, draft) if complete else None,
+        ask_category=complete and not draft.category_id,
+    )
     extra = {}
     if draft and fuel_followup.is_fuel(draft.description, draft.category):
         details = fuel_followup.merge_details(args, args.get("_hint"))
@@ -1221,9 +1238,13 @@ def update_expense(db: Session, context: UserAccessContext, args: dict) -> dict:
     )
     if not draft:
         raise ToolError("Nao ha despesa aguardando confirmacao")
+    complete = not missing
+    impact = _draft_budget_impact(db, context, draft)
     return {"status": "missing_information" if missing else "awaiting_confirmation",
             "missing_fields": missing, "category_options": category_options,
-            "summary": format_draft(draft), "budget_impact": _draft_budget_impact(db, context, draft)}
+            "summary": format_draft(draft, impact if complete else None,
+                                    ask_category=complete and not draft.category_id),
+            "budget_impact": impact}
 
 
 def recommend_expense_category(db: Session, context: UserAccessContext, args: dict) -> dict:

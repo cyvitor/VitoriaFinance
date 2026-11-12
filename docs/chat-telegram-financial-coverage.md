@@ -31,3 +31,9 @@ Antes desta branch, o agente já consultava receitas, despesas, contas, cartões
 
 - Histórico de abastecimento retorna até 100 itens por consulta.
 - A análise e a alteração dependem do usuário informar nomes suficientemente claros quando há cadastros homônimos; o agente deve perguntar pela categoria/conta para desambiguar.
+
+## Confirmação, extrato e gasto programado
+
+- Toda confirmação de despesa (texto e botões Confirmar/Cancelar) usa o resumo montado do rascunho gravado. O texto livre do modelo não substitui esse resumo.
+- Um PDF ou uma imagem pode ser extrato ou comprovante. Se a leitura não decidir, o bot pergunta qual dos dois. O extrato só ajusta o saldo da conta; não lança as movimentações como receita.
+- `confirme o gasto programado ...` localiza a conta fixa, pede a forma de pagamento quando ela não veio na frase e registra pelo mesmo resumo. A competência do mês não é confirmada duas vezes.

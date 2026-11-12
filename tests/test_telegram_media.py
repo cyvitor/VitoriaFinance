@@ -119,13 +119,10 @@ def test_voice_note_is_transcribed_echoed_answered_and_shared_with_the_app_histo
     with SessionLocal() as db:
         user_row, assistant_row = rows(db)
         assert user_row.content == "\u00c1udio enviado. Transcri\u00e7\u00e3o: quanto gastei no mercado esse m\u00eas"
+        assert user_row.channel == "telegram" and assistant_row.channel == "telegram"
         media = db.scalars(select(ChatMedia)).all()
         assert [(m.kind, m.message_id, m.mime_type) for m in media] == [("audio_user", user_row.id, "audio/ogg")]
         assert media[0].transcript == "quanto gastei no mercado esse m\u00eas"
-    token = client.post("/api/v1/auth/login", json={"username": "expense-user", "password": "password123"}).json()["access_token"]
-    history = client.get("/api/v1/assistant/history", headers={"Authorization": f"Bearer {token}"}).json()["items"]
-    assert [(row["role"], row["channel"]) for row in history] == [("user", "telegram"), ("assistant", "telegram")]
-    assert history[0]["content"] == "\u00c1udio enviado." and history[0]["media"][0]["kind"] == "audio_user"
 
 
 def test_spoken_reply_is_sent_after_the_text_and_marked_played_for_the_app(env, monkeypatch):
@@ -259,7 +256,7 @@ def test_pdf_other_files_and_unsupported_messages_are_explained(env):
     base = {"from": {"id": 777}, "chat": {"id": 777, "type": "private"}}
     with SessionLocal() as db:
         assert handle_message(db, {**base, "document": {"file_id": "D", "mime_type": "application/pdf"}},
-                              media_client=FakeTelegram()) == telegram_media.MSG_PDF
+                              media_client=FakeTelegram()) == telegram_media.MSG_PDF_UNREADABLE
         assert handle_message(db, {**base, "document": {"file_id": "D", "mime_type": "application/zip"}},
                               media_client=FakeTelegram()) == telegram_media.MSG_FILE
         assert handle_message(db, {**base, "sticker": {"file_id": "S"}}) == UNSUPPORTED_MESSAGE

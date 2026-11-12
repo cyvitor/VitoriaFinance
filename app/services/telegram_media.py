@@ -40,8 +40,8 @@ MSG_IMAGE_OFF = "A leitura de imagens ainda n\u00e3o est\u00e1 configurada no si
 MSG_IMAGE_FAIL = ("N\u00e3o consegui ler essa imagem. Tente uma foto mais n\u00edtida, com o comprovante inteiro e boa luz, "
                   "ou me escreva os dados.")
 MSG_IMAGE_FORMAT = "Esse formato de imagem n\u00e3o \u00e9 suportado. Envie como foto ou como JPG, PNG ou WebP."
-MSG_PDF = ("Ainda n\u00e3o leio PDF por aqui. Envie uma foto ou um print da conta/comprovante, "
-           "ou me escreva o valor e a descri\u00e7\u00e3o.")
+MSG_PDF_UNREADABLE = ("Não consegui ler o texto desse PDF. Se for um extrato ou um comprovante, "
+                       "me diga qual dos dois, ou envie uma foto.")
 MSG_FILE = "N\u00e3o sei ler esse tipo de arquivo. Envie um \u00e1udio, uma foto de comprovante ou escreva sua mensagem."
 
 AUDIO_MIME_ALIASES = {
@@ -150,7 +150,9 @@ def _snippet(text: str) -> str:
 def handle_media(db: Session, user: User, message: dict, media: dict, client, message_date) -> str | BotReply:
     kind = media["kind"]
     if kind == "pdf":
-        return MSG_PDF
+        if client is None:
+            return MSG_DOWNLOAD
+        return _handle_pdf(db, user, message, media, client, message_date)
     if kind == "file":
         return MSG_FILE
     if client is None:
@@ -211,9 +213,58 @@ def _handle_audio(db: Session, user: User, media: dict, client, message_date) ->
     return BotReply(full, keyboard)
 
 
-def _handle_image(db: Session, user: User, message: dict, media: dict, client, message_date) -> str | BotReply:
+def _document_reply(db: Session, user: User, extracted: str, message_date, caption: str = "",
+                    stored: str | None = None):
+    """Extrato vira ajuste de saldo; comprovante segue o fluxo de um gasto; dúvida pergunta ao usuário."""
     from app.automation import telegram_bot
+    from app.services.statement_balance import classify_financial_document
     from app.services.telegram_agent import receipt_prompt
+    kind = classify_financial_document(extracted)
+    body = f"{extracted}\n{caption}".strip()
+    if kind == "statement":
+        from app.services import statement_balance
+        text, keyboard = statement_balance.prepare_from_document(db, user, body, message_date)
+        return text, keyboard, "statement"
+    if kind == "unknown":
+        from app.services import statement_balance
+        text, keyboard = statement_balance.ask_which(db, user, body, message_date)
+        return text, keyboard, "unknown"
+    prompt = receipt_prompt(extracted, caption)
+    reply = telegram_bot.agent_turn(db, user, prompt[:4000], message_date, stored_user_content=stored)
+    reply_text, keyboard = _split(reply)
+    return reply_text, keyboard, "receipt"
+
+
+def _handle_pdf(db: Session, user: User, message: dict, media: dict, client, message_date) -> str | BotReply:
+    from app.services.statement_balance import StatementReadError, extract_pdf
+    try:
+        data, _path = client.download_file(media["file_id"], MAX_MEDIA_BYTES)
+    except TelegramDownloadError:
+        return MSG_DOWNLOAD
+    try:
+        text, images = extract_pdf(data)
+    except StatementReadError:
+        return MSG_PDF_UNREADABLE
+    if len(text) < 40 and images:
+        image, mime = images[0]
+        try:
+            text = describe_receipt(db, image, mime)
+        except MediaNotConfigured:
+            return MSG_IMAGE_OFF
+        except MediaProcessingError:
+            text = text or ""
+    if len((text or "").strip()) < 20:
+        return MSG_PDF_UNREADABLE
+    caption = " ".join((message.get("caption") or "").split())[:500]
+    before_id = _last_message_id(db, user.id)
+    stored = f"Documento enviado.\n{text[:3500]}" + (f"\nLegenda: {caption}" if caption else "")
+    reply_text, keyboard, kind = _document_reply(db, user, text, message_date, caption, stored=stored[:4000])
+    _persist(db, user, before_id, stored, reply_text, "statement_pdf" if kind == "statement" else "receipt_image",
+             data, media.get("name") or "documento.pdf", "application/pdf", text[:4000])
+    return BotReply(reply_text, keyboard)
+
+
+def _handle_image(db: Session, user: User, message: dict, media: dict, client, message_date) -> str | BotReply:
     mime = _image_mime(media.get("mime"))
     if not mime:
         return MSG_IMAGE_FORMAT
@@ -229,12 +280,12 @@ def _handle_image(db: Session, user: User, message: dict, media: dict, client, m
         return MSG_IMAGE_FAIL
     caption = " ".join((message.get("caption") or "").split())[:500]
     transcript = f"{IMAGE_TRANSCRIPT_PREFIX}{extracted}"
-    prompt = receipt_prompt(extracted, caption)
     stored = f"Comprovante enviado.\n{transcript}" + (f"\nLegenda: {caption}" if caption else "")
     before_id = _last_message_id(db, user.id)
-    reply = telegram_bot.agent_turn(db, user, prompt[:4000], message_date, stored_user_content=stored[:4000])
-    reply_text, keyboard = _split(reply)
-    _persist(db, user, before_id, stored, reply_text, "receipt_image", data, media.get("name") or "foto.jpg", mime, transcript)
+    reply_text, keyboard, kind = _document_reply(db, user, extracted, message_date, caption, stored=stored[:4000])
+    _persist(db, user, before_id, stored, reply_text,
+             "statement_image" if kind == "statement" else "receipt_image",
+             data, media.get("name") or "foto.jpg", mime, transcript)
     return BotReply(reply_text, keyboard)
 
 

@@ -62,8 +62,11 @@ def handle_callback(db: Session, callback: dict) -> BotReply:
         return BotReply("Seu Telegram ainda nao esta associado. Gere um codigo em Meu perfil e envie /start CODIGO.")
     try:
         data = str(callback.get("data") or "")
+        from app.services import scheduled_expenses, statement_balance
         reply = (bot_confirmations.handle_callback(db, user, data)
                  or fuel_followup.handle_callback(db, user, data)
+                 or scheduled_expenses.handle_callback(db, user, data)
+                 or statement_balance.handle_callback(db, user, data)
                  or handle_bill_callback(db, user, data, _message_date(callback.get("message") or {}, user)))
         key = _button_key(data)
         echo = BUTTON_ECHO.get(key)

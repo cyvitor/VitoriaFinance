@@ -296,6 +296,23 @@ class Account(Base):
     person: Mapped[Person | None] = relationship()
 
 
+class AccountBalanceAdjustment(Base):
+    """Auditoria do ajuste de saldo pelo extrato. Não é receita nem despesa."""
+    __tablename__ = "account_balance_adjustments"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    adjustment_date: Mapped[date] = mapped_column(Date, index=True)
+    previous_balance: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+    new_balance: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+    previous_initial_balance: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+    new_initial_balance: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+    description: Mapped[str] = mapped_column(String(180), default="Ajuste de saldo pelo extrato")
+    notes: Mapped[str | None] = mapped_column(String(180), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    account: Mapped[Account] = relationship()
+
+
 class Card(Base):
     __tablename__ = "cards"
     id: Mapped[int] = mapped_column(primary_key=True)

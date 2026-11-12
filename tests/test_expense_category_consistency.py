@@ -45,7 +45,7 @@ def test_summary_category_is_the_one_saved_even_if_the_model_narrates_another(mo
     with SessionLocal() as db:
         user = _setup(db)
         summary = run_financial_agent(db, user, "gastei 8,60 em Vampire the Masquerade")
-        assert "Categoria: Nao identificada" in summary  # resumo vem do rascunho, nao do texto do modelo
+        assert "Categoria: Sem categoria" in summary  # resumo vem do rascunho, nao do texto do modelo
         assert "Lazer > Jogos" not in summary
         confirmation = run_financial_agent(db, user, "sim")
         transaction = db.scalar(select(Transaction))
@@ -77,7 +77,7 @@ def test_unrelated_memory_does_not_assign_a_category():
         db.commit()
         context = build_user_access_context(db, user)
         result = execute_tool(db, context, "preparar_despesa", {"amount": 30, "description": "Padaria"})
-        assert "Categoria: Nao identificada" in result["summary"]
+        assert "Categoria: Sem categoria" in result["summary"]
 
 
 def test_preparing_the_same_expense_again_keeps_category_and_date():

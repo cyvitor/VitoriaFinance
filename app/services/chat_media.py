@@ -16,7 +16,7 @@ MODEL_NAME = re.compile(r"^[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+){1,4}$")
 MIME_EXTENSIONS = {"audio/mp4": ".m4a", "audio/mpeg": ".mp3", "audio/wav": ".wav",
                    "audio/x-wav": ".wav", "audio/aac": ".aac", "audio/ogg": ".ogg",
                    "audio/webm": ".webm", "image/jpeg": ".jpg", "image/png": ".png",
-                   "image/webp": ".webp"}
+                   "image/webp": ".webp", "application/pdf": ".pdf"}
 
 
 IMAGE_TRANSCRIPT_PREFIX = "Dados lidos da imagem (podem conter erros):\n"
@@ -54,7 +54,7 @@ def store_bytes(data: bytes, mime_type: str) -> str:
 
 
 def read_bytes(key: str) -> bytes:
-    if not re.fullmatch(r"[a-f0-9]{32}\.(?:m4a|mp3|wav|aac|ogg|webm|jpg|png|webp)", key):
+    if not re.fullmatch(r"[a-f0-9]{32}\.(?:m4a|mp3|wav|aac|ogg|webm|jpg|png|webp|pdf)", key):
         raise FileNotFoundError
     root = storage_root()
     path = (root / key).resolve()

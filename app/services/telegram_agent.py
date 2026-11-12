@@ -493,6 +493,24 @@ def _enforce_fixed_bill_intent(db: Session, user: User, text: str, decision: dic
     return {"action": "ask_choice", "reply": reply, "keyboard": keyboard, "rule_id": rule.id}
 
 
+_FREEFORM_CONFIRMATION = re.compile(r"confirma(?:r|ei)?(?: o gasto)?|confirmei aqui|posso registrar")
+
+
+def _replace_freeform_expense_confirmation(text: str, decision: dict) -> dict:
+    """Se o modelo escreve a confirmacao em vez de chamar a ferramenta, o rascunho e criado aqui."""
+    if decision.get("action") != "respond":
+        return decision
+    reply = _normalized_text(str(decision.get("reply") or ""))
+    if not _FREEFORM_CONFIRMATION.search(reply):
+        return decision
+    from app.services.telegram_expenses import parse_quick_expense
+    parsed = parse_quick_expense(text)
+    if not parsed:
+        return decision
+    logger.info("agent_decision_corrected reason=freeform_expense_confirmation original=%s", decision)
+    return {"action": "tool", "tool": "preparar_despesa", "arguments": parsed}
+
+
 def _select_decision(token: str, model: str, messages: list[dict], text: str, require_tool: bool = False) -> dict:
     retry_messages = list(messages)
     format_error = None
@@ -946,27 +964,20 @@ def _expense_tool_reply_base(tool_name: str, result: dict, model_reply: str) -> 
             missing = ", ".join(result.get("missing_fields") or ["informações pendentes"])
             instruction = f"Falta informar: **{missing}**."
         return "Estou me referindo a esta despesa:\n\n" + summary + "\n\n" + instruction
-    impact = result.get("budget_impact")
-    if impact and result.get("status") == "awaiting_confirmation":
-        if impact.get("exceeds_budget"):
-            budget_text = (
-                f"Esta compra ultrapassa o orçamento de **{impact['category']}** em "
-                f"**R$ {impact['exceeded_by']}**. O lançamento ainda pode ser registrado."
-            )
-        else:
-            budget_text = (
-                f"Orçamento de **{impact['category']}**: havia **R$ {impact['remaining']}** disponíveis "
-                f"e restarão **R$ {impact['remaining_after_spending']}** após esta compra."
-            )
-        summary = str(result.get("summary") or model_reply).replace("\n\nPosso registrar?", "").rstrip()
-        return summary + "\n\n" + budget_text + "\n\nPosso registrar?"
     if (tool_name in ("preparar_despesa", "preparar_despesas", "atualizar_despesa")
             and result.get("status") == "awaiting_confirmation" and result.get("summary")):
-        # O resumo mostrado ao usuario vem do rascunho gravado, nunca do texto do modelo:
-        # assim a categoria/cartao confirmados sao exatamente o que sera salvo.
+        # O modelo costuma reescrever a confirmacao ("Confirma o gasto de...", "Confirmei aqui:").
+        # O texto enviado, com ou sem botoes, e sempre o resumo montado do rascunho gravado.
+        summary = str(result["summary"])
+        impact = result.get("budget_impact")
+        if impact and "Orçamento de" not in summary:
+            from app.services.telegram_expenses import budget_sentence
+            sentence = budget_sentence(impact)
+            if sentence:
+                summary = summary.replace("\n\nPosso registrar?", f"\n\n{sentence}\n\nPosso registrar?", 1)
         batch = result.get("batch") or {}
         prefix = f"Despesa {batch.get('current', 1)} de {batch['total']}:\n\n" if batch.get("total") else ""
-        return prefix + str(result["summary"])
+        return prefix + summary
     if model_reply.startswith("A consulta foi executada, mas nao consegui formatar"):
         return _draft_fallback_reply(result) or model_reply
     return model_reply
@@ -1105,6 +1116,17 @@ def run_financial_agent(db: Session, user: User, text: str, reference_date: date
         db.commit()
         logger.info("fuel_followup_local_reply user_id=%s", user.id)
         return fuel_reply
+    from app.services import scheduled_expenses, statement_balance
+    local = (scheduled_expenses.local_reply(db, user, text, reference_date)
+             or statement_balance.local_reply(db, user, text, reference_date))
+    if local:
+        reply, keyboard = local
+        db.info["bot_write_flow"] = True
+        db.info["bot_keyboard"] = keyboard
+        db.add_all([_user_message(user, text, channel, user_message, stored_user_content),
+                    TelegramConversationMessage(user_id=user.id, role="assistant", content=reply[:4000], channel=channel)])
+        db.commit()
+        return reply
     token, model = _settings(db)
     context = scope_to_principal_area(build_user_access_context(db, user))
     areas = db.scalars(select(Person.name).where(Person.id.in_(context.allowed_person_ids))).all() if context.allowed_person_ids else []
@@ -1166,6 +1188,7 @@ Retorne SOMENTE JSON valido em um destes formatos:
         decision = _select_decision(token, model, selector_messages, text,
                                     require_tool=text.startswith(RECEIPT_PROMPT_PREFIX))
         decision = _enforce_fixed_bill_intent(db, user, text, decision)
+        decision = _replace_freeform_expense_confirmation(text, decision)
     db.add(_user_message(user, text, channel, user_message, stored_user_content))
     if decision.get("action") == "ask_choice":
         db.info["bot_write_flow"] = True
