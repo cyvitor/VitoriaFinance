@@ -865,6 +865,10 @@ def confirm_pending_action(db: Session, context: UserAccessContext, args: dict) 
         from app.services import statement_balance
         user = db.get(User, context.user_id)
         return statement_balance.apply_adjustment(db, user, action)
+    if action.action_type == "statement_import":
+        from app.services import statement_import
+        user = db.get(User, context.user_id)
+        return statement_import.apply(db, user, action)
     if action.action_type == "configuration_change":
         try:
             return conversation_crud.confirm_configuration_change(db, context, action)
@@ -1069,7 +1073,7 @@ def cancel_pending_action(db: Session, context: UserAccessContext, args: dict) -
     if action.action_type == "scheduled_expense":
         from app.services import scheduled_expenses
         return scheduled_expenses.cancel(db, context.user_id, action.id)
-    if action.action_type in ("statement_balance", "document_kind"):
+    if action.action_type in ("statement_balance", "document_kind", "statement_import"):
         from app.services import statement_balance
         return statement_balance.cancel(db, context.user_id, action.id)
     action.status = "cancelled"; action.resolved_at = datetime.utcnow(); db.commit()

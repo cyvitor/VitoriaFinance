@@ -132,6 +132,15 @@ prepare_directories() {
     chown root:"$SERVICE_GROUP" "$BACKUP_DIR"
 }
 
+# Os testes rodam como root e o bot grava os anexos do Telegram em $APP_DIR/private_media (fora do git):
+# a pasta precisa ser do usuario do servico, senao o original do arquivo recebido nao e salvo.
+prepare_media_directory() {
+    media_dir="$APP_DIR/private_media"
+    mkdir -p "$media_dir"
+    chown -R "$SERVICE_USER":"$SERVICE_GROUP" "$media_dir"
+    chmod 750 "$media_dir"
+}
+
 start_deploy_log() {
     action=$1
     [ "$(id -u)" -eq 0 ] || return 0
@@ -577,6 +586,7 @@ install_application() {
     validate_install_ref
     validate_database_connection
     run_migrations
+    prepare_media_directory
     write_systemd_services
     start_services
     health_check || die "A aplicacao nao respondeu ao health check."
@@ -635,6 +645,7 @@ deploy_application() {
         die "Migration falhou. O banco nao foi restaurado automaticamente."
     fi
 
+    prepare_media_directory
     write_systemd_services
     start_services
     if ! health_check; then

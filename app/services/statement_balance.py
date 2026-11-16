@@ -27,6 +27,8 @@ from app.services.telegram_expenses import format_money
 logger = get_bot_logger()
 ACTION_BALANCE = "statement_balance"
 ACTION_KIND = "document_kind"
+ACTION_IMPORT = "statement_import"
+STORED_TEXT_CHARS = 30000
 EXPIRATION = timedelta(minutes=30)
 STATEMENT_TERMS = (
     "extrato", "saldo final", "saldo anterior", "saldo do dia", "saldo em conta",
@@ -108,7 +110,13 @@ def _money_token(raw: str) -> Decimal | None:
 def extract_statement_fields(text: str) -> dict:
     normalized = _norm(text)
     balance = None
+    total = re.search(r"(?m)^total\s+\d{1,3}(?:\.\d{3})*,\d{2}\s+\d{1,3}(?:\.\d{3})*,\d{2}\s+(-?\d{1,3}(?:\.\d{3})*,\d{2}-?)\s*$",
+                      normalized)
+    if total:
+        balance = _money_token(total.group(1).strip("-")) * (-1 if "-" in total.group(1) else 1)
     for pattern in BALANCE_PATTERNS:
+        if balance is not None:
+            break
         found = re.search(pattern, normalized)
         if found:
             balance = _money_token(found.group(1))
@@ -116,7 +124,10 @@ def extract_statement_fields(text: str) -> dict:
     if balance is None:
         balance = parse_amount(text)
     dates = re.findall(r"\b(\d{2})/(\d{2})/(\d{4})\b", text or "")
+    header = re.findall(r"(?mi)^data:\s*(\d{2})/(\d{2})/(\d{4})", text or "")
     statement_date = None
+    if header:
+        dates = header[:1]
     if dates:
         day, month, year = dates[-1]
         try:
@@ -169,6 +180,12 @@ def match_accounts(accounts: list[Account], text: str) -> list[Account]:
         names = [name for name in (_norm(account.name), _norm(account.bank_name or "")) if len(name) >= 2]
         if any(re.search(rf"\b{re.escape(name)}\b", normalized) for name in names):
             hits.append(account)
+    if len(hits) > 1:  # varias contas citadas (ex.: destino de um PIX): vale o banco do cabecalho
+        header = _norm(text)[:300]
+        narrowed = [item for item in hits if any(len(name) >= 2 and re.search(rf"\b{re.escape(name)}\b", header)
+                                                 for name in (_norm(item.name), _norm(item.bank_name or "")))]
+        if len(narrowed) == 1:
+            return narrowed
     if hits:
         return hits
     return accounts if len(accounts) == 1 else []
@@ -188,7 +205,7 @@ def _active(db: Session, user_id: int, action_type: str) -> TelegramPendingActio
 
 
 def _store(db: Session, user_id: int, action_type: str, payload: dict, status: str) -> TelegramPendingAction:
-    for kind in (ACTION_BALANCE, ACTION_KIND):
+    for kind in (ACTION_BALANCE, ACTION_KIND, ACTION_IMPORT):
         previous = _active(db, user_id, kind)
         if previous:
             previous.status = "cancelled"
@@ -218,7 +235,11 @@ def confirmation_text(account: Account, current: Decimal, target: Decimal, when:
     ])
 
 
-def _prepare_account(db: Session, user: User, account: Account, target: Decimal, when: date):
+def _prepare_account(db: Session, user: User, account: Account, target: Decimal, when: date, text: str = ""):
+    from app.services import statement_import
+    imported = statement_import.prepare(db, user, account, text, when) if text else None
+    if imported:
+        return imported
     current = estimated_balance(db, account)
     new_initial = opening_for_statement(account, current, target)
     action = _store(db, user.id, ACTION_BALANCE, {
@@ -241,22 +262,22 @@ def prepare_from_document(db: Session, user: User, text: str, today: date | None
         names = ", ".join(item.name for item in accounts) or "nenhuma"
         action = _store(db, user.id, ACTION_KIND, {
             "phase": "account", "balance": str(fields["balance"]), "statement_date": when.isoformat(),
-            "text": text[:4000],
+            "text": text[:STORED_TEXT_CHARS],
         }, "collecting")
         return (f"Não identifiquei a conta do extrato. Qual delas? {names}", None)
     if len(matches) > 1:
         names = ", ".join(item.name for item in matches)
         _store(db, user.id, ACTION_KIND, {
             "phase": "account", "balance": str(fields["balance"]), "statement_date": when.isoformat(),
-            "candidates": [item.id for item in matches], "text": text[:4000],
+            "candidates": [item.id for item in matches], "text": text[:STORED_TEXT_CHARS],
         }, "collecting")
         return (f"Encontrei mais de uma conta nesse extrato: {names}. Qual delas?", None)
-    return _prepare_account(db, user, matches[0], fields["balance"], when)
+    return _prepare_account(db, user, matches[0], fields["balance"], when, text)
 
 
 def ask_which(db: Session, user: User, text: str, today: date | None = None) -> tuple[str, list]:
     today = today or date.today()
-    action = _store(db, user.id, ACTION_KIND, {"phase": "kind", "text": (text or "")[:4000],
+    action = _store(db, user.id, ACTION_KIND, {"phase": "kind", "text": (text or "")[:STORED_TEXT_CHARS],
                                                "today": today.isoformat()}, "collecting")
     keyboard = [[
         {"text": "📄 Extrato", "callback_data": f"dk:s:{action.id}"},
@@ -299,8 +320,9 @@ def apply_adjustment(db: Session, user: User, action: TelegramPendingAction) -> 
 
 def cancel(db: Session, user_id: int, action_id: int | None = None) -> dict:
     action = db.get(TelegramPendingAction, action_id) if action_id else (
-        _active(db, user_id, ACTION_BALANCE) or _active(db, user_id, ACTION_KIND))
-    if not action or action.user_id != user_id or action.action_type not in (ACTION_BALANCE, ACTION_KIND):
+        _active(db, user_id, ACTION_BALANCE) or _active(db, user_id, ACTION_IMPORT)
+        or _active(db, user_id, ACTION_KIND))
+    if not action or action.user_id != user_id or action.action_type not in (ACTION_BALANCE, ACTION_KIND, ACTION_IMPORT):
         return {"deterministic": True, "message": "Não há ajuste de extrato pendente para cancelar."}
     action.status = "cancelled"
     action.resolved_at = datetime.utcnow()
@@ -317,7 +339,8 @@ def _continue_account_choice(db: Session, user: User, action: TelegramPendingAct
     if len(matches) != 1:
         names = ", ".join(item.name for item in accounts)
         return (f"Qual conta? {names}", None)
-    return _prepare_account(db, user, matches[0], Decimal(payload["balance"]), date.fromisoformat(payload["statement_date"]))
+    return _prepare_account(db, user, matches[0], Decimal(payload["balance"]), date.fromisoformat(payload["statement_date"]),
+                            payload.get("text") or "")
 
 
 def local_reply(db: Session, user: User, text: str, today: date | None = None):
