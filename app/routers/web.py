@@ -1535,7 +1535,11 @@ def reopen_month(request: Request, year: int = Form(), month: int = Form(),
 
 
 @router.post("/transactions/{item_id}/confirm")
-def transaction_confirm(item_id: int, request: Request, db: Session = Depends(get_db), user: User = Depends(current_user)):
+def transaction_confirm(item_id: int, request: Request, edited: str | None = Form(None),
+                        description: str | None = Form(None), amount: Decimal | None = Form(None),
+                        transaction_date: date | None = Form(None), account_id: str | None = Form(None),
+                        category_id: str | None = Form(None), notes: str | None = Form(None),
+                        db: Session = Depends(get_db), user: User = Depends(current_user)):
     wid = current_workspace_id(request, user, db)
     item = db.scalar(select(Transaction).where(
         Transaction.id == item_id, Transaction.workspace_id == wid, Transaction.status == TransactionStatus.pending
@@ -1555,6 +1559,35 @@ def transaction_confirm(item_id: int, request: Request, db: Session = Depends(ge
             target_month = int(params.get("month", [target_month])[0])
         except (TypeError, ValueError):
             pass
+    back_url = f"/month?year={target_year}&month={target_month}" if parsed.path == "/month" else "/future"
+    if edited:
+        # Confirmação com revisão (V da visão mês): valida as informações editadas antes de confirmar.
+        account_value, category_value = optional_int(account_id), optional_int(category_id)
+        error = None
+        if amount is None or amount <= 0 or transaction_date is None or not (description or "").strip():
+            error = "Informe descrição, valor e data válidos."
+        elif account_value:
+            account = db.scalar(select(Account).where(
+                Account.id == account_value, Account.workspace_id == wid, Account.is_active.is_(True),
+            ))
+            if not account or (item.person_id and account.person_id != item.person_id):
+                error = "Selecione uma fonte pagadora da mesma área financeira."
+            else:
+                ensure_account_access(account_value, user, wid, db, write=True)
+        if not error and category_value and not db.scalar(select(Category.id).where(
+            Category.id == category_value, Category.workspace_id == wid,
+            Category.kind == item.transaction_type,
+        )):
+            error = "Selecione uma categoria válida para o lançamento."
+        if error:
+            flash(request, error, "danger")
+            return redirect(back_url)
+        item.description = description.strip()
+        item.amount = amount
+        item.transaction_date = transaction_date
+        item.account_id = account_value
+        item.category_id = category_value
+        item.notes = (notes or "").strip() or None
     while db.scalar(select(AccountingPeriod.id).where(
         AccountingPeriod.workspace_id == wid, AccountingPeriod.year == target_year,
         AccountingPeriod.month == target_month, AccountingPeriod.is_closed.is_(True),

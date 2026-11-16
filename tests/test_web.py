@@ -825,6 +825,97 @@ def test_confirmed_income_status_can_be_changed_to_pending(client):
     assert f'action="/transactions/{income_id}/confirm"' in pending_page.text
 
 
+def _pending_month_expense(area_id, **extra):
+    with SessionLocal() as db:
+        workspace_id = db.scalar(select(Workspace.id))
+        user_id = db.scalar(select(User.id).where(User.username == "vh"))
+        source = Account(workspace_id=workspace_id, person_id=area_id, name="Caixa",
+                         account_type=AccountType.checking)
+        other = Person(workspace_id=workspace_id, name="Outra", person_type=PersonType.personal)
+        db.add_all([source, other]); db.flush()
+        foreign = Account(workspace_id=workspace_id, person_id=other.id, name="Alheia",
+                          account_type=AccountType.checking)
+        category = Category(workspace_id=workspace_id, kind=TransactionType.expense,
+                            parent_name="Moradia", name=f"Internet {db.scalar(select(func.count(Category.id)))}", color="#fdcb6e")
+        db.add_all([foreign, category]); db.flush()
+        tx = Transaction(workspace_id=workspace_id, transaction_type=TransactionType.expense,
+                         description="Internet", amount=Decimal("99.90"), transaction_date=date(2026, 8, 10),
+                         competence_year=2026, competence_month=8, status=TransactionStatus.pending,
+                         person_id=area_id, created_by_id=user_id, **extra)
+        db.add(tx); db.commit()
+        return tx.id, source.id, foreign.id, category.id, workspace_id
+
+
+def test_month_pending_transaction_has_check_and_cross_with_review_modals(client):
+    area_id = seed_test(); client.post("/login", data={"username": "vh", "password": "123456"})
+    tx_id, *_ = _pending_month_expense(area_id)
+    page = client.get("/month?year=2026&month=8").text
+    assert f'data-bs-target="#confirmTransaction{tx_id}"' in page
+    assert f'data-bs-target="#deleteTransaction{tx_id}"' in page
+    assert f'id="confirmTransaction{tx_id}"' in page and f'action="/transactions/{tx_id}/confirm"' in page
+    assert f'id="deleteTransaction{tx_id}"' in page and f'action="/transactions/{tx_id}/delete"' in page
+    assert "Confirmar lançamento" in page and "Excluir lançamento?" in page
+    assert 'class="status-pending"' not in page
+
+
+def test_month_pending_transaction_confirms_with_edited_information(client):
+    area_id = seed_test(); client.post("/login", data={"username": "vh", "password": "123456"})
+    tx_id, source_id, foreign_id, category_id, _ = _pending_month_expense(area_id)
+    month_page = {"referer": "http://testserver/month?year=2026&month=8"}
+    # Conta de outra área é recusada e o lançamento continua pendente.
+    response = client.post(f"/transactions/{tx_id}/confirm", data={
+        "edited": "1", "description": "Internet", "amount": "99.90", "transaction_date": "2026-08-10",
+        "account_id": str(foreign_id), "category_id": "", "notes": "",
+    }, headers=month_page, follow_redirects=False)
+    assert response.status_code == 303 and response.headers["location"] == "/month?year=2026&month=8"
+    with SessionLocal() as db:
+        assert db.get(Transaction, tx_id).status == TransactionStatus.pending
+    response = client.post(f"/transactions/{tx_id}/confirm", data={
+        "edited": "1", "description": "Internet fibra", "amount": "109.90", "transaction_date": "2026-08-12",
+        "account_id": str(source_id), "category_id": str(category_id), "notes": "Reajuste",
+    }, headers=month_page, follow_redirects=False)
+    assert response.status_code == 303 and response.headers["location"] == "/month?year=2026&month=8"
+    with SessionLocal() as db:
+        tx = db.get(Transaction, tx_id)
+        assert tx.status == TransactionStatus.paid
+        assert (tx.description, tx.amount, tx.transaction_date) == ("Internet fibra", Decimal("109.90"), date(2026, 8, 12))
+        assert (tx.account_id, tx.category_id, tx.notes) == (source_id, category_id, "Reajuste")
+        assert (tx.competence_year, tx.competence_month) == (2026, 8)
+
+
+def test_month_pending_transaction_confirm_moves_to_next_open_month_and_plain_confirm_still_works(client):
+    area_id = seed_test(); client.post("/login", data={"username": "vh", "password": "123456"})
+    tx_id, source_id, _, _, workspace_id = _pending_month_expense(area_id)
+    with SessionLocal() as db:
+        db.add(AccountingPeriod(workspace_id=workspace_id, year=2026, month=8, is_closed=True)); db.commit()
+    response = client.post(f"/transactions/{tx_id}/confirm", data={
+        "edited": "1", "description": "Internet", "amount": "99.90", "transaction_date": "2026-08-10",
+        "account_id": str(source_id), "category_id": "", "notes": "",
+    }, headers={"referer": "http://testserver/month?year=2026&month=8"}, follow_redirects=False)
+    assert response.headers["location"] == "/month?year=2026&month=9"
+    with SessionLocal() as db:
+        tx = db.get(Transaction, tx_id)
+        assert tx.status == TransactionStatus.paid and (tx.competence_year, tx.competence_month) == (2026, 9)
+    # Sem o campo "edited" o comportamento anterior (confirmar sem alterar nada) continua igual.
+    other_id, *_ = _pending_month_expense(area_id)
+    response = client.post(f"/transactions/{other_id}/confirm", follow_redirects=False,
+                           headers={"referer": "http://testserver/month?year=2026&month=10"})
+    assert response.headers["location"] == "/month?year=2026&month=10"
+    with SessionLocal() as db:
+        other = db.get(Transaction, other_id)
+        assert other.status == TransactionStatus.paid and other.description == "Internet"
+
+
+def test_month_pending_transaction_cross_deletes_and_returns_to_month(client):
+    area_id = seed_test(); client.post("/login", data={"username": "vh", "password": "123456"})
+    tx_id, *_ = _pending_month_expense(area_id)
+    response = client.post(f"/transactions/{tx_id}/delete", data={"return_year": "2026", "return_month": "8"},
+                           follow_redirects=False)
+    assert response.status_code == 303 and response.headers["location"] == "/month?year=2026&month=8"
+    with SessionLocal() as db:
+        assert db.get(Transaction, tx_id) is None
+
+
 def test_superadmin_creates_account_and_refreshes_deepinfra_models(client, monkeypatch):
     seed_test(); client.post("/login", data={"username": "vh", "password": "123456"})
     response = client.post("/system/accounts", data={
