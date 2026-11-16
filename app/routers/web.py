@@ -9,7 +9,7 @@ from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 import httpx
 from sqlalchemy import case, delete, extract, func, select
@@ -2293,8 +2293,6 @@ def account_user_reset_password(target_id: int, request: Request, db: Session = 
 def system_settings(request: Request, db: Session = Depends(get_db), user: User = Depends(current_user)):
     require_super_admin(user)
     values = {item.key: item.value for item in db.scalars(select(SystemSetting)).all()}
-    try: models = json.loads(values.get("deepinfra_models", "[]"))
-    except json.JSONDecodeError: models = []
     from app.services import llm_client as llm
     from app.services import chat_history
     llm_defaults = {
@@ -2311,8 +2309,7 @@ def system_settings(request: Request, db: Session = Depends(get_db), user: User 
         "chat_history_max_messages": chat_history.DEFAULT_HISTORY_MESSAGES,
         "chat_history_max_chars": chat_history.DEFAULT_HISTORY_CHARS,
     }
-    return render(request, "admin/system_settings.html", user=user, values=values, models=models,
-                  llm_defaults=llm_defaults)
+    return render(request, "admin/system_settings.html", user=user, values=values, llm_defaults=llm_defaults)
 
 
 @router.post("/system/settings")
@@ -2326,7 +2323,30 @@ def system_settings_save(request: Request, deepinfra_api_key: str = Form(""), de
         chat_history_max_messages: str = Form(""), chat_history_max_chars: str = Form(""),
         db: Session = Depends(get_db), user: User = Depends(current_user)):
     require_super_admin(user)
+    from app.services import llm_client as llm
+    from app.services.deepinfra_models import CatalogUnavailable, missing_models
     from app.services.llm_client import parse_model_list
+    # Só aceita modelo que existe na DeepInfra. Valida apenas o que mudou em relação ao salvo,
+    # para um ID antigo já salvo não impedir o ajuste de outras configurações.
+    stored = {item.key: item.value for item in db.scalars(select(SystemSetting).where(
+        SystemSetting.key.in_(("deepinfra_api_key", "deepinfra_model", "deepinfra_fallback_models")))).all()}
+    stored_fallbacks = parse_model_list(stored["deepinfra_fallback_models"]) \
+        if "deepinfra_fallback_models" in stored else list(llm.DEFAULT_FALLBACK_MODELS)
+    changed_models: list[str] = []
+    if deepinfra_model.strip() and deepinfra_model.strip() != ((stored.get("deepinfra_model") or "").strip() or llm.DEFAULT_MODEL):
+        changed_models.append(deepinfra_model.strip())
+    if deepinfra_fallback_models is not None:
+        changed_models += [item for item in parse_model_list(deepinfra_fallback_models)
+                           if item not in stored_fallbacks and item not in changed_models]
+    if changed_models:
+        try:
+            absent = missing_models(deepinfra_api_key.strip() or stored.get("deepinfra_api_key"), changed_models)
+        except CatalogUnavailable as exc:
+            flash(request, f"Modelos não alterados: {exc}", "danger")
+            db.rollback(); return redirect("/system/settings")
+        if absent:
+            flash(request, "Modelo inexistente na DeepInfra: " + ", ".join(absent) + ". Escolha um modelo da lista.", "danger")
+            db.rollback(); return redirect("/system/settings")
     if deepinfra_api_key: set_system_setting(db, "deepinfra_api_key", deepinfra_api_key, True)
     if deepinfra_model: set_system_setting(db, "deepinfra_model", deepinfra_model.strip())
     for key, value in (("audio_transcription_model", audio_transcription_model),
@@ -2359,26 +2379,19 @@ def system_settings_save(request: Request, deepinfra_api_key: str = Form(""), de
     return redirect("/system/settings")
 
 
-@router.post("/system/deepinfra/models")
-def deepinfra_models_refresh(request: Request, db: Session = Depends(get_db), user: User = Depends(current_user)):
+@router.get("/system/deepinfra/models")
+def deepinfra_models_catalog(request: Request, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    """Catálogo atual da DeepInfra para o seletor de modelos (nunca devolve a chave)."""
     require_super_admin(user)
+    from app.services.deepinfra_models import CatalogUnavailable, fetch_catalog
     token_setting = db.scalar(select(SystemSetting).where(SystemSetting.key == "deepinfra_api_key"))
-    if not token_setting or not token_setting.value:
-        flash(request, "Salve a API key da DeepInfra antes de atualizar os modelos.", "danger")
-        return redirect("/system/settings")
-    if looks_like_telegram_token(token_setting.value):
-        flash(request, "A chave informada tem formato de token do Telegram, não de API key da DeepInfra.", "danger")
-        return redirect("/system/settings")
+    token = token_setting.value if token_setting else ""
+    if token and looks_like_telegram_token(token):
+        return JSONResponse({"error": "A chave salva tem formato de token do Telegram, não de API key da DeepInfra."}, status_code=409)
     try:
-        response = httpx.get("https://api.deepinfra.com/v1/models",
-            headers={"Authorization": f"Bearer {token_setting.value}"}, timeout=20.0)
-        response.raise_for_status()
-        models = sorted({item["id"] for item in response.json().get("data", []) if item.get("id")})
-        set_system_setting(db, "deepinfra_models", json.dumps(models))
-        db.commit(); flash(request, f"{len(models)} modelos carregados da DeepInfra.")
-    except (httpx.HTTPError, ValueError, KeyError) as exc:
-        flash(request, f"Não foi possível atualizar os modelos da DeepInfra: {exc}", "danger")
-    return redirect("/system/settings")
+        return JSONResponse({"models": fetch_catalog(token)}, headers={"Cache-Control": "no-store"})
+    except CatalogUnavailable as exc:
+        return JSONResponse({"error": str(exc)}, status_code=409 if not token else 502)
 
 
 @router.post("/system/deepinfra/test")

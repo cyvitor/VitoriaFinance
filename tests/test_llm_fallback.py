@@ -176,8 +176,12 @@ def test_simple_reply_kind():
         assert _simple_reply_kind(word) is None
 
 
-def test_admin_screen_saves_llm_settings(client):
+def test_admin_screen_saves_llm_settings(client, monkeypatch):
     from test_web import seed_test
+    class FakeCatalog:
+        def raise_for_status(self): return None
+        def json(self): return {"data": [{"id": PRIMARY}, {"id": FALLBACK}]}
+    monkeypatch.setattr(httpx, "get", lambda *args, **kwargs: FakeCatalog())
     seed_test(); client.post("/login", data={"username": "vh", "password": "123456"})
     page = client.get("/system/settings")
     assert page.status_code == 200 and "deepinfra_fallback_models" in page.text and PRIMARY in page.text

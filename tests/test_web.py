@@ -916,7 +916,7 @@ def test_month_pending_transaction_cross_deletes_and_returns_to_month(client):
         assert db.get(Transaction, tx_id) is None
 
 
-def test_superadmin_creates_account_and_refreshes_deepinfra_models(client, monkeypatch):
+def test_superadmin_creates_account_and_lists_deepinfra_models(client, monkeypatch):
     seed_test(); client.post("/login", data={"username": "vh", "password": "123456"})
     response = client.post("/system/accounts", data={
         "account_name":"Amigo", "is_super_account":"on", "admin_name":"João",
@@ -948,11 +948,10 @@ def test_superadmin_creates_account_and_refreshes_deepinfra_models(client, monke
         def raise_for_status(self): return None
         def json(self): return {"data":[{"id":"meta-llama/Llama-3"},{"id":"deepseek-ai/DeepSeek-V3"}]}
     monkeypatch.setattr("app.routers.web.httpx.get", lambda *args, **kwargs: FakeResponse())
-    response = client.post("/system/deepinfra/models", follow_redirects=False)
-    assert response.status_code == 303
+    response = client.get("/system/deepinfra/models")
+    assert response.status_code == 200 and "deepseek-ai/DeepSeek-V3" in response.json()["models"]
     with SessionLocal() as db:
-        catalog = db.scalar(select(SystemSetting.value).where(SystemSetting.key == "deepinfra_models"))
-        assert "DeepSeek-V3" in catalog
+        assert db.scalar(select(SystemSetting.value).where(SystemSetting.key == "deepinfra_models")) is None
         vh_account_id = db.scalar(select(SystemAccount.id).where(SystemAccount.name == "VH"))
     client.post("/system/settings", data={
         "deepinfra_api_key":"", "deepinfra_model":"deepseek-ai/DeepSeek-V3",

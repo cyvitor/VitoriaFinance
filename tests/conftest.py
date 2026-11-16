@@ -27,6 +27,14 @@ def database():
     Base.metadata.drop_all(engine)
 
 
+@pytest.fixture(autouse=True)
+def limpar_cache_de_modelos():
+    from app.services.deepinfra_models import clear_cache
+    clear_cache()
+    yield
+    clear_cache()
+
+
 @pytest.fixture
 def client(): return TestClient(app)
 
